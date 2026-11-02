@@ -33,7 +33,7 @@ size_t FSE_buildCTableU16(FSE_CTable* ct, const short* normalizedCounter, unsign
 }
 
 namespace hlc {
-constexpr int TS = 256;                                         // tile side
+static int g_tw = 256, g_th = 256;                              // tile size (-tw, -th), stored in the header
 static inline uint32_t bw(uint32_t v) { return v ? 32 - __builtin_clz(v) : 0; }
 static inline uint16_t zz(int e) { return uint16_t(e >= 0 ? 2 * e : -2 * e - 1); }
 static inline int unzz(uint32_t z) { return int(z >> 1) ^ -int(z & 1); }
@@ -295,12 +295,12 @@ static void decode_tile_skew(const int16_t* S0, const int16_t* S1, const int16_t
 }
 
 static bool g_raw = false, g_skew = false;                          // -n: no entropy coding, -s: skewed 8-row bands
-// file: "HLC3" var W var H u8 raw, then per tile (raster order): var size, payload = 3 x stream
+// file: "HLC3" var W var H u8 flags var TW var TH, then per tile (raster order): var size, payload = 3 x stream
 std::vector<uint8_t> compress(const Img& im, int threads) {
-    const int W = im.W, H = im.H, tx = (W + TS - 1) / TS, ty = (H + TS - 1) / TS, nt = tx * ty;
+    const int W = im.W, H = im.H, TW = g_tw, TH = g_th, tx = (W + TW - 1) / TW, ty = (H + TH - 1) / TH, nt = tx * ty;
     std::vector<std::vector<uint8_t>> tiles(nt);
     parallel_for(nt, threads, [&](int t) {
-        int x0 = (t % tx) * TS, y0 = (t / tx) * TS, w = std::min(TS, W - x0), h = std::min(TS, H - y0); size_t n = size_t(w) * h;
+        int x0 = (t % tx) * TW, y0 = (t / tx) * TH, w = std::min(TW, W - x0), h = std::min(TH, H - y0); size_t n = size_t(w) * h;
         thread_local std::vector<int16_t> P[3], SK; thread_local std::vector<uint8_t> tmp;
         for (auto& p : P) p.resize(n); const size_t ns = g_skew ? skew_len(w, h) : n; SK.resize(ns);
         for (int y = 0; y < h; ++y) rct_row(im.rgb.data() + (size_t(y0 + y) * W + x0) * 3, w, P[0].data() + size_t(y) * w, P[1].data() + size_t(y) * w, P[2].data() + size_t(y) * w);
@@ -314,7 +314,7 @@ std::vector<uint8_t> compress(const Img& im, int threads) {
         }
         tiles[t] = std::move(o.b);
     });
-    Out f; f.raw("HLC3", 4); f.var(W); f.var(H); f.u8(uint8_t(g_raw | g_skew << 1));
+    Out f; f.raw("HLC3", 4); f.var(W); f.var(H); f.u8(uint8_t(g_raw | g_skew << 1)); f.var(TW); f.var(TH);
     for (int t = 0; t < nt; ++t) { f.var(tiles[t].size()); f.raw(tiles[t].data(), tiles[t].size()); }
     return std::move(f.b);
 }
@@ -322,12 +322,13 @@ std::vector<uint8_t> compress(const Img& im, int threads) {
 Img decompress(const std::vector<uint8_t>& data, int threads) {
     In in{data.data(), data.data() + data.size()};
     if (std::memcmp(in.take(4), "HLC3", 4)) throw std::runtime_error("not HLC3");
-    Img im; im.W = int(in.var()); im.H = int(in.var()); const uint8_t fl = in.u8(); const bool raw = fl & 1, skew = fl >> 1 & 1; const int W = im.W, H = im.H, tx = (W + TS - 1) / TS, ty = (H + TS - 1) / TS, nt = tx * ty;
+    Img im; im.W = int(in.var()); im.H = int(in.var()); const uint8_t fl = in.u8(); const bool raw = fl & 1, skew = fl >> 1 & 1; const int W = im.W, H = im.H, TW = int(in.var()), TH = int(in.var());
+    if (TW < 1 || TH < 1 || TW > 65536 || TH > 65536) throw std::runtime_error("tile size"); const int tx = (W + TW - 1) / TW, ty = (H + TH - 1) / TH, nt = tx * ty;
     im.rgb.resize(size_t(W) * H * 3 + 64);
     std::vector<const uint8_t*> tp(nt); std::vector<size_t> tn(nt);
     for (int t = 0; t < nt; ++t) { tn[t] = in.var(); tp[t] = in.take(tn[t]); }
     parallel_for(nt, threads, [&](int t) {
-        int x0 = (t % tx) * TS, y0 = (t / tx) * TS, w = std::min(TS, W - x0), h = std::min(TS, H - y0); size_t n = size_t(w) * h;
+        int x0 = (t % tx) * TW, y0 = (t / tx) * TH, w = std::min(TW, W - x0), h = std::min(TH, H - y0); size_t n = size_t(w) * h;
         thread_local std::vector<int16_t> P[3];
         In ti{tp[t], tp[t] + tn[t]}; const size_t ns = skew ? skew_len(w, h) : n;
         if (skew) {                                                     // fused: streams -> wavefront MED -> RGB
@@ -362,7 +363,7 @@ int main(int argc, char** argv) {
     using namespace hlc; init_shuf();
     if (argc < 3) { std::fprintf(stderr, "usage: hlc c in.ppm out.hlc [-t N] [-n] | hlc d in.hlc out.ppm [-t N] | hlc bench [-t N] [-n] a.ppm ...\n"); return 1; }
     std::string mode = argv[1]; int threads = 1; std::vector<const char*> pos;
-    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
+    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-tw" && i + 1 < argc) g_tw = std::max(8, std::atoi(argv[++i])); else if (a == "-th" && i + 1 < argc) g_th = std::max(8, std::atoi(argv[++i])); else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
     try {
         if (mode == "c" && pos.size() == 2) { auto o = compress(read_ppm(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
         if (mode == "d" && pos.size() == 2) { Img im = decompress(slurp(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fprintf(f, "P6\n%d %d\n255\n", im.W, im.H); std::fwrite(im.rgb.data(), 1, im.rgb.size(), f); std::fclose(f); return 0; }
