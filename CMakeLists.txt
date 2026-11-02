@@ -51,3 +51,11 @@ if(PLT_BUILD_PCTX)
   set_target_properties(pctx PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
                         RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR} RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR})
 endif()
+
+# hlc (HALIC-class on PALIC-1: one RCT, independent 256x256 tiles, in-place decode) from hlc/
+option(PLT_BUILD_HLC "build hlc" ON)
+if(PLT_BUILD_HLC AND PLT_BUILD_PCTX)
+  add_subdirectory(hlc)
+  set_target_properties(hlc PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+                        RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR} RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR})
+endif()
