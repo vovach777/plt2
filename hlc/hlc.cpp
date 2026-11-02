@@ -212,6 +212,58 @@ template <bool N9> static void skew_restore(const int16_t* S, int w, int h, int1
     }
 }
 
+
+// ---- fused decoder for -s: wavefront MED of a band for all three planes, then transpose + inverse RCT straight to RGB
+template <bool N9> static const int16_t* wave_band(const int16_t* S, int w, int hb, const int16_t* top, int16_t* band) {
+    const int L = w + 7; const __m128i one = _mm_set1_epi16(1), zero = _mm_setzero_si128(), m255 = _mm_set1_epi16(255);
+    alignas(16) int16_t lane[8]; __m128i V = zero, Bp = zero;
+    for (int t = 0; t < L; ++t) {
+        int klo = std::max(0, t - w + 1), khi = std::min(hb - 1, t); __m128i Z;
+        if (klo == 0 && khi == 7) { Z = _mm_loadu_si128((const __m128i*)S); S += 8; }
+        else { std::memset(lane, 0, sizeof lane); if (klo <= khi) { std::memcpy(lane + klo, S, size_t(khi - klo + 1) * 2); S += khi - klo + 1; } Z = _mm_load_si128((const __m128i*)lane); }
+        __m128i e = _mm_xor_si128(_mm_srli_epi16(Z, 1), _mm_sub_epi16(zero, _mm_and_si128(Z, one)));
+        __m128i b = _mm_insert_epi16(_mm_slli_si128(V, 2), top[t], 0), c = Bp, a = V;
+        __m128i mx = _mm_max_epi16(a, b), mn = _mm_min_epi16(a, b);
+        __m128i v = _mm_add_epi16(_mm_min_epi16(_mm_max_epi16(_mm_sub_epi16(_mm_add_epi16(a, b), c), mn), mx), e);
+        V = N9 ? _mm_srai_epi16(_mm_slli_epi16(v, 7), 7) : _mm_and_si128(v, m255);
+        _mm_store_si128((__m128i*)(band + size_t(t) * 8), V); Bp = b;
+    }
+    return S;
+}
+static inline void irct8(__m128i v, __m128i u, __m128i y, uint8_t* out24) {        // 8 px -> 24 bytes RGB
+    const __m128i ff = _mm_set1_epi16(255), z = _mm_setzero_si128();
+    __m128i g = _mm_sub_epi16(y, _mm_srai_epi16(_mm_add_epi16(u, v), 2));
+    __m128i R8 = _mm_packus_epi16(_mm_and_si128(_mm_add_epi16(v, g), ff), z), G8 = _mm_packus_epi16(_mm_and_si128(g, ff), z);
+    __m128i B8 = _mm_packus_epi16(_mm_and_si128(_mm_add_epi16(u, g), ff), z);
+    __m128i o0 = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(R8, _mm_load_si128((const __m128i*)SHUF[0][0])), _mm_shuffle_epi8(G8, _mm_load_si128((const __m128i*)SHUF[0][1]))), _mm_shuffle_epi8(B8, _mm_load_si128((const __m128i*)SHUF[0][2])));
+    __m128i o1 = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(R8, _mm_load_si128((const __m128i*)SHUF[1][0])), _mm_shuffle_epi8(G8, _mm_load_si128((const __m128i*)SHUF[1][1]))), _mm_shuffle_epi8(B8, _mm_load_si128((const __m128i*)SHUF[1][2])));
+    _mm_storeu_si128((__m128i*)out24, o0); _mm_storel_epi64((__m128i*)(out24 + 16), o1);
+}
+static void decode_tile_skew(const int16_t* S0, const int16_t* S1, const int16_t* S2, int w, int h, uint8_t* rgb, size_t rstride) {
+    const int L = w + 7, LB = ((L + 7) & ~7) + 8;
+    thread_local std::vector<int16_t> band[3], top[3];
+    for (int c = 0; c < 3; ++c) { band[c].assign(size_t(LB) * 8, 0); top[c].assign(size_t(w) + 48, 0); }
+    const int16_t* S[3] = {S0, S1, S2};
+    alignas(16) uint8_t tmp[32];
+    for (int b0 = 0; b0 < h; b0 += 8) {
+        const int hb = std::min(8, h - b0);
+        S[0] = wave_band<true>(S[0], w, hb, top[0].data() + 8, band[0].data());
+        S[1] = wave_band<true>(S[1], w, hb, top[1].data() + 8, band[1].data());
+        S[2] = wave_band<false>(S[2], w, hb, top[2].data() + 8, band[2].data());
+        for (int t = 0; t < L; t += 8) {
+            __m128i P[3][8];
+            for (int c = 0; c < 3; ++c) { for (int j = 0; j < 8; ++j) P[c][j] = _mm_load_si128((const __m128i*)(band[c].data() + size_t(t + j) * 8));
+                tr8x8(P[c][0], P[c][1], P[c][2], P[c][3], P[c][4], P[c][5], P[c][6], P[c][7]); }
+            for (int k = 0; k < hb; ++k) {                         // row k, pixels x = t - k .. t - k + 7
+                int x0 = t - k; uint8_t* row = rgb + size_t(b0 + k) * rstride;
+                if (x0 >= 0 && x0 + 8 <= w) irct8(P[0][k], P[1][k], P[2][k], row + size_t(x0) * 3);
+                else { irct8(P[0][k], P[1][k], P[2][k], tmp); int xa = std::max(0, x0), xb = std::min(w, x0 + 8); if (xa < xb) std::memcpy(row + size_t(xa) * 3, tmp + (xa - x0) * 3, size_t(xb - xa) * 3); }
+                if (k == hb - 1) for (int c = 0; c < 3; ++c) _mm_storeu_si128((__m128i*)(top[c].data() + 8 + x0), P[c][k]);   // row above the next band
+            }
+        }
+    }
+}
+
 static bool g_raw = false, g_skew = false;                          // -n: no entropy coding, -s: skewed 8-row bands
 // file: "HLC2" var W var H u8 raw, then per tile (raster order): var size, payload = 3 x stream
 std::vector<uint8_t> compress(const Img& im, int threads) {
@@ -246,13 +298,17 @@ Img decompress(const std::vector<uint8_t>& data, int threads) {
     for (int t = 0; t < nt; ++t) { tn[t] = in.var(); tp[t] = in.take(tn[t]); }
     parallel_for(nt, threads, [&](int t) {
         int x0 = (t % tx) * TS, y0 = (t / tx) * TS, w = std::min(TS, W - x0), h = std::min(TS, H - y0); size_t n = size_t(w) * h;
-        thread_local std::vector<int16_t> P[3], SK; thread_local std::vector<uint8_t> b8;
+        thread_local std::vector<int16_t> P[3]; thread_local std::vector<uint8_t> b8;
         In ti{tp[t], tp[t] + tn[t]}; const size_t ns = skew ? skew_len(w, h) : n;
+        if (skew) {                                                     // fused: streams -> wavefront MED -> RGB
+            for (int c = 0; c < 3; ++c) { P[c].resize(ns + 16); if (raw) std::memcpy(P[c].data(), ti.take(ns * 2), ns * 2); else get_stream(ti, P[c].data(), ns, b8); }
+            decode_tile_skew(P[0].data(), P[1].data(), P[2].data(), w, h, im.rgb.data() + (size_t(y0) * W + x0) * 3, size_t(W) * 3);
+            return;
+        }
         for (int c = 0; c < 3; ++c) {
-            P[c].resize(n + 16); SK.resize(ns + 16); int16_t* dst = skew ? SK.data() : P[c].data();
-            if (raw) std::memcpy(dst, ti.take(ns * 2), ns * 2); else get_stream(ti, dst, ns, b8);
-            if (skew) { if (c < 2) skew_restore<true>(SK.data(), w, h, P[c].data()); else skew_restore<false>(SK.data(), w, h, P[c].data()); }
-            else if (c < 2) restore<true>(P[c].data(), w, h); else restore<false>(P[c].data(), w, h);
+            P[c].resize(n + 16);
+            if (raw) std::memcpy(P[c].data(), ti.take(n * 2), n * 2); else get_stream(ti, P[c].data(), n, b8);
+            if (c < 2) restore<true>(P[c].data(), w, h); else restore<false>(P[c].data(), w, h);
         }
         for (int y = 0; y < h; ++y) irct_row(P[0].data() + size_t(y) * w, P[1].data() + size_t(y) * w, P[2].data() + size_t(y) * w, w, im.rgb.data() + (size_t(y0 + y) * W + x0) * 3);
     });
