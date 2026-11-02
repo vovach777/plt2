@@ -6,7 +6,8 @@
 //   wrapped (Y mod 256, U/V mod 512), zz = zigzag(e) is the symbol itself (Y < 256, U/V < 512);
 //   class = #thresholds <= act,  act = |a-c| + |c-b| + |b-d|  (own plane):
 //       Y:  1, 3, 10, 18, 35        U, V:  1, 4, 8, 16, 30          (6 classes each; from the CLIC sample)
-//   streams per block, all of them FSE-U16 (Collet's fseU16, the engine HALIC uses), one table per stream:
+//   streams per block, FSE (Collet's, the engine HALIC uses), one table per stream: byte FSE (tableLog 12) when all
+//   symbols of the stream are < 256 (HALIC's "FSE-256" path, bit 19), FSE-U16 otherwise (-16 forces U16):
 //       class 0 of Y, U and V together (flat pixels)      classes 1..5 of Y       classes 1..5 of U + V (shared)
 //   Prediction runs across block borders (only the statistics reset per block).
 //
@@ -23,7 +24,11 @@
 extern "C" {
 #include "fseU16.h"
 unsigned FSE_isError(size_t code);
+size_t FSE_compress(void* dst, size_t dstCapacity, const void* src, size_t srcSize);           // byte FSE (zstd)
+size_t FSE_compress2(void* dst, size_t dstCapacity, const void* src, size_t srcSize, unsigned maxSymbolValue, unsigned tableLog);
+size_t FSE_decompress(void* dst, size_t dstCapacity, const void* cSrc, size_t cSrcSize);
 }
+static bool g_fse8 = true; static unsigned g_tl8 = 12;                                 // byte FSE when the stream fits in 0..255 (HALIC "FSE-256")
 
 namespace pctx {
 constexpr int NCL = 6, NSTR = 11;
@@ -55,22 +60,32 @@ struct In {
 };
 
 // symbol stream (u16 = whole zigzag residual): var(n), mode u8 (0 raw u16, 1 rle, 2 FSE-U16), [var csize][data]
+// symbol stream: var(n), mode u8: 0 raw u16, 1 rle, 2 FSE-U16, 3 FSE-8 (all symbols < 256, as HALIC's 256 path)
 static void put_stream(Out& o, const std::vector<uint16_t>& s, std::vector<uint8_t>& tmp) {
     o.var(s.size()); if (s.empty()) return;
     unsigned mx = *std::max_element(s.begin(), s.end());
-    tmp.resize(s.size() * 2 + 4096);
-    size_t c = FSE_compressU16(tmp.data(), tmp.size(), s.data(), s.size(), mx ? mx : 1, 0);
+    tmp.resize(s.size() * 2 + 4096); size_t c;
+    if (g_fse8 && mx < 256) {
+        static thread_local std::vector<uint8_t> b; b.resize(s.size()); for (size_t i = 0; i < s.size(); ++i) b[i] = uint8_t(s[i]);
+        c = FSE_compress2(tmp.data(), tmp.size(), b.data(), b.size(), mx ? mx : 1, g_tl8);
+        if (!FSE_isError(c) && c > 1 && c < s.size()) { o.u8(3); o.var(c); o.raw(tmp.data(), c); return; }
+    }
+    if (!(g_fse8 && mx < 256) || FSE_isError(c) || c > 1) c = FSE_compressU16(tmp.data(), tmp.size(), s.data(), s.size(), mx ? mx : 1, 0);
     if (!FSE_isError(c) && c == 1) { o.u8(1); o.var(s[0]); }
     else if (FSE_isError(c) || c == 0 || c >= s.size() * 2) { o.u8(0); o.raw(s.data(), s.size() * 2); }
     else { o.u8(2); o.var(c); o.raw(tmp.data(), c); }
 }
+static double g_tent = 0;
 static void get_stream(In& in, std::vector<uint16_t>& s) {
     size_t n = in.var(); s.resize(n + 8); if (!n) return;
     uint8_t mode = in.u8();
     if (mode == 1) { uint16_t v = uint16_t(in.var()); std::fill(s.begin(), s.begin() + n, v); return; }
     if (mode == 0) { std::memcpy(s.data(), in.take(n * 2), n * 2); return; }
-    size_t c = in.var(); const uint8_t* src = in.take(c);
-    size_t r = FSE_decompressU16(s.data(), n, src, c);
+    size_t c = in.var(); const uint8_t* src = in.take(c); size_t r;
+    auto t0 = std::chrono::steady_clock::now();
+    if (mode == 3) { static thread_local std::vector<uint8_t> b; b.resize(n + 8); r = FSE_decompress(b.data(), n, src, c); for (size_t i = 0; i < n; ++i) s[i] = b[i]; }
+    else r = FSE_decompressU16(s.data(), n, src, c);
+    g_tent += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (FSE_isError(r) || r != n) throw std::runtime_error("entropy stream");
 }
 
@@ -176,7 +191,7 @@ int main(int argc, char** argv) {
     using namespace pctx;
     if (argc < 3) { std::fprintf(stderr, "usage: pctx c in.ppm out.pcx [-b rows] [-P mask] | pctx d in.pcx out.ppm | pctx bench [-b rows] [-P mask] a.ppm ...\n"); return 1; }
     std::string mode = argv[1]; std::vector<const char*> pos;
-    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-b" && i + 1 < argc) g_rows = std::atoi(argv[++i]); else if (a == "-P" && i + 1 < argc) g_pmask = std::atoi(argv[++i]) & 15; else pos.push_back(argv[i]); }
+    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-b" && i + 1 < argc) g_rows = std::atoi(argv[++i]); else if (a == "-16") g_fse8 = false; else if (a == "-T" && i + 1 < argc) g_tl8 = unsigned(std::clamp(std::atoi(argv[++i]), 5, 12)); else if (a == "-P" && i + 1 < argc) g_pmask = std::atoi(argv[++i]) & 15; else pos.push_back(argv[i]); }
     if (!g_pmask) g_pmask = 1;
     try {
         if (mode == "c" && pos.size() == 2) { auto o = compress(read_ppm(pos[0])); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
@@ -192,6 +207,7 @@ int main(int argc, char** argv) {
                 bool g = r.rgb == im.rgb; ok &= g; size_t n = size_t(im.W) * im.H; px += n; by += o.size(); te += be; td += bd;
                 std::printf("%-28s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s %s\n", fn, im.W, im.H, o.size(), 8.0 * o.size() / n, 3e-6 * n / be, 3e-6 * n / bd, g ? "ok" : "FAIL");
             }
+            std::printf("entropy decode share: %.1f%% of decode time (3 reps)\n", 100.0 * g_tent / (3 * td) / 1.0);
             std::printf("TOTAL %zu files  %.4f bpp  enc %.1f  dec %.1f MB/s (RGB)  b=%d  P=%d  predictors used: MED %d  3pt %d  (a+b)/2 %d  (a+c)/2 %d  %s\n", pos.size(), 8.0 * by / px, 3e-6 * px / te, 3e-6 * px / td, g_rows, g_pmask, ps[0], ps[1], ps[2], ps[3], ok ? "all ok" : "FAIL");
             return ok ? 0 : 3;
         }
