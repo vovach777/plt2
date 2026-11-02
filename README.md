@@ -13,7 +13,7 @@ Lossless RGB. RCT → MED → контекст (корпусный класте�
 - **Полосы:** N = W/512 по умолчанию или `-s N`; ⌊W/64⌋ блоков по 64 px раздаются поровну, хвост — последней.
   Полосы независимы → потоки ОС / Web Workers. Начала полос кратны 64 px (RGB совпадает с SIMD-блоками).
 - **Память O(ширина):** RCT построчно в кольца из 2 строк, декодер пишет RGB сразу.
-- **SIMD:** AVX-512BW, AVX2, скаляр; через SIMDe — SSE2/SSSE3 (core2) и AVX1 (Sandy/Ivy Bridge). Поток одинаковый.
+- **SIMD:** AVX-512BW, AVX2, SSE4.1 (Nehalem…Ivy Bridge), встроенный SIMDe для core2, скаляр. Поток одинаковый.
 - Альтернативные раскладки (несколько буферов на полосу, bypass внутри RC) — в `archive/`, финальный декодер о них не знает.
 
 **Файл:** `PLT2 | u32 W | u32 H | u8 model | u8 флаги (b0 A15, b1 статика, b2 свои таблицы) | u8 раскладка = 3 |
@@ -21,9 +21,14 @@ u8 полосы (0 = W/512) | [u32 отпечаток таблиц, если b2]
 
 ## Сборка и запуск
 ```
-clang++ -O3 -march=native -std=c++17 -pthread plt2.cpp -o plt2
-clang++ -O3 -march=sandybridge -std=c++17 -pthread -I<simde> -DPLT_SIMDE=1 plt2.cpp -o plt2_avx1     # до Haswell
-clang++ -O3 -march=core2       -std=c++17 -pthread -I<simde> -DPLT_SIMDE=1 plt2.cpp -o plt2_core2
+cmake -B build && cmake --build build --config Release        # -march=native (clang-cl/gcc/clang), /QxHost (icx)
+cmake -B build -DPLT_ARCH=ivybridge                            # явный ISA для gcc/clang/clang-cl
+cmake -B build -DPLT_ARCH=AVX                                  # cl.exe: AVX | AVX2 | AVX512 (без него SSE2 → SIMDe)
+```
+Путь SIMD выбирается по ISA цели, поток одинаковый: AVX-512BW → AVX2 → **SSE4.1** (Nehalem…Ivy Bridge, родные XMM) →
+встроенный SIMDe `avx2.h` (core2 и старше) → скаляр (`-DPLT_SCALAR=ON`). Внешний SIMDe не нужен; `-DPLT_SIMDE=1|2
+-I<simde>` (эмуляция AVX2/AVX-512 из полного SIMDe) оставлен для экспериментов.
+```
 plt2 c in.ppm out.plt [-t N] [-m 0|1] [-a 31|15] [-s strips] [-x] [-T tables.pltt]
 plt2 d in.plt out.ppm [-t N] [-T tables.pltt]
 plt2 bench [опции] [-r R] [-csv f] (ppm | папка)...
@@ -63,3 +68,12 @@ Web Worker на полосу, экспорт полосы сразу в RGBA. He
 ## gen/
 `gen2.py` (вшитые таблицы из jointstats CLIC train), `design_a15.py` (подбор A15). Нужны корпусные `jointstats.npz`,
 `clusters_64.npz` и `invcommon.py`.
+
+## SIMD-пути (VM Xeon, 1 поток, 13 картинок, enc / dec MB/s; на реальном Ivy Bridge делить ≈ на 2.4)
+| сборка | путь | enc | dec |
+|---|---|---|---|
+| native (AVX-512) | avx512 | 84.2 | 73.1 |
+| `-march=haswell` | avx2 | 73.6 | 62.4 |
+| `-march=ivybridge` | **sse4.1** | 65.4 | 52.2 |
+| `-march=core2` | simde-avx2 (bundled) | 59.9 | 42.7 |
+| `PLT_SCALAR` | scalar | 36.6 | 27.5 |

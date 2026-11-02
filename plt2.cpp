@@ -78,6 +78,17 @@ static inline simde__m256i plt_mask_sub256(simde__m256i src, simde__mmask16 k, s
 #define SIMD 2
 #elif defined(__AVX2__) && !defined(PLT_SCALAR)
 #define SIMD 1
+#elif defined(__SSE4_1__) && !defined(PLT_SCALAR) && !defined(PLT_FORCE_SIMDE)   // Nehalem..Ivy Bridge: native XMM
+#include <immintrin.h>
+#define SIMD 3
+#elif !defined(PLT_SCALAR) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
+#if !defined(__AVX__)                    // bundled SIMDe amalgam (avx2.h): AVX2 path emulated on SSE2/SSSE3 (core2)
+#define SIMDE_X86_AVX_ENABLE_NATIVE_ALIASES // __m256i, _mm256_load/store/set* are AVX1; clash with native ones on AVX
+#endif
+#define SIMDE_X86_AVX2_ENABLE_NATIVE_ALIASES
+#include "avx2.h"
+#define SIMD 1
+#define PLT_SIMDE_BUNDLED 1
 #else
 #define SIMD 0
 #endif
@@ -168,7 +179,19 @@ static inline void cdf_update(Cdf<Alpha<A>::LANES>& d, uint16_t& cnt, int l) {
         _mm256_store_si256((__m256i*)d.c, c); return;
     }
 #endif
-#if SIMD >= 1
+#if SIMD == 3
+    {
+        const __m128i idx = _mm_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7), ll = _mm_set1_epi16(short(l)); __m128i sh = _mm_cvtsi32_si128(rate);
+        for (int h = 0; h < Alpha<A>::LANES; h += 8) {
+            __m128i c = _mm_load_si128((const __m128i*)(d.c + h));
+            __m128i gt = _mm_cmpgt_epi16(_mm_add_epi16(idx, _mm_set1_epi16(short(h))), ll);
+            __m128i up = _mm_srl_epi16(_mm_sub_epi16(_mm_load_si128((const __m128i*)(T.gt + h)), c), sh);
+            __m128i dn = _mm_srl_epi16(_mm_sub_epi16(c, _mm_load_si128((const __m128i*)(T.le + h))), sh);
+            _mm_store_si128((__m128i*)(d.c + h), _mm_blendv_epi8(_mm_sub_epi16(c, dn), _mm_add_epi16(c, up), gt));
+        }
+        return;
+    }
+#elif SIMD >= 1
     {
         const __m256i idx = _mm256_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
         __m128i sh = _mm_cvtsi32_si128(rate);
@@ -192,7 +215,17 @@ static inline int cdf_find(const Cdf<Alpha<A>::LANES>& d, uint32_t v) {
     if constexpr (A == 31) return __builtin_popcount(_mm512_cmple_epu16_mask(_mm512_load_si512(d.c), _mm512_set1_epi16(short(v)))) - 1;
     else return __builtin_popcount(_mm256_cmple_epu16_mask(_mm256_load_si256((const __m256i*)d.c), _mm256_set1_epi16(short(v)))) - 1;
 #endif
-#if SIMD >= 1
+#if SIMD == 3
+    {   // c[i] <= v  <=>  max(c[i], v) == v; 16 lanes -> one packs + movemask
+        const __m128i vv = _mm_set1_epi16(short(v)); const __m128i* p = (const __m128i*)d.c;
+        unsigned m = unsigned(_mm_movemask_epi8(_mm_packs_epi16(_mm_cmpeq_epi16(_mm_max_epu16(_mm_load_si128(p), vv), vv),
+                                                                _mm_cmpeq_epi16(_mm_max_epu16(_mm_load_si128(p + 1), vv), vv))));
+        if constexpr (Alpha<A>::LANES == 32)
+            m |= unsigned(_mm_movemask_epi8(_mm_packs_epi16(_mm_cmpeq_epi16(_mm_max_epu16(_mm_load_si128(p + 2), vv), vv),
+                                                            _mm_cmpeq_epi16(_mm_max_epu16(_mm_load_si128(p + 3), vv), vv)))) << 16;
+        return __builtin_popcount(m) - 1;
+    }
+#elif SIMD >= 1
     {
         __m256i vv = _mm256_set1_epi16(short(v)); int n = 0;
         for (int h = 0; h < Alpha<A>::LANES; h += 16) {
@@ -581,7 +614,11 @@ int main(int argc, char** argv) {
         #ifdef PLT_SIMDE
         const char* simd = SIMD == 2 ? "simde-avx512" : "simde-avx2";
 #else
-        const char* simd = SIMD == 2 ? "avx512" : SIMD == 1 ? "avx2" : "scalar";
+#if defined(PLT_SIMDE_BUNDLED)
+        const char* simd = "simde-avx2 (bundled)";
+#else
+        const char* simd = SIMD == 2 ? "avx512" : SIMD == 1 ? "avx2" : SIMD == 3 ? "sse4.1" : "scalar";
+#endif
 #endif
         std::printf("PLT2 model=%d alphabet=A%d %s threads=%d simd=%s\n", model, alpha, stat ? "STATIC" : "adaptive", threads, simd);
         for (auto& fn : files) {
