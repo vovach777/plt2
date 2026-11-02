@@ -27,10 +27,9 @@
 #include <smmintrin.h>
 #include "../palic-1/rgb.hpp"
 extern "C" {
-#include "fseU16.h"
-unsigned FSE_isError(size_t code);
-size_t FSE_compress2(void* dst, size_t dstCapacity, const void* src, size_t srcSize, unsigned maxSymbolValue, unsigned tableLog);
-size_t FSE_decompress(void* dst, size_t dstCapacity, const void* cSrc, size_t cSrcSize);
+#define FSE_STATIC_LINKING_ONLY
+#include "fse.h"
+size_t FSE_buildCTableU16(FSE_CTable* ct, const short* normalizedCounter, unsigned maxSymbolValue, unsigned tableLog);
 }
 
 namespace hlc {
@@ -110,69 +109,59 @@ template <bool N9> static void restore(int16_t* p, int w, int h) {
     }
 }
 
-// ------------------------------------------------------------------ FSE stream: mode u8, [var csize][data]
-// 0 raw u16, 1 rle, 2 FSE-U16, 3 FSE-8, 4 raw u8,
-// 5 FSE-8 + escape: u8 E, var c, FSE-8(min(zz,E)), var ne, u8 tb, ne x tb bits of (zz-E) LSB-first
-static int g_esc = 255;                                             // -e: escape symbol for wide (9-bit) streams, 0 = use FSE-U16
-static void put_stream(Out& o, const uint16_t* s, size_t n, std::vector<uint8_t>& tmp, std::vector<uint8_t>& b8) {
-    unsigned mx = *std::max_element(s, s + n); tmp.resize(n * 2 + 4096);
-    if (mx < 256) {
-        b8.resize(n + 16); for (size_t i = 0; i < n; ++i) b8[i] = uint8_t(s[i]);   // slack: HIST_count reads ahead
-        size_t c = FSE_compress2(tmp.data(), tmp.size(), b8.data(), n, mx ? mx : 1, 12);
-        if (!FSE_isError(c) && c == 1) { o.u8(1); o.var(s[0]); return; }
-        if (!FSE_isError(c) && c > 1 && c < n) { o.u8(3); o.var(c); o.raw(tmp.data(), c); return; }
-        o.u8(4); o.raw(b8.data(), n); return;
-    }
-    if (g_esc > 0) {
-        const unsigned E = unsigned(g_esc), tb = bw(mx - E); b8.resize(n + 16); size_t ne = 0;
-        for (size_t i = 0; i < n; ++i) { unsigned v = s[i]; ne += v >= E; b8[i] = uint8_t(v < E ? v : E); }
-        size_t c = FSE_compress2(tmp.data(), tmp.size(), b8.data(), n, E, 12);
-        if (!FSE_isError(c) && c > 1 && c < n) {
-            if (ne * 64 > n) {                                      // escape-heavy (noise, tiny tiles): keep FSE-U16 if it is smaller
-                std::vector<uint8_t> t2(n * 2 + 4096); size_t c2 = FSE_compressU16(t2.data(), t2.size(), s, n, mx, 0);
-                if (!FSE_isError(c2) && c2 > 1 && c2 + 4 < c + (ne * tb + 7) / 8) { o.u8(2); o.var(c2); o.raw(t2.data(), c2); return; }
-            }
-            o.u8(5); o.u8(uint8_t(E)); o.var(c); o.raw(tmp.data(), c); o.var(ne); o.u8(uint8_t(tb));
-            uint64_t acc = 0; int nb = 0;
-            for (size_t i = 0; i < n; ++i) if (s[i] >= E) { acc |= uint64_t(s[i] - E) << nb; nb += tb; while (nb >= 8) { o.u8(uint8_t(acc)); acc >>= 8; nb -= 8; } }
-            if (nb) o.u8(uint8_t(acc));
-            return;
-        }
-    }
-    size_t c = FSE_compressU16(tmp.data(), tmp.size(), s, n, mx, 0);
-    if (!FSE_isError(c) && c == 1) { o.u8(1); o.var(s[0]); return; }
-    if (FSE_isError(c) || c == 0 || c >= n * 2) { o.u8(0); o.raw(s, n * 2); return; }
-    o.u8(2); o.var(c); o.raw(tmp.data(), c);
+// ------------------------------------------------------------------ FSE4: tANS over u16 symbols, 4 interleaved states, one bitstream
+// Library parts: histogram normalisation, NCount header, CTable + encoder primitives. The decoder is ours:
+// flat u32 table (newState | nbBits << 16 | symbol << 20), reload once per 4 symbols, output straight to int16.
+// stream: mode u8 (0 raw u16, 1 rle var, 6 FSE4 var csize + data)
+static int g_tl = 12;                                               // -T: max tableLog
+static size_t fse4_enc(uint8_t* dst, size_t cap, const uint16_t* s, size_t n, unsigned mx, const unsigned* cnt) {
+    const unsigned tl = FSE_optimalTableLog(unsigned(g_tl), n, mx); short norm[1024];
+    if (FSE_isError(FSE_normalizeCount(norm, tl, cnt, n, mx))) return 0;
+    size_t h = FSE_writeNCount(dst, cap, norm, mx, tl); if (FSE_isError(h)) return 0;
+    thread_local std::vector<FSE_CTable> ct(FSE_CTABLE_SIZE_U32(13, 1023));
+    if (FSE_isError(FSE_buildCTableU16(ct.data(), norm, mx, tl))) return 0;
+    BIT_CStream_t bc; if (FSE_isError(BIT_initCStream(&bc, dst + h, cap - h))) return 0;
+    FSE_CState_t st[4]; const size_t L = std::min<size_t>(n, 4); size_t i = n;
+    for (size_t j = 0; j < L; ++j) { --i; FSE_initCState2(&st[i & 3], ct.data(), s[i]); }   // last symbol of each lane
+    while (i > 0) { --i; FSE_encodeSymbol(&bc, &st[i & 3], s[i]); if ((i & 3) == 0) BIT_flushBits(&bc); }   // <= 4 x 12 bits between flushes
+    for (size_t k = L; k-- > 0;) FSE_flushCState(&bc, &st[k]);    // lane 0 last -> read first
+    size_t c = BIT_closeCStream(&bc); return c ? h + c : 0;
 }
-static inline void widen8(const uint8_t* b, int16_t* d, size_t n) {   // u8 -> i16, 16 per step (b has 16 slack)
-    size_t i = 0;
-    for (; i + 16 <= n; i += 16) { __m128i x = _mm_loadu_si128((const __m128i*)(b + i));
-        _mm_storeu_si128((__m128i*)(d + i), _mm_cvtepu8_epi16(x)); _mm_storeu_si128((__m128i*)(d + i + 8), _mm_cvtepu8_epi16(_mm_srli_si128(x, 8))); }
-    for (; i < n; ++i) d[i] = b[i];
+static void fse4_dec(int16_t* out, size_t n, const uint8_t* src, size_t c) {
+    short norm[1024]; unsigned mx = 1023, tl;
+    size_t h = FSE_readNCount(norm, &mx, &tl, src, c); if (FSE_isError(h) || tl > 13 || tl < 1) throw std::runtime_error("ncount");
+    thread_local std::vector<uint32_t> T(1 << 13); thread_local std::vector<uint16_t> nxt(1024);
+    const uint32_t ts = 1u << tl, mask = ts - 1, step = (ts >> 1) + (ts >> 3) + 3; uint32_t hi = ts - 1;
+    for (unsigned s = 0; s <= mx; ++s) { if (norm[s] == -1) { T[hi--] = s; nxt[s] = 1; } else nxt[s] = uint16_t(norm[s]); }
+    uint32_t pos = 0;
+    for (unsigned s = 0; s <= mx; ++s) for (int k = 0; k < norm[s]; ++k) { T[pos] = s; pos = (pos + step) & mask; while (pos > hi) pos = (pos + step) & mask; }
+    if (pos) throw std::runtime_error("ncount spread");
+    for (uint32_t u = 0; u < ts; ++u) { uint32_t s = T[u], ns = nxt[s]++, nb = tl - bw(ns) + 1; T[u] = (((ns << nb) - ts) & 0xffff) | nb << 16 | s << 20; }
+    BIT_DStream_t bd; if (FSE_isError(BIT_initDStream(&bd, src + h, c - h))) throw std::runtime_error("bitstream");
+    const size_t L = std::min<size_t>(n, 4); uint32_t st[4] = {0, 0, 0, 0};
+    for (size_t k = 0; k < L; ++k) { st[k] = uint32_t(BIT_readBits(&bd, tl)); BIT_reloadDStream(&bd); }
+    const uint32_t* t = T.data(); size_t i = 0;
+#define HLC_DEC1(k) { uint32_t e = t[st[k]]; out[i + k] = int16_t(e >> 20); st[k] = (e & 0xffff) + uint32_t(BIT_readBits(&bd, (e >> 16) & 15)); }
+    for (; i + 4 <= n; i += 4) { BIT_reloadDStream(&bd); HLC_DEC1(0) HLC_DEC1(1) HLC_DEC1(2) HLC_DEC1(3) }
+    BIT_reloadDStream(&bd); for (size_t k = 0; i < n; ++i, ++k) { uint32_t e = t[st[k]]; out[i] = int16_t(e >> 20); st[k] = (e & 0xffff) + uint32_t(BIT_readBits(&bd, (e >> 16) & 15)); }
+#undef HLC_DEC1
+}
+static void put_stream(Out& o, const uint16_t* s, size_t n, std::vector<uint8_t>& tmp) {
+    thread_local unsigned cnt[1024]; std::memset(cnt, 0, sizeof cnt); unsigned mx = 0;
+    for (size_t i = 0; i < n; ++i) cnt[s[i]]++;
+    for (unsigned v = 0; v < 1024; ++v) if (cnt[v]) mx = v;
+    if (cnt[s[0]] == n) { o.u8(1); o.var(s[0]); return; }
+    tmp.resize(n * 2 + 4096); size_t c = fse4_enc(tmp.data(), tmp.size(), s, n, mx, cnt);
+    if (!c || c >= n * 2) { o.u8(0); o.raw(s, n * 2); return; }
+    o.u8(6); o.var(c); o.raw(tmp.data(), c);
 }
 // decode straight into the tile buffer (int16 holding zigzag values)
-static void get_stream(In& in, int16_t* dst, size_t n, std::vector<uint8_t>& b8) {
+static void get_stream(In& in, int16_t* dst, size_t n) {
     uint8_t mode = in.u8();
     if (mode == 1) { int16_t v = int16_t(in.var()); std::fill(dst, dst + n, v); return; }
     if (mode == 0) { std::memcpy(dst, in.take(n * 2), n * 2); return; }
-    if (mode == 4) { const uint8_t* b = in.take(n); for (size_t i = 0; i < n; ++i) dst[i] = b[i]; return; }
-    unsigned E = mode == 5 ? in.u8() : 0;
-    size_t c = in.var(); const uint8_t* src = in.take(c); size_t r;
-    if (mode == 3 || mode == 5) { b8.resize(n + 16); r = FSE_decompress(b8.data(), n, src, c); if (FSE_isError(r) || r != n) throw std::runtime_error("entropy stream"); }
-    else { r = FSE_decompressU16((unsigned short*)dst, n, src, c); if (FSE_isError(r) || r != n) throw std::runtime_error("entropy stream"); return; }
-    widen8(b8.data(), dst, n);
-    if (mode == 3) return;
-    size_t ne = in.var(); const unsigned tb = in.u8(); if (tb > 9) throw std::runtime_error("escape bits");
-    const uint8_t* t = in.take((ne * tb + 7) / 8); uint64_t acc = 0; int nb = 0; const uint32_t msk = (1u << tb) - 1;
-    const __m128i ev = _mm_set1_epi8(char(E)); size_t seen = 0;
-    for (size_t i = 0; i < n && seen < ne; i += 16) {                 // find escapes 16 at a time (rare)
-        unsigned m = unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128((const __m128i*)(b8.data() + i)), ev)));
-        if (i + 16 > n) m &= (1u << (n - i)) - 1;
-        while (m) { int k = __builtin_ctz(m); m &= m - 1;
-            while (nb < int(tb)) { acc |= uint64_t(*t++) << nb; nb += 8; }
-            dst[i + k] = int16_t(E + (acc & msk)); acc >>= tb; nb -= tb; ++seen; }
-    }
-    if (seen != ne) throw std::runtime_error("escape count");
+    if (mode != 6) throw std::runtime_error("stream mode");
+    size_t c = in.var(); fse4_dec(dst, n, in.take(c), c);
 }
 
 template <class F> static void parallel_for(int n, int threads, F f) {
@@ -306,13 +295,13 @@ static void decode_tile_skew(const int16_t* S0, const int16_t* S1, const int16_t
 }
 
 static bool g_raw = false, g_skew = false;                          // -n: no entropy coding, -s: skewed 8-row bands
-// file: "HLC2" var W var H u8 raw, then per tile (raster order): var size, payload = 3 x stream
+// file: "HLC3" var W var H u8 raw, then per tile (raster order): var size, payload = 3 x stream
 std::vector<uint8_t> compress(const Img& im, int threads) {
     const int W = im.W, H = im.H, tx = (W + TS - 1) / TS, ty = (H + TS - 1) / TS, nt = tx * ty;
     std::vector<std::vector<uint8_t>> tiles(nt);
     parallel_for(nt, threads, [&](int t) {
         int x0 = (t % tx) * TS, y0 = (t / tx) * TS, w = std::min(TS, W - x0), h = std::min(TS, H - y0); size_t n = size_t(w) * h;
-        thread_local std::vector<int16_t> P[3], SK; thread_local std::vector<uint8_t> tmp, b8;
+        thread_local std::vector<int16_t> P[3], SK; thread_local std::vector<uint8_t> tmp;
         for (auto& p : P) p.resize(n); const size_t ns = g_skew ? skew_len(w, h) : n; SK.resize(ns);
         for (int y = 0; y < h; ++y) rct_row(im.rgb.data() + (size_t(y0 + y) * W + x0) * 3, w, P[0].data() + size_t(y) * w, P[1].data() + size_t(y) * w, P[2].data() + size_t(y) * w);
         Out o;
@@ -321,35 +310,35 @@ std::vector<uint8_t> compress(const Img& im, int threads) {
             const int16_t* src = P[c].data();
             if (g_skew) { skew_pack(P[c].data(), w, h, SK.data()); src = SK.data(); }
             if (g_raw) o.raw(src, ns * 2);
-            else put_stream(o, (const uint16_t*)src, ns, tmp, b8);
+            else put_stream(o, (const uint16_t*)src, ns, tmp);
         }
         tiles[t] = std::move(o.b);
     });
-    Out f; f.raw("HLC2", 4); f.var(W); f.var(H); f.u8(uint8_t(g_raw | g_skew << 1));
+    Out f; f.raw("HLC3", 4); f.var(W); f.var(H); f.u8(uint8_t(g_raw | g_skew << 1));
     for (int t = 0; t < nt; ++t) { f.var(tiles[t].size()); f.raw(tiles[t].data(), tiles[t].size()); }
     return std::move(f.b);
 }
 
 Img decompress(const std::vector<uint8_t>& data, int threads) {
     In in{data.data(), data.data() + data.size()};
-    if (std::memcmp(in.take(4), "HLC2", 4)) throw std::runtime_error("not HLC2");
+    if (std::memcmp(in.take(4), "HLC3", 4)) throw std::runtime_error("not HLC3");
     Img im; im.W = int(in.var()); im.H = int(in.var()); const uint8_t fl = in.u8(); const bool raw = fl & 1, skew = fl >> 1 & 1; const int W = im.W, H = im.H, tx = (W + TS - 1) / TS, ty = (H + TS - 1) / TS, nt = tx * ty;
     im.rgb.resize(size_t(W) * H * 3 + 64);
     std::vector<const uint8_t*> tp(nt); std::vector<size_t> tn(nt);
     for (int t = 0; t < nt; ++t) { tn[t] = in.var(); tp[t] = in.take(tn[t]); }
     parallel_for(nt, threads, [&](int t) {
         int x0 = (t % tx) * TS, y0 = (t / tx) * TS, w = std::min(TS, W - x0), h = std::min(TS, H - y0); size_t n = size_t(w) * h;
-        thread_local std::vector<int16_t> P[3]; thread_local std::vector<uint8_t> b8;
+        thread_local std::vector<int16_t> P[3];
         In ti{tp[t], tp[t] + tn[t]}; const size_t ns = skew ? skew_len(w, h) : n;
         if (skew) {                                                     // fused: streams -> wavefront MED -> RGB
             for (int c = 0; c < 3; ++c) { P[c].resize(ns + 32); int16_t* d = P[c].data() + 8; std::memset(P[c].data(), 0, 16);   // 8 slack before: masked loads read S - klo
-                if (raw) std::memcpy(d, ti.take(ns * 2), ns * 2); else get_stream(ti, d, ns, b8); }
+                if (raw) std::memcpy(d, ti.take(ns * 2), ns * 2); else get_stream(ti, d, ns); }
             decode_tile_skew(P[0].data() + 8, P[1].data() + 8, P[2].data() + 8, w, h, im.rgb.data() + (size_t(y0) * W + x0) * 3, size_t(W) * 3);
             return;
         }
         for (int c = 0; c < 3; ++c) {
             P[c].resize(n + 16);
-            if (raw) std::memcpy(P[c].data(), ti.take(n * 2), n * 2); else get_stream(ti, P[c].data(), n, b8);
+            if (raw) std::memcpy(P[c].data(), ti.take(n * 2), n * 2); else get_stream(ti, P[c].data(), n);
             if (c < 2) restore<true>(P[c].data(), w, h); else restore<false>(P[c].data(), w, h);
         }
         for (int y = 0; y < h; ++y) irct_row(P[0].data() + size_t(y) * w, P[1].data() + size_t(y) * w, P[2].data() + size_t(y) * w, w, im.rgb.data() + (size_t(y0 + y) * W + x0) * 3);
@@ -373,7 +362,7 @@ int main(int argc, char** argv) {
     using namespace hlc; init_shuf();
     if (argc < 3) { std::fprintf(stderr, "usage: hlc c in.ppm out.hlc [-t N] [-n] | hlc d in.hlc out.ppm [-t N] | hlc bench [-t N] [-n] a.ppm ...\n"); return 1; }
     std::string mode = argv[1]; int threads = 1; std::vector<const char*> pos;
-    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-e" && i + 1 < argc) g_esc = std::atoi(argv[++i]); else pos.push_back(argv[i]); }
+    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
     try {
         if (mode == "c" && pos.size() == 2) { auto o = compress(read_ppm(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
         if (mode == "d" && pos.size() == 2) { Img im = decompress(slurp(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fprintf(f, "P6\n%d %d\n255\n", im.W, im.H); std::fwrite(im.rgb.data(), 1, im.rgb.size(), f); std::fclose(f); return 0; }
