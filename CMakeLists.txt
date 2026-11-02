@@ -42,3 +42,12 @@ if(PLT_BUILD_PALIC1)
   set_target_properties(llrans p-conv PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
                         RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR} RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR})
 endif()
+
+# pctx (PALIC + activity contexts, FSE/Huff0 streams) from palic-ctx/
+option(PLT_BUILD_PCTX "build palic-ctx (pctx)" ON)
+if(PLT_BUILD_PCTX)
+  enable_language(C)
+  add_subdirectory(palic-ctx)
+  set_target_properties(pctx PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+                        RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR} RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR})
+endif()
