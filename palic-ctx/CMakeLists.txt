@@ -6,7 +6,9 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 set(FSE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/fse)
 add_library(fse_huf STATIC ${FSE_DIR}/entropy_common.c ${FSE_DIR}/fse_compress.c ${FSE_DIR}/fse_decompress.c
-                           ${FSE_DIR}/hist.c ${FSE_DIR}/huf_compress.c ${FSE_DIR}/huf_decompress.c ${FSE_DIR}/debug.c)
+                           ${FSE_DIR}/hist.c ${FSE_DIR}/huf_compress.c ${FSE_DIR}/huf_decompress.c ${FSE_DIR}/debug.c
+                           ${FSE_DIR}/fseU16.c)
+target_compile_definitions(fse_huf PUBLIC FSEU16_MAX_SYMBOL_VALUE=1023)
 target_include_directories(fse_huf PUBLIC ${FSE_DIR})
 add_executable(pctx pctx.cpp)
 target_link_libraries(pctx PRIVATE fse_huf)

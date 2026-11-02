@@ -1,19 +1,16 @@
 // pctx — PALIC with activity contexts, HALIC-like block pipeline (prototype).
 //
-//   RGB -> RCT planes (Y = G + ((U+V)>>2), U = B-G, V = R-G)  ->  blocks of 200 rows (rest < 101 rows glued to the
-//   last block, as HALIC)  ->  per pixel, per plane: MED residual e, zz = zigzag(e), s = bit_width(zz) (0..9),
-//   (s-1) raw mantissa bits;  class = #thresholds <= act,  act = |a-c| + |c-b| + |b-d|  (own plane):
+//   RGB -> RCT planes (Y = G + ((U+V)>>2), U = B-G, V = R-G)  ->  blocks of 200 rows (HALIC rule: rest < 101
+//   rows glued to the last block; -b N for experiments, 0 = whole image)  ->  per plane-block predictor (one byte:
+//   0 MED, 1 (2(a+b)-c)/3, 2 (a+b+1)>>1; chosen by min sum of bit_width(zz))  ->  per pixel, per plane: residual e,
+//   wrapped (Y mod 256, U/V mod 512), zz = zigzag(e) is the symbol itself (Y < 256, U/V < 512);
+//   class = #thresholds <= act,  act = |a-c| + |c-b| + |b-d|  (own plane):
 //       Y:  1, 3, 10, 18, 35        U, V:  1, 4, 8, 16, 30          (6 classes each; from the CLIC sample)
-//   streams per block (11 symbol streams + 1 raw-bit stream):
-//       class 0 of Y, U and V together (flat pixels): JPEG-like run/size bytes  (run<<4 | s), ZRL = 0xF0 (16 zeros),
-//                                                       EOB = 0x00 (all remaining class-0 values of the block are 0)
-//       classes 1..5 of Y:      one byte stream each (s)
-//       classes 1..5 of U + V:  one byte stream each (s), chroma shares its tables
-//       mantissa bits of every nonzero value: one plain bit stream (64-bit words, LSB first)
-//   every symbol stream is coded with FSE (tANS) or Huff0 (-e fse|huf), chunks of 128 KB; raw / RLE fallbacks.
+//   streams per block, all of them FSE-U16 (Collet's fseU16, the engine HALIC uses), one table per stream:
+//       class 0 of Y, U and V together (flat pixels)      classes 1..5 of Y       classes 1..5 of U + V (shared)
 //   Prediction runs across block borders (only the statistics reset per block).
 //
-//   pctx c in.ppm out.pcx [-e fse|huf]      pctx d in.pcx out.ppm      pctx bench [-e fse|huf] a.ppm ...
+//   pctx c in.ppm out.pcx [-b rows] [-P mask]      pctx d in.pcx out.ppm      pctx bench [-b rows] [-P mask] a.ppm ...
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -24,12 +21,13 @@
 #include <string>
 #include <vector>
 extern "C" {
-#include "fse.h"
-#include "huf.h"
+#include "fseU16.h"
+unsigned FSE_isError(size_t code);
 }
 
 namespace pctx {
-constexpr int ROWS = 200, NCL = 6, NSTR = 11, CHUNK = 128 * 1024;
+constexpr int NCL = 6, NSTR = 11;
+static int g_rows = 200;                                    // block height (HALIC: 200)
 static const int THY[5] = {1, 3, 10, 18, 35}, THC[5] = {1, 4, 8, 16, 30};
 static uint8_t CLS[2][1024];                       // act (capped 1023) -> class, [0] Y, [1] chroma
 static void init_cls() { for (int t = 0; t < 2; ++t) for (int a = 0; a < 1024; ++a) { int k = 0; for (int i = 0; i < 5; ++i) k += a >= (t ? THC : THY)[i]; CLS[t][a] = uint8_t(k); } }
@@ -56,38 +54,25 @@ struct In {
     const uint8_t* take(size_t n) { if (size_t(e - p) < n) throw std::runtime_error("truncated"); const uint8_t* r = p; p += n; return r; }
 };
 
-// symbol stream: var(n) then chunks: [mode u8][var csize][data]   mode 0 raw, 1 rle (1 byte), 2 entropy-coded
-static void put_stream(Out& o, const std::vector<uint8_t>& s, bool huf, std::vector<uint8_t>& tmp) {
-    o.var(s.size());
-    for (size_t at = 0; at < s.size(); at += CHUNK) {
-        size_t n = std::min<size_t>(CHUNK, s.size() - at); const uint8_t* src = s.data() + at;
-        tmp.resize(n + n / 2 + 1024);
-        size_t c = huf ? HUF_compress(tmp.data(), tmp.size(), src, n) : FSE_compress(tmp.data(), tmp.size(), src, n);
-        bool err = huf ? HUF_isError(c) : FSE_isError(c);
-        if (!err && c == 1) { o.u8(1); o.u8(src[0]); }
-        else if (err || c == 0 || c >= n) { o.u8(0); o.raw(src, n); }
-        else { o.u8(2); o.var(c); o.raw(tmp.data(), c); }
-    }
+// symbol stream (u16 = whole zigzag residual): var(n), mode u8 (0 raw u16, 1 rle, 2 FSE-U16), [var csize][data]
+static void put_stream(Out& o, const std::vector<uint16_t>& s, std::vector<uint8_t>& tmp) {
+    o.var(s.size()); if (s.empty()) return;
+    unsigned mx = *std::max_element(s.begin(), s.end());
+    tmp.resize(s.size() * 2 + 4096);
+    size_t c = FSE_compressU16(tmp.data(), tmp.size(), s.data(), s.size(), mx ? mx : 1, 0);
+    if (!FSE_isError(c) && c == 1) { o.u8(1); o.var(s[0]); }
+    else if (FSE_isError(c) || c == 0 || c >= s.size() * 2) { o.u8(0); o.raw(s.data(), s.size() * 2); }
+    else { o.u8(2); o.var(c); o.raw(tmp.data(), c); }
 }
-static void get_stream(In& in, std::vector<uint8_t>& s, bool huf) {
-    size_t n = in.var(); s.resize(n + 16);
-    for (size_t at = 0; at < n; at += CHUNK) {
-        size_t m = std::min<size_t>(CHUNK, n - at); uint8_t mode = in.u8();
-        if (mode == 1) { std::memset(s.data() + at, in.u8(), m); continue; }
-        if (mode == 0) { std::memcpy(s.data() + at, in.take(m), m); continue; }
-        size_t c = in.var(); const uint8_t* src = in.take(c);
-        size_t r = huf ? HUF_decompress(s.data() + at, m, src, c) : FSE_decompress(s.data() + at, m, src, c);
-        if ((huf ? HUF_isError(r) : FSE_isError(r)) || r != m) throw std::runtime_error("entropy stream");
-    }
+static void get_stream(In& in, std::vector<uint16_t>& s) {
+    size_t n = in.var(); s.resize(n + 8); if (!n) return;
+    uint8_t mode = in.u8();
+    if (mode == 1) { uint16_t v = uint16_t(in.var()); std::fill(s.begin(), s.begin() + n, v); return; }
+    if (mode == 0) { std::memcpy(s.data(), in.take(n * 2), n * 2); return; }
+    size_t c = in.var(); const uint8_t* src = in.take(c);
+    size_t r = FSE_decompressU16(s.data(), n, src, c);
+    if (FSE_isError(r) || r != n) throw std::runtime_error("entropy stream");
 }
-
-// raw mantissa bits, LSB-first 64-bit words
-struct BitW { std::vector<uint64_t> w; uint64_t acc = 0; int n = 0;
-    inline void put(uint32_t v, int k) { if (!k) return; acc |= uint64_t(v) << n; n += k; if (n >= 64) { w.push_back(acc); n -= 64; acc = n ? uint64_t(v) >> (k - n) : 0; } }
-    void flush() { if (n) w.push_back(acc); acc = 0; n = 0; } };
-struct BitR { const uint64_t* p; uint64_t cur = 0; int avail = 0;
-    inline uint32_t get(int k) { if (!k) return 0; if (avail >= k) { uint32_t v = uint32_t(cur & ((1ull << k) - 1)); cur >>= k; avail -= k; return v; }
-        uint64_t w = *p++; uint32_t v = uint32_t((cur | (w << avail)) & ((1ull << k) - 1)); int used = k - avail; cur = used < 64 ? w >> used : 0; avail = 64 - used; return v; } };
 
 // ------------------------------------------------------------------ image and planes
 struct Img { int W = 0, H = 0; std::vector<uint8_t> rgb; };
@@ -99,11 +84,10 @@ static Img read_ppm(const char* fn) {
     im.rgb.resize(size_t(im.W) * im.H * 3); if (std::fread(im.rgb.data(), 1, im.rgb.size(), f) != im.rgb.size()) throw std::runtime_error("short");
     std::fclose(f); return im;
 }
-static std::vector<int> block_rows(int H) {                          // HALIC rule: 200-row blocks, rest < 101 glued
-    std::vector<int> r; int q = H / 200, rem = H % 200;
-    if (q == 0) { r.push_back(H); return r; }
-    int n = q + 1 - (rem < 101); for (int i = 0; i < n - 1; ++i) r.push_back(200); r.push_back(rem < 101 ? rem + 200 : rem);
-    return r;
+static std::vector<int> block_rows(int H, int R) {                  // HALIC rule for R = 200: rest < R/2+1 glued
+    std::vector<int> r; if (R <= 0 || R >= H) { r.push_back(H); return r; }
+    int q = H / R, rem = H % R, glue = rem < R / 2 + 1, n = q + 1 - glue;
+    for (int i = 0; i < n - 1; ++i) r.push_back(R); r.push_back(glue ? rem + R : rem); return r;
 }
 
 // per plane state: two rows (cur, up) of int16 values
@@ -115,9 +99,9 @@ static inline void nbr(const Plane& P, int x, int y, int W, int& a, int& b, int&
     b = P.up[x]; if (x == 0) { a = c = b; } else { a = P.cur[x - 1]; c = P.up[x - 1]; } d = x + 1 < W ? P.up[x + 1] : b;
 }
 
-std::vector<uint8_t> compress(const Img& im, bool huf, int* pstat = nullptr) {
+std::vector<uint8_t> compress(const Img& im, int* pstat = nullptr) {
     const int W = im.W, H = im.H; init_cls();
-    Out o; o.raw("PCX2", 4); o.var(W); o.var(H); o.u8(huf);
+    Out o; o.raw("PCX3", 4); o.var(W); o.var(H); o.var(g_rows);
     std::vector<int16_t> PL[3]; for (auto& p : PL) p.resize(size_t(W) * H);
     for (size_t i = 0, n = size_t(W) * H; i < n; ++i) { int R = im.rgb[3 * i], G = im.rgb[3 * i + 1], B = im.rgb[3 * i + 2], u = B - G, v = R - G;
         PL[0][i] = int16_t(G + ((u + v) >> 2)); PL[1][i] = int16_t(u); PL[2][i] = int16_t(v); }
@@ -126,8 +110,8 @@ std::vector<uint8_t> compress(const Img& im, bool huf, int* pstat = nullptr) {
         if (y == 0) { a = x ? cur[x - 1] : 0; b = c = d = a; return; }
         const int16_t* up = cur - W; b = up[x]; if (x == 0) { a = c = b; } else { a = cur[x - 1]; c = up[x - 1]; } d = x + 1 < W ? up[x + 1] : b; };
     auto wrap = [](int c, int e) { return c ? ((e + 256) & 511) - 256 : int(int8_t(e)); };
-    std::vector<uint8_t> S[NSTR], tmp; BitW bits; int y0 = 0;
-    for (int rows : block_rows(H)) {
+    std::vector<uint16_t> S[NSTR]; std::vector<uint8_t> tmp; int y0 = 0;
+    for (int rows : block_rows(H, g_rows)) {
         int mode[3];
         for (int c = 0; c < 3; ++c) {                                   // pick the predictor: min sum of bit_width(zz)
             long best = -1; mode[c] = 0;
@@ -137,7 +121,7 @@ std::vector<uint8_t> compress(const Img& im, bool huf, int* pstat = nullptr) {
                 if (best < 0 || cost < best) { best = cost; mode[c] = m; } }
             o.u8(uint8_t(mode[c])); if (pstat) pstat[mode[c]]++;
         }
-        for (auto& s : S) s.clear(); bits.w.clear(); int run = 0;
+        for (auto& s : S) s.clear();
         for (int y = y0; y < y0 + rows; ++y)
             for (int x = 0; x < W; ++x)
                 for (int c = 0; c < 3; ++c) {
@@ -145,36 +129,25 @@ std::vector<uint8_t> compress(const Img& im, bool huf, int* pstat = nullptr) {
                     int act = std::abs(a - cc) + std::abs(cc - b) + std::abs(b - d);
                     int k = CLS[c != 0][act < 1023 ? act : 1023];
                     int e = wrap(c, PL[c][size_t(y) * W + x] - pred(mode[c], a, b, cc));
-                    uint32_t z = uint32_t(e >= 0 ? 2 * e : -2 * e - 1), s = bw(z);
-                    if (k == 0) {
-                        if (!z) { ++run; continue; }
-                        while (run >= 16) { S[0].push_back(0xF0); run -= 16; }
-                        S[0].push_back(uint8_t(run << 4 | s)); run = 0;
-                    } else S[c ? 5 + k : k].push_back(uint8_t(s));
-                    if (s > 1) bits.put(z - (1u << (s - 1)), int(s - 1));
+                    S[k == 0 ? 0 : (c ? 5 + k : k)].push_back(uint16_t(e >= 0 ? 2 * e : -2 * e - 1));
                 }
         y0 += rows;
-        if (run) S[0].push_back(0x00);                                 // EOB: the rest of class 0 in this block is zero
-        bits.flush();
-        for (auto& s : S) put_stream(o, s, huf, tmp);
-        o.var(bits.w.size()); o.raw(bits.w.data(), bits.w.size() * 8);
+        for (auto& s : S) put_stream(o, s, tmp);
     }
     return std::move(o.b);
 }
 
 Img decompress(const std::vector<uint8_t>& data) {
     In in{data.data(), data.data() + data.size()}; init_cls();
-    if (std::memcmp(in.take(4), "PCX2", 4)) throw std::runtime_error("not PCX2");
-    Img im; im.W = int(in.var()); im.H = int(in.var()); bool huf = in.u8(); const int W = im.W, H = im.H;
+    if (std::memcmp(in.take(4), "PCX3", 4)) throw std::runtime_error("not PCX3");
+    Img im; im.W = int(in.var()); im.H = int(in.var()); int brows = int(in.var()); const int W = im.W, H = im.H;
     im.rgb.resize(size_t(W) * H * 3);
     Plane P[3]; for (auto& p : P) p.init(W);
-    std::vector<uint8_t> S[NSTR]; std::vector<uint64_t> words; int y = 0;
-    for (int rows : block_rows(H)) {
+    std::vector<uint16_t> S[NSTR]; int y = 0;
+    for (int rows : block_rows(H, brows)) {
         int mode[3]; for (int c = 0; c < 3; ++c) { mode[c] = in.u8(); if (mode[c] > 3) throw std::runtime_error("bad predictor"); }
-        for (auto& s : S) get_stream(in, s, huf);
-        size_t nw = in.var(); words.assign(nw + 2, 0); std::memcpy(words.data(), in.take(nw * 8), nw * 8);
-        BitR br{words.data()}; const uint8_t* sp[NSTR]; for (int i = 0; i < NSTR; ++i) sp[i] = S[i].data();
-        int zeros = 0; uint32_t pend = 0; bool eob = false;
+        for (auto& s : S) get_stream(in, s);
+        const uint16_t* sp[NSTR]; for (int i = 0; i < NSTR; ++i) sp[i] = S[i].data();
         for (int yy = 0; yy < rows; ++yy, ++y) {
             uint8_t* rgb = im.rgb.data() + size_t(y) * W * 3;
             for (int x = 0; x < W; ++x) {
@@ -183,20 +156,7 @@ Img decompress(const std::vector<uint8_t>& data) {
                     int a, b, cc, d; nbr(P[c], x, y, W, a, b, cc, d);
                     int act = std::abs(a - cc) + std::abs(cc - b) + std::abs(b - d);
                     int k = CLS[c != 0][act < 1023 ? act : 1023];
-                    uint32_t s;
-                    if (k == 0) {
-                        if (eob) s = 0;
-                        else if (zeros) { --zeros; s = 0; }
-                        else if (pend) { s = pend; pend = 0; }
-                        else {
-                            uint8_t t = *sp[0]++;
-                            if (t == 0xF0) { zeros = 15; s = 0; }
-                            else if (t == 0x00) { eob = true; s = 0; }
-                            else if (t >> 4) { zeros = (t >> 4) - 1; pend = t & 15; s = 0; }
-                            else s = t;
-                        }
-                    } else s = *sp[c ? 5 + k : k]++;
-                    uint32_t z = s > 1 ? (1u << (s - 1)) + br.get(int(s - 1)) : s;
+                    uint32_t z = *sp[k == 0 ? 0 : (c ? 5 + k : k)]++;
                     int e = int(z >> 1) ^ -int(z & 1), v = pred(mode[c], a, b, cc) + e;
                     v = c ? ((v + 256) & 511) - 256 : (v & 255);
                     P[c].cur[x] = int16_t(v); val[c] = v;
@@ -214,25 +174,25 @@ Img decompress(const std::vector<uint8_t>& data) {
 static std::vector<uint8_t> slurp(const char* fn) { FILE* f = std::fopen(fn, "rb"); if (!f) throw std::runtime_error("open"); std::vector<uint8_t> v; uint8_t b[1 << 16]; size_t k; while ((k = std::fread(b, 1, sizeof b, f))) v.insert(v.end(), b, b + k); std::fclose(f); return v; }
 int main(int argc, char** argv) {
     using namespace pctx;
-    if (argc < 3) { std::fprintf(stderr, "usage: pctx c in.ppm out.pcx [-e fse|huf] [-P mask] | pctx d in.pcx out.ppm | pctx bench [-e fse|huf] a.ppm ...\n"); return 1; }
-    std::string mode = argv[1]; bool huf = false; std::vector<const char*> pos;
-    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-e" && i + 1 < argc) huf = std::string(argv[++i]) == "huf"; else if (a == "-P" && i + 1 < argc) g_pmask = std::atoi(argv[++i]) & 15; else pos.push_back(argv[i]); }
+    if (argc < 3) { std::fprintf(stderr, "usage: pctx c in.ppm out.pcx [-b rows] [-P mask] | pctx d in.pcx out.ppm | pctx bench [-b rows] [-P mask] a.ppm ...\n"); return 1; }
+    std::string mode = argv[1]; std::vector<const char*> pos;
+    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-b" && i + 1 < argc) g_rows = std::atoi(argv[++i]); else if (a == "-P" && i + 1 < argc) g_pmask = std::atoi(argv[++i]) & 15; else pos.push_back(argv[i]); }
     if (!g_pmask) g_pmask = 1;
     try {
-        if (mode == "c" && pos.size() == 2) { auto o = compress(read_ppm(pos[0]), huf); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
+        if (mode == "c" && pos.size() == 2) { auto o = compress(read_ppm(pos[0])); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
         if (mode == "d" && pos.size() == 2) { Img im = decompress(slurp(pos[0])); FILE* f = std::fopen(pos[1], "wb"); std::fprintf(f, "P6\n%d %d\n255\n", im.W, im.H); std::fwrite(im.rgb.data(), 1, im.rgb.size(), f); std::fclose(f); return 0; }
         if (mode == "bench") {
             double te = 0, td = 0; size_t px = 0, by = 0; bool ok = true; int ps[4] = {0, 0, 0, 0};
             for (auto fn : pos) {
                 Img im = read_ppm(fn); double be = 1e9, bd = 1e9; std::vector<uint8_t> o; Img r;
                 for (int k = 0; k < 3; ++k) {
-                    auto t0 = std::chrono::steady_clock::now(); o = compress(im, huf, k ? nullptr : ps); auto t1 = std::chrono::steady_clock::now(); r = decompress(o); auto t2 = std::chrono::steady_clock::now();
+                    auto t0 = std::chrono::steady_clock::now(); o = compress(im, k ? nullptr : ps); auto t1 = std::chrono::steady_clock::now(); r = decompress(o); auto t2 = std::chrono::steady_clock::now();
                     be = std::min(be, std::chrono::duration<double>(t1 - t0).count()); bd = std::min(bd, std::chrono::duration<double>(t2 - t1).count());
                 }
                 bool g = r.rgb == im.rgb; ok &= g; size_t n = size_t(im.W) * im.H; px += n; by += o.size(); te += be; td += bd;
                 std::printf("%-28s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s %s\n", fn, im.W, im.H, o.size(), 8.0 * o.size() / n, 3e-6 * n / be, 3e-6 * n / bd, g ? "ok" : "FAIL");
             }
-            std::printf("TOTAL %zu files  %.4f bpp  enc %.1f  dec %.1f MB/s (RGB)  %s  P=%d  predictors used: MED %d  3pt %d  (a+b)/2 %d  (a+c)/2 %d  %s\n", pos.size(), 8.0 * by / px, 3e-6 * px / te, 3e-6 * px / td, huf ? "huf" : "fse", g_pmask, ps[0], ps[1], ps[2], ps[3], ok ? "all ok" : "FAIL");
+            std::printf("TOTAL %zu files  %.4f bpp  enc %.1f  dec %.1f MB/s (RGB)  b=%d  P=%d  predictors used: MED %d  3pt %d  (a+b)/2 %d  (a+c)/2 %d  %s\n", pos.size(), 8.0 * by / px, 3e-6 * px / te, 3e-6 * px / td, g_rows, g_pmask, ps[0], ps[1], ps[2], ps[3], ok ? "all ok" : "FAIL");
             return ok ? 0 : 3;
         }
     } catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 2; }
