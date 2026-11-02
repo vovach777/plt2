@@ -7,6 +7,7 @@
 //      backwards (bottom-right to top-left) so the neighbours are still the original samples; SSE4.1 8 lanes
 //   -> residual wrapped (Y mod 256, U/V mod 512), zigzag, in place
 //   -> FSE (Collet): byte FSE when max zz < 256, else FSE-U16; -n = no entropy coding (raw u16 residuals)
+//   -s: skewed 8-row bands (wavefront MED in 8 SSE lanes); only real pixels are stored, the band triangles are not.
 //   decoder: FSE writes straight into the tile buffer, MED restores the plane in place (left neighbour in a
 //   register), SSSE3 inverse RCT to interleaved RGB.  HALIC itself writes encoder residuals to a separate buffer.
 //
@@ -155,7 +156,7 @@ static inline void tr8x8(__m128i& r0, __m128i& r1, __m128i& r2, __m128i& r3, __m
     r0 = _mm_unpacklo_epi64(b0, b4); r1 = _mm_unpackhi_epi64(b0, b4); r2 = _mm_unpacklo_epi64(b1, b5); r3 = _mm_unpackhi_epi64(b1, b5);
     r4 = _mm_unpacklo_epi64(b2, b6); r5 = _mm_unpackhi_epi64(b2, b6); r6 = _mm_unpacklo_epi64(b3, b7); r7 = _mm_unpackhi_epi64(b3, b7);
 }
-static inline size_t skew_len(int w, int h) { return size_t((h + 7) / 8) * size_t(w + 7) * 8; }
+static inline size_t skew_len(int w, int h) { return size_t(w) * h; }      // only real pixels are stored, no padding
 // raster (stride w) -> skewed bands; rows of the band are first copied into zero-padded rows (8 left, 16 right)
 static void skew_pack(const int16_t* R, int w, int h, int16_t* S) {
     const int L = w + 7, PW = w + 32; thread_local std::vector<int16_t> pad; pad.assign(size_t(8) * PW, 0);
@@ -167,18 +168,32 @@ static void skew_pack(const int16_t* R, int w, int h, int16_t* S) {
             tr8x8(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
             for (int j = 0; j < 8; ++j) _mm_storeu_si128((__m128i*)(band.data() + size_t(t + j) * 8), v[j]);
         }
-        std::memcpy(S, band.data(), size_t(L) * 16); S += size_t(L) * 8;
+        const int hb = std::min(8, h - b0);                    // store only the lanes holding real pixels
+        for (int t = 0; t < L; ++t) {
+            int klo = std::max(0, t - w + 1), khi = std::min(hb - 1, t);
+            if (klo > khi) continue;
+            std::memcpy(S, band.data() + size_t(t) * 8 + klo, size_t(khi - klo + 1) * 2); S += khi - klo + 1;
+        }
     }
 }
 // in place over the skewed residuals: zigzag residuals in, plane values out; then back to raster rows of P (stride w)
-template <bool N9> static void skew_restore(int16_t* S, int w, int h, int16_t* P) {
+template <bool N9> static void skew_restore(const int16_t* S, int w, int h, int16_t* P) {
     const int L = w + 7, PW = w + 32; const __m128i one = _mm_set1_epi16(1), zero = _mm_setzero_si128(), m255 = _mm_set1_epi16(255);
     thread_local std::vector<int16_t> band, pad; band.resize(size_t(((L + 7) & ~7) + 8) * 8); pad.resize(size_t(8) * PW);
-    for (int b0 = 0; b0 < h; b0 += 8, S += size_t(L) * 8) {
+    alignas(16) int16_t lane[8];
+    for (int b0 = 0; b0 < h; b0 += 8) {
         const int16_t* top = b0 ? P + size_t(b0 - 1) * w : nullptr;
+        const int hb = std::min(8, h - b0);
         __m128i V = zero, Bp = zero;
         for (int t = 0; t < L; ++t) {
-            __m128i Z = _mm_loadu_si128((const __m128i*)(S + size_t(t) * 8));
+            int klo = std::max(0, t - w + 1), khi = std::min(hb - 1, t);
+            __m128i Z;
+            if (klo == 0 && khi == 7) { Z = _mm_loadu_si128((const __m128i*)S); S += 8; }       // full antidiagonal
+            else {                                                                              // band triangles / short band
+                std::memset(lane, 0, sizeof lane);
+                if (klo <= khi) { std::memcpy(lane + klo, S, size_t(khi - klo + 1) * 2); S += khi - klo + 1; }
+                Z = _mm_load_si128((const __m128i*)lane);
+            }
             __m128i e = _mm_xor_si128(_mm_srli_epi16(Z, 1), _mm_sub_epi16(zero, _mm_and_si128(Z, one)));
             __m128i b = _mm_insert_epi16(_mm_slli_si128(V, 2), (top && t < w) ? top[t] : 0, 0), c = Bp, a = V;
             __m128i mx = _mm_max_epi16(a, b), mn = _mm_min_epi16(a, b);
