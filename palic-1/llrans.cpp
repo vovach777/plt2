@@ -29,10 +29,30 @@ struct Enc {
     inline void put(uint32_t start, uint32_t freq, int sb, std::vector<uint32_t>& o) {
         renorm(((L >> sb) << 32) * freq, o); x = ((x / freq) << sb) + (x % freq) + start;
     }
+    // division-free put (ryg_rans Rans64EncSymbol): q = mulhi(x, rcp) >> shift == x / freq
+    inline void put_sym(const struct Sym& s, std::vector<uint32_t>& o);
     inline void bits(uint32_t v, int n, std::vector<uint32_t>& o) {     // n <= 16
         renorm(((L >> 16) << 32) << (16 - n), o); x = (x << n) | v;
     }
 };
+static inline uint64_t mulhi64(uint64_t a, uint64_t b) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    return __umulh(a, b);
+#else
+    return uint64_t((unsigned __int128)a * b >> 64);
+#endif
+}
+struct Sym { uint64_t rcp, xmax; uint32_t bias, cmpl; int shift; };
+static inline void sym_init(Sym& s, uint32_t start, uint32_t freq, int sb) {
+    s.xmax = ((L >> sb) << 32) * freq; s.cmpl = (1u << sb) - freq;
+    if (freq < 2) { s.rcp = ~0ull; s.shift = 0; s.bias = start + (1u << sb) - 1; return; }
+    int sh = 0; while (freq > (1u << sh)) ++sh;
+    uint64_t x0 = freq - 1, x1 = 1ull << (sh + 31), t1 = x1 / freq; x0 += (x1 % freq) << 32; uint64_t t0 = x0 / freq;
+    s.rcp = t0 + (t1 << 32); s.shift = sh - 1; s.bias = start;
+}
+inline void Enc::put_sym(const Sym& s, std::vector<uint32_t>& o) {
+    renorm(s.xmax, o); uint64_t q = mulhi64(x, s.rcp) >> s.shift; x = x + s.bias + q * s.cmpl;
+}
 struct Dec {
     uint64_t x;
     inline void renorm(const uint32_t*& p) { if (x < L) x = (x << 32) | *p++; }
@@ -70,10 +90,11 @@ static std::vector<uint32_t> enc_plane(const std::vector<uint16_t>& zz, int sb) 
         Hist h{}; size_t b = w * W;
         for (size_t i = 0; i < W; ++i) { uint32_t s = b + i < n ? bw(zz[b + i]) : 0; sym[i] = uint8_t(s); h.freq[s]++; }
         for (int i = 0, c = 0; i < NSYM; ++i) { h.start[i] = c; c += h.freq[i]; }
+        Sym S[NSYM]; for (int i = 0; i < NSYM; ++i) if (h.freq[i]) sym_init(S[i], h.start[i], h.freq[i], sb);
         for (size_t i = W; i-- > 0;) {
             Enc X = R[3]; uint32_t s = sym[i], v = b + i < n ? zz[b + i] : 0;
             if (s > 1) X.bits(v - (1u << (s - 1)), int(s - 1), o);
-            X.put(h.start[s], h.freq[s], sb, o);
+            X.put_sym(S[s], o);
             R[3] = R[2]; R[2] = R[1]; R[1] = R[0]; R[0] = X;
         }
         enc_hist(h, sb, R[0], o);
