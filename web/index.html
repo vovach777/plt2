@@ -1,0 +1,79 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>PLT2 web decode</title>
+<style>body{font:14px system-ui;margin:16px;background:#111;color:#ddd} canvas{max-width:100%;image-rendering:pixelated;border:1px solid #444} #log{white-space:pre}</style></head>
+<body>
+<div>PLT2: <input type="file" id="f" accept=".plt"> workers <select id="k"><option>1</option><option selected>2</option><option>4</option></select></div>
+<div id="log"></div><canvas id="c"></canvas>
+<script>
+// Decode a .plt with K Web Workers: each worker takes strips (round-robin), decodes a strip straight to RGBA
+// in its own wasm instance, transfers the buffer back; the main thread putImageData()s it at the strip's x.
+const qs = new URLSearchParams(location.search);
+const wasmUrl = qs.get('wasm') || 'plt2_dec_simd128.wasm';
+const log = s => (document.getElementById('log').textContent += s + '\n');
+let modP = fetch(wasmUrl).then(r => r.arrayBuffer()).then(b => WebAssembly.compile(b));
+
+function header(u8) {
+  const dv = new DataView(u8.buffer, u8.byteOffset);
+  const W = dv.getUint32(4, true), H = dv.getUint32(8, true);
+  const req = u8[15], n = req ? Math.min(req, Math.max(1, Math.floor(W / 64))) : Math.max(1, Math.floor(W / 512));
+  const B = Math.floor(W / 64), q = n > 1 ? Math.floor(B / n) : 0, r = n > 1 ? B % n : 0;            // same geometry as plt2.cpp
+  const x = i => (n === 1 ? 0 : 64 * (i * q + Math.min(i, r)));
+  return { W, H, n, x, w: i => (i + 1 < n ? 64 * (q + (i < r ? 1 : 0)) : W - x(i)) };
+}
+const workerSrc = `
+let ex, inPtr, inLen;
+onmessage = async (e) => {
+  const m = e.data;
+  if (m.type === 'init') {
+    const { instance } = await WebAssembly.instantiate(m.module, {}).then(i => ({ instance: i }));
+    ex = instance.exports; ex.plt_reset();
+    inLen = m.plt.byteLength; inPtr = ex.plt_alloc(inLen + 16);
+    new Uint8Array(ex.memory.buffer, inPtr, inLen).set(new Uint8Array(m.plt));
+    postMessage({ type: 'ready' });
+  } else if (m.type === 'strip') {
+    const w = ex.plt_strip_w(inPtr, inLen, m.i), H = m.H, n = w * H * 4;
+    const out = ex.plt_alloc(n);
+    const t0 = performance.now(); const rc = ex.plt_decode_strip_rgba(inPtr, inLen, m.i, out); const t1 = performance.now();
+    const buf = new Uint8ClampedArray(n); buf.set(new Uint8Array(ex.memory.buffer, out, n));
+    postMessage({ type: 'strip', i: m.i, w, rc, ms: t1 - t0, buf }, [buf.buffer]);
+  }
+};`;
+async function decode(pltBuf, K) {
+  const u8 = new Uint8Array(pltBuf), h = header(u8), mod = await modP;
+  const cv = document.getElementById('c'); cv.width = h.W; cv.height = h.H;
+  const ctx = cv.getContext('2d');
+  const url = URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' }));
+  const ws = Array.from({ length: Math.min(K, h.n) }, () => new Worker(url));
+  await Promise.all(ws.map(w => new Promise(r => { w.onmessage = r; w.postMessage({ type: 'init', module: mod, plt: pltBuf.slice(0) }); })));
+  const t0 = performance.now(); let left = h.n, busy = 0;
+  await new Promise(done => {
+    ws.forEach((w, k) => {
+      w.onmessage = e => {
+        const m = e.data; if (m.rc !== 0) log('strip ' + m.i + ' rc=' + m.rc);
+        ctx.putImageData(new ImageData(m.buf, m.w, h.H), h.x(m.i), 0);
+        busy = Math.max(busy, m.ms); if (--left === 0) done();
+      };
+      for (let i = k; i < h.n; i += ws.length) w.postMessage({ type: 'strip', i, H: h.H });
+    });
+  });
+  const ms = performance.now() - t0; ws.forEach(w => w.terminate());
+  return { W: h.W, H: h.H, strips: h.n, workers: ws.length, ms, mbs: 3 * h.W * h.H / 1e3 / ms, ctx };
+}
+async function verify(ctx, W, H, ppmUrl) {
+  const ppm = new Uint8Array(await (await fetch(ppmUrl)).arrayBuffer()), ref = ppm.subarray(ppm.length - W * H * 3);
+  const img = ctx.getImageData(0, 0, W, H).data; let bad = 0;
+  for (let p = 0, q = 0; p < W * H; ++p, q += 4) if (img[q] !== ref[3 * p] || img[q + 1] !== ref[3 * p + 1] || img[q + 2] !== ref[3 * p + 2] || img[q + 3] !== 255) ++bad;
+  return bad;
+}
+window.run = async (pltUrl, ppmUrl, K, reps = 3) => {
+  const buf = await (await fetch(pltUrl)).arrayBuffer(); let best = null;
+  for (let r = 0; r < reps; ++r) { const res = await decode(buf, K); if (!best || res.ms < best.ms) best = res; }
+  const bad = ppmUrl ? await verify(best.ctx, best.W, best.H, ppmUrl) : -1;
+  const out = { W: best.W, H: best.H, strips: best.strips, workers: best.workers, ms: +best.ms.toFixed(1), mbs: +best.mbs.toFixed(1), badPixels: bad };
+  log(JSON.stringify(out)); return out;
+};
+document.getElementById('f').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return; const res = await decode(await f.arrayBuffer(), +document.getElementById('k').value);
+  log(`${f.name}: ${res.W}x${res.H}, ${res.strips} strips, ${res.workers} workers, ${res.ms.toFixed(1)} ms, ${res.mbs.toFixed(1)} MB/s`);
+};
+</script></body></html>
