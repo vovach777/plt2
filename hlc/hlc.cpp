@@ -143,25 +143,81 @@ template <class F> static void parallel_for(int n, int threads, F f) {
     for (auto& t : th) t.join();
 }
 
-static bool g_raw = false;                                          // -n: no entropy coding
+// ------------------------------------------------------------------ skewed 8-row bands (wavefront MED, 8 lanes)
+// Band of 8 rows; pixel (x, k) lives at (x + k) * 8 + k, so vector t holds the antidiagonal (t - k, k), k = 0..7.
+// MED neighbours of vector t: a = V(t-1), b = V(t-1) shifted up one lane (lane 0 = row above the band, x = t),
+// c = b of step t-1. Borders are virtual zeros, which gives exactly the raster rules (row 0: P = a, column 0: P = b).
+static inline void tr8x8(__m128i& r0, __m128i& r1, __m128i& r2, __m128i& r3, __m128i& r4, __m128i& r5, __m128i& r6, __m128i& r7) {
+    __m128i a0 = _mm_unpacklo_epi16(r0, r1), a1 = _mm_unpackhi_epi16(r0, r1), a2 = _mm_unpacklo_epi16(r2, r3), a3 = _mm_unpackhi_epi16(r2, r3);
+    __m128i a4 = _mm_unpacklo_epi16(r4, r5), a5 = _mm_unpackhi_epi16(r4, r5), a6 = _mm_unpacklo_epi16(r6, r7), a7 = _mm_unpackhi_epi16(r6, r7);
+    __m128i b0 = _mm_unpacklo_epi32(a0, a2), b1 = _mm_unpackhi_epi32(a0, a2), b2 = _mm_unpacklo_epi32(a1, a3), b3 = _mm_unpackhi_epi32(a1, a3);
+    __m128i b4 = _mm_unpacklo_epi32(a4, a6), b5 = _mm_unpackhi_epi32(a4, a6), b6 = _mm_unpacklo_epi32(a5, a7), b7 = _mm_unpackhi_epi32(a5, a7);
+    r0 = _mm_unpacklo_epi64(b0, b4); r1 = _mm_unpackhi_epi64(b0, b4); r2 = _mm_unpacklo_epi64(b1, b5); r3 = _mm_unpackhi_epi64(b1, b5);
+    r4 = _mm_unpacklo_epi64(b2, b6); r5 = _mm_unpackhi_epi64(b2, b6); r6 = _mm_unpacklo_epi64(b3, b7); r7 = _mm_unpackhi_epi64(b3, b7);
+}
+static inline size_t skew_len(int w, int h) { return size_t((h + 7) / 8) * size_t(w + 7) * 8; }
+// raster (stride w) -> skewed bands; rows of the band are first copied into zero-padded rows (8 left, 16 right)
+static void skew_pack(const int16_t* R, int w, int h, int16_t* S) {
+    const int L = w + 7, PW = w + 32; thread_local std::vector<int16_t> pad; pad.assign(size_t(8) * PW, 0);
+    thread_local std::vector<int16_t> band; band.resize(size_t(((L + 7) & ~7) + 8) * 8);
+    for (int b0 = 0; b0 < h; b0 += 8) {
+        for (int k = 0; k < 8; ++k) { int16_t* row = pad.data() + size_t(k) * PW; std::fill(row, row + PW, int16_t(0)); if (b0 + k < h) std::memcpy(row + 8, R + size_t(b0 + k) * w, size_t(w) * 2); }
+        for (int t = 0; t < L; t += 8) {                       // row k, x = t - k .. t - k + 7 -> transpose -> vectors t .. t+7
+            __m128i v[8]; for (int k = 0; k < 8; ++k) v[k] = _mm_loadu_si128((const __m128i*)(pad.data() + size_t(k) * PW + 8 + t - k));
+            tr8x8(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            for (int j = 0; j < 8; ++j) _mm_storeu_si128((__m128i*)(band.data() + size_t(t + j) * 8), v[j]);
+        }
+        std::memcpy(S, band.data(), size_t(L) * 16); S += size_t(L) * 8;
+    }
+}
+// in place over the skewed residuals: zigzag residuals in, plane values out; then back to raster rows of P (stride w)
+template <bool N9> static void skew_restore(int16_t* S, int w, int h, int16_t* P) {
+    const int L = w + 7, PW = w + 32; const __m128i one = _mm_set1_epi16(1), zero = _mm_setzero_si128(), m255 = _mm_set1_epi16(255);
+    thread_local std::vector<int16_t> band, pad; band.resize(size_t(((L + 7) & ~7) + 8) * 8); pad.resize(size_t(8) * PW);
+    for (int b0 = 0; b0 < h; b0 += 8, S += size_t(L) * 8) {
+        const int16_t* top = b0 ? P + size_t(b0 - 1) * w : nullptr;
+        __m128i V = zero, Bp = zero;
+        for (int t = 0; t < L; ++t) {
+            __m128i Z = _mm_loadu_si128((const __m128i*)(S + size_t(t) * 8));
+            __m128i e = _mm_xor_si128(_mm_srli_epi16(Z, 1), _mm_sub_epi16(zero, _mm_and_si128(Z, one)));
+            __m128i b = _mm_insert_epi16(_mm_slli_si128(V, 2), (top && t < w) ? top[t] : 0, 0), c = Bp, a = V;
+            __m128i mx = _mm_max_epi16(a, b), mn = _mm_min_epi16(a, b);
+            __m128i pr = _mm_min_epi16(_mm_max_epi16(_mm_sub_epi16(_mm_add_epi16(a, b), c), mn), mx);
+            __m128i v = _mm_add_epi16(pr, e);
+            V = N9 ? _mm_srai_epi16(_mm_slli_epi16(v, 7), 7) : _mm_and_si128(v, m255);
+            _mm_storeu_si128((__m128i*)(band.data() + size_t(t) * 8), V); Bp = b;
+        }
+        std::memset(band.data() + size_t(L) * 8, 0, size_t(((L + 7) & ~7) + 8 - L) * 16);
+        for (int t = 0; t < L; t += 8) {                       // vectors t .. t+7 -> transpose -> row k, x = t - k ..
+            __m128i v[8]; for (int j = 0; j < 8; ++j) v[j] = _mm_loadu_si128((const __m128i*)(band.data() + size_t(t + j) * 8));
+            tr8x8(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            for (int k = 0; k < 8; ++k) _mm_storeu_si128((__m128i*)(pad.data() + size_t(k) * PW + 8 + t - k), v[k]);
+        }
+        for (int k = 0; k < 8 && b0 + k < h; ++k) std::memcpy(P + size_t(b0 + k) * w, pad.data() + size_t(k) * PW + 8, size_t(w) * 2);
+    }
+}
+
+static bool g_raw = false, g_skew = false;                          // -n: no entropy coding, -s: skewed 8-row bands
 // file: "HLC2" var W var H u8 raw, then per tile (raster order): var size, payload = 3 x stream
 std::vector<uint8_t> compress(const Img& im, int threads) {
     const int W = im.W, H = im.H, tx = (W + TS - 1) / TS, ty = (H + TS - 1) / TS, nt = tx * ty;
     std::vector<std::vector<uint8_t>> tiles(nt);
     parallel_for(nt, threads, [&](int t) {
         int x0 = (t % tx) * TS, y0 = (t / tx) * TS, w = std::min(TS, W - x0), h = std::min(TS, H - y0); size_t n = size_t(w) * h;
-        thread_local std::vector<int16_t> P[3]; thread_local std::vector<uint8_t> tmp, b8;
-        for (auto& p : P) p.resize(n);
+        thread_local std::vector<int16_t> P[3], SK; thread_local std::vector<uint8_t> tmp, b8;
+        for (auto& p : P) p.resize(n); const size_t ns = g_skew ? skew_len(w, h) : n; SK.resize(ns);
         for (int y = 0; y < h; ++y) rct_row(im.rgb.data() + (size_t(y0 + y) * W + x0) * 3, w, P[0].data() + size_t(y) * w, P[1].data() + size_t(y) * w, P[2].data() + size_t(y) * w);
         Out o;
         for (int c = 0; c < 3; ++c) {
             if (c < 2) residuals_inplace<true>(P[c].data(), w, h); else residuals_inplace<false>(P[c].data(), w, h);
-            if (g_raw) o.raw(P[c].data(), n * 2);
-            else put_stream(o, (const uint16_t*)P[c].data(), n, tmp, b8);
+            const int16_t* src = P[c].data();
+            if (g_skew) { skew_pack(P[c].data(), w, h, SK.data()); src = SK.data(); }
+            if (g_raw) o.raw(src, ns * 2);
+            else put_stream(o, (const uint16_t*)src, ns, tmp, b8);
         }
         tiles[t] = std::move(o.b);
     });
-    Out f; f.raw("HLC2", 4); f.var(W); f.var(H); f.u8(g_raw);
+    Out f; f.raw("HLC2", 4); f.var(W); f.var(H); f.u8(uint8_t(g_raw | g_skew << 1));
     for (int t = 0; t < nt; ++t) { f.var(tiles[t].size()); f.raw(tiles[t].data(), tiles[t].size()); }
     return std::move(f.b);
 }
@@ -169,18 +225,19 @@ std::vector<uint8_t> compress(const Img& im, int threads) {
 Img decompress(const std::vector<uint8_t>& data, int threads) {
     In in{data.data(), data.data() + data.size()};
     if (std::memcmp(in.take(4), "HLC2", 4)) throw std::runtime_error("not HLC2");
-    Img im; im.W = int(in.var()); im.H = int(in.var()); const bool raw = in.u8(); const int W = im.W, H = im.H, tx = (W + TS - 1) / TS, ty = (H + TS - 1) / TS, nt = tx * ty;
+    Img im; im.W = int(in.var()); im.H = int(in.var()); const uint8_t fl = in.u8(); const bool raw = fl & 1, skew = fl >> 1 & 1; const int W = im.W, H = im.H, tx = (W + TS - 1) / TS, ty = (H + TS - 1) / TS, nt = tx * ty;
     im.rgb.resize(size_t(W) * H * 3 + 64);
     std::vector<const uint8_t*> tp(nt); std::vector<size_t> tn(nt);
     for (int t = 0; t < nt; ++t) { tn[t] = in.var(); tp[t] = in.take(tn[t]); }
     parallel_for(nt, threads, [&](int t) {
         int x0 = (t % tx) * TS, y0 = (t / tx) * TS, w = std::min(TS, W - x0), h = std::min(TS, H - y0); size_t n = size_t(w) * h;
-        thread_local std::vector<int16_t> P[3]; thread_local std::vector<uint8_t> b8;
-        In ti{tp[t], tp[t] + tn[t]};
+        thread_local std::vector<int16_t> P[3], SK; thread_local std::vector<uint8_t> b8;
+        In ti{tp[t], tp[t] + tn[t]}; const size_t ns = skew ? skew_len(w, h) : n;
         for (int c = 0; c < 3; ++c) {
-            P[c].resize(n + 16);
-            if (raw) std::memcpy(P[c].data(), ti.take(n * 2), n * 2); else get_stream(ti, P[c].data(), n, b8);
-            if (c < 2) restore<true>(P[c].data(), w, h); else restore<false>(P[c].data(), w, h);
+            P[c].resize(n + 16); SK.resize(ns + 16); int16_t* dst = skew ? SK.data() : P[c].data();
+            if (raw) std::memcpy(dst, ti.take(ns * 2), ns * 2); else get_stream(ti, dst, ns, b8);
+            if (skew) { if (c < 2) skew_restore<true>(SK.data(), w, h, P[c].data()); else skew_restore<false>(SK.data(), w, h, P[c].data()); }
+            else if (c < 2) restore<true>(P[c].data(), w, h); else restore<false>(P[c].data(), w, h);
         }
         for (int y = 0; y < h; ++y) irct_row(P[0].data() + size_t(y) * w, P[1].data() + size_t(y) * w, P[2].data() + size_t(y) * w, w, im.rgb.data() + (size_t(y0 + y) * W + x0) * 3);
     });
@@ -203,7 +260,7 @@ int main(int argc, char** argv) {
     using namespace hlc; init_shuf();
     if (argc < 3) { std::fprintf(stderr, "usage: hlc c in.ppm out.hlc [-t N] [-n] | hlc d in.hlc out.ppm [-t N] | hlc bench [-t N] [-n] a.ppm ...\n"); return 1; }
     std::string mode = argv[1]; int threads = 1; std::vector<const char*> pos;
-    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else pos.push_back(argv[i]); }
+    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else pos.push_back(argv[i]); }
     try {
         if (mode == "c" && pos.size() == 2) { auto o = compress(read_ppm(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
         if (mode == "d" && pos.size() == 2) { Img im = decompress(slurp(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fprintf(f, "P6\n%d %d\n255\n", im.W, im.H); std::fwrite(im.rgb.data(), 1, im.rgb.size(), f); std::fclose(f); return 0; }
@@ -218,7 +275,7 @@ int main(int argc, char** argv) {
                 bool g = r.rgb == im.rgb; ok &= g; size_t n = size_t(im.W) * im.H; px += n; by += o.size(); te += be; td += bd;
                 std::printf("%-28s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s %s\n", fn, im.W, im.H, o.size(), 8.0 * o.size() / n, 3e-6 * n / be, 3e-6 * n / bd, g ? "ok" : "FAIL");
             }
-            std::printf("TOTAL %zu files  %.4f bpp  enc %.1f  dec %.1f MB/s (RGB)  t=%d  %s  %s\n", pos.size(), 8.0 * by / px, 3e-6 * px / te, 3e-6 * px / td, threads, g_raw ? "raw" : "fse", ok ? "all ok" : "FAIL");
+            std::printf("TOTAL %zu files  %.4f bpp  enc %.1f  dec %.1f MB/s (RGB)  t=%d  %s  %s\n", pos.size(), 8.0 * by / px, 3e-6 * px / te, 3e-6 * px / td, threads, g_raw ? (g_skew ? "raw skew" : "raw") : (g_skew ? "fse skew" : "fse"), ok ? "all ok" : "FAIL");
             return ok ? 0 : 3;
         }
     } catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 2; }
