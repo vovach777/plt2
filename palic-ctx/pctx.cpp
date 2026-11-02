@@ -70,10 +70,10 @@ static void put_stream(Out& o, const std::vector<uint16_t>& s, std::vector<uint8
     unsigned mx = *std::max_element(s.begin(), s.end());
     tmp.resize(s.size() * 2 + 4096); size_t c;
     if (g_fse8 && mx < 256) {
-        static thread_local std::vector<uint8_t> b; b.resize(s.size()); for (size_t i = 0; i < s.size(); ++i) b[i] = uint8_t(s[i]);
-        c = FSE_compress2(tmp.data(), tmp.size(), b.data(), b.size(), mx ? mx : 1, g_tl8);
+        static thread_local std::vector<uint8_t> b; b.resize(s.size() + 16); for (size_t i = 0; i < s.size(); ++i) b[i] = uint8_t(s[i]);
+        c = FSE_compress2(tmp.data(), tmp.size(), b.data(), s.size(), mx ? mx : 1, g_tl8);
         if (!FSE_isError(c) && c > 1 && c < s.size()) { o.u8(3); o.var(c); o.raw(tmp.data(), c); return; }
-        if (!FSE_isError(c) && (c == 0 || c >= s.size())) { o.u8(4); o.raw(b.data(), b.size()); return; }   // incompressible bytes
+        if (!FSE_isError(c) && (c == 0 || c >= s.size())) { o.u8(4); o.raw(b.data(), s.size()); return; }   // incompressible bytes
     }
     if (!(g_fse8 && mx < 256) || FSE_isError(c) || c > 1) c = FSE_compressU16(tmp.data(), tmp.size(), s.data(), s.size(), mx ? mx : 1, 0);
     if (!FSE_isError(c) && c == 1) { o.u8(1); o.var(s[0]); }

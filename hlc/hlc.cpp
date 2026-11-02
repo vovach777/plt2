@@ -114,7 +114,7 @@ template <bool N9> static void restore(int16_t* p, int w, int h) {
 static void put_stream(Out& o, const uint16_t* s, size_t n, std::vector<uint8_t>& tmp, std::vector<uint8_t>& b8) {
     unsigned mx = *std::max_element(s, s + n); tmp.resize(n * 2 + 4096);
     if (mx < 256) {
-        b8.resize(n); for (size_t i = 0; i < n; ++i) b8[i] = uint8_t(s[i]);
+        b8.resize(n + 16); for (size_t i = 0; i < n; ++i) b8[i] = uint8_t(s[i]);   // slack: HIST_count reads ahead
         size_t c = FSE_compress2(tmp.data(), tmp.size(), b8.data(), n, mx ? mx : 1, 12);
         if (!FSE_isError(c) && c == 1) { o.u8(1); o.var(s[0]); return; }
         if (!FSE_isError(c) && c > 1 && c < n) { o.u8(3); o.var(c); o.raw(tmp.data(), c); return; }
@@ -216,11 +216,14 @@ template <bool N9> static void skew_restore(const int16_t* S, int w, int h, int1
 // ---- fused decoder for -s: wavefront MED of a band for all three planes, then transpose + inverse RCT straight to RGB
 template <bool N9> static const int16_t* wave_band(const int16_t* S, int w, int hb, const int16_t* top, int16_t* band) {
     const int L = w + 7; const __m128i one = _mm_set1_epi16(1), zero = _mm_setzero_si128(), m255 = _mm_set1_epi16(255);
-    alignas(16) int16_t lane[8]; __m128i V = zero, Bp = zero;
+    const __m128i idx = _mm_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7); __m128i V = zero, Bp = zero;
     for (int t = 0; t < L; ++t) {
         int klo = std::max(0, t - w + 1), khi = std::min(hb - 1, t); __m128i Z;
         if (klo == 0 && khi == 7) { Z = _mm_loadu_si128((const __m128i*)S); S += 8; }
-        else { std::memset(lane, 0, sizeof lane); if (klo <= khi) { std::memcpy(lane + klo, S, size_t(khi - klo + 1) * 2); S += khi - klo + 1; } Z = _mm_load_si128((const __m128i*)lane); }
+        else {   // band triangle: load 8 so that lane klo = S[0], keep lanes klo..khi (the stream is padded, earlier data exists)
+            __m128i m = _mm_and_si128(_mm_cmpgt_epi16(idx, _mm_set1_epi16(short(klo - 1))), _mm_cmpgt_epi16(_mm_set1_epi16(short(khi + 1)), idx));
+            if (khi < klo) Z = zero; else { Z = _mm_and_si128(_mm_loadu_si128((const __m128i*)(S - klo)), m); S += khi - klo + 1; }
+        }
         __m128i e = _mm_xor_si128(_mm_srli_epi16(Z, 1), _mm_sub_epi16(zero, _mm_and_si128(Z, one)));
         __m128i b = _mm_insert_epi16(_mm_slli_si128(V, 2), top[t], 0), c = Bp, a = V;
         __m128i mx = _mm_max_epi16(a, b), mn = _mm_min_epi16(a, b);
@@ -301,8 +304,9 @@ Img decompress(const std::vector<uint8_t>& data, int threads) {
         thread_local std::vector<int16_t> P[3]; thread_local std::vector<uint8_t> b8;
         In ti{tp[t], tp[t] + tn[t]}; const size_t ns = skew ? skew_len(w, h) : n;
         if (skew) {                                                     // fused: streams -> wavefront MED -> RGB
-            for (int c = 0; c < 3; ++c) { P[c].resize(ns + 16); if (raw) std::memcpy(P[c].data(), ti.take(ns * 2), ns * 2); else get_stream(ti, P[c].data(), ns, b8); }
-            decode_tile_skew(P[0].data(), P[1].data(), P[2].data(), w, h, im.rgb.data() + (size_t(y0) * W + x0) * 3, size_t(W) * 3);
+            for (int c = 0; c < 3; ++c) { P[c].resize(ns + 32); int16_t* d = P[c].data() + 8; std::memset(P[c].data(), 0, 16);   // 8 slack before: masked loads read S - klo
+                if (raw) std::memcpy(d, ti.take(ns * 2), ns * 2); else get_stream(ti, d, ns, b8); }
+            decode_tile_skew(P[0].data() + 8, P[1].data() + 8, P[2].data() + 8, w, h, im.rgb.data() + (size_t(y0) * W + x0) * 3, size_t(W) * 3);
             return;
         }
         for (int c = 0; c < 3; ++c) {
