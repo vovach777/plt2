@@ -1,7 +1,8 @@
-// pctx — PALIC with activity contexts on the HALIC pipeline (format PCX4).
+// pctx — PALIC with activity contexts on the HALIC pipeline (format PCX5).
 //
-//   HALIC 0.7.2 pipeline (reverse-engineered with REA): blocks of 200 rows (rest < 101 glued to the last block);
-//   per block a colour mode = one of 17 triples of signals R, G, B, Y = (R+2G+B)>>2, Co = R-G, Cg = G-B, D = R-B
+//   HALIC 0.7.2 pipeline (reverse-engineered with REA): blocks of 200 rows (rest < 101 glued to the last block),
+//   tiles of 300 columns (HALIC's working buffer has rows of 300 samples; rest < 151 glued, -w 0 = full width);
+//   per tile a colour mode = one of 17 triples of signals R, G, B, Y = (R+2G+B)>>2, Co = R-G, Cg = G-B, D = R-B
 //   (mode 0 = Y,Co,Cg, modes 1..16 = the 16 independent triples of R,G,B,Co,Cg,D); per plane-block a predictor
 //   (0 MED, 1 (2(a+b)-c)/3, 2 (a+b+1)>>1); residual wrapped (8-bit signals mod 256, differences mod 512), zigzag;
 //   FSE (Collet's, as HALIC): byte path when the stream is < 256, U16 otherwise; raw / RLE fallbacks.
@@ -10,11 +11,11 @@
 //           shared streams, class 0 shared by all planes (11 streams per block). -k 0 = one stream per plane (HALIC).
 //     -C 2  colour mode chosen by MED cost (sum of bit_width(zz), every 2nd row); -C 1 = HALIC's sum|dx| with 2 %
 //           hysteresis; -C 0 = always Y,Co,Cg.
-//     -I 0  prediction continues across block borders (the row above is converted to the block's signals);
-//           -I 1 = independent blocks (HALIC).
-//   Defaults: -k 1 -C 2 -I 0.   HALIC-like:  -k 0 -C 1 -I 1.
+//     -I 0  prediction continues across tile borders (neighbours converted to the tile's signals);
+//           -I 1 = independent tiles (HALIC).
+//   Defaults: -k 1 -C 2 -I 0 -w 300.   HALIC-like:  -k 0 -C 1 -I 1.
 //
-//   pctx c in.ppm out.pcx [-k 0|1] [-C 0|1|2] [-I 0|1] [-b rows] [-P mask]   pctx d in.pcx out.ppm   pctx bench [opts] a.ppm ...
+//   pctx c in.ppm out.pcx [-k 0|1] [-C 0|1|2] [-I 0|1] [-w cols] [-b rows] [-P mask]   pctx d in.pcx out.ppm   pctx bench [opts] a.ppm ...
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -135,106 +136,132 @@ static inline void inv(int m, int p, int q, int r, int& R, int& G, int& B) {
 static inline bool nine(int id) { return id >= 4; }                         // differences are 9-bit (mod 512)
 static inline int wrapv(bool n9, int v) { return n9 ? ((v + 256) & 511) - 256 : (v & 255); }
 static inline int wrape(bool n9, int e) { return n9 ? ((e + 256) & 511) - 256 : int(int8_t(e)); }
-static int g_ctx = 1, g_indep = 0, g_cmode = 2;   // -k contexts (0 = one table per plane, as HALIC), -I independent blocks (HALIC: 1), -C colour mode: 0 fixed YCoCg, 1 HALIC sum|dx|, 2 MED cost
+static int g_ctx = 1, g_indep = 0, g_cmode = 2;   // -k contexts (0 = one table per plane, as HALIC), -I independent tiles (HALIC: 1), -C colour mode: 0 fixed YCoCg, 1 HALIC sum|dx|, 2 MED cost
+static int g_tw = 300;                             // -w tile width (HALIC working buffer: rows of 300 samples); 0 = full width
 
-// neighbours inside a block (independent blocks: the block's first row sees only the left neighbour)
-static inline void nbr2(const int16_t* cur, const int16_t* up, bool first, int x, int W, int& a, int& b, int& c, int& d) {
-    if (first) { a = x ? cur[x - 1] : 0; b = c = d = a; return; }
-    b = up[x]; if (x == 0) { a = c = b; } else { a = cur[x - 1]; c = up[x - 1]; } d = x + 1 < W ? up[x + 1] : b;
+static std::vector<int> spans(int n, int R) {      // 200-row blocks / 300-column tiles, rest < R/2+1 glued (HALIC rule for rows)
+    std::vector<int> r; if (R <= 0 || R >= n) { r.push_back(n); return r; }
+    int q = n / R, rem = n % R, glue = rem < R / 2 + 1, k = q + 1 - glue;
+    for (int i = 0; i < k - 1; ++i) r.push_back(R); r.push_back(glue ? rem + R : rem); return r;
 }
 static inline int stream_of(int ctx, int plane, int k) { return !ctx ? plane : (k == 0 ? 0 : (plane ? 5 + k : k)); }
 
+// Tile working buffer (as HALIC: row stride = tile width + border). Interior (x, y) at (y + 1) * S + x + 1;
+// row 0 and column 0 are the border (row above the tile, column left of it), filled only when the neighbour
+// exists and tiles are not independent.
+struct Tile {
+    int tw = 0, th = 0, S = 0; bool top = false, left = false;
+    std::vector<int16_t> buf[7];
+    void init(int w, int h, int nsig) { tw = w; th = h; S = w + 2; for (int i = 0; i < nsig; ++i) buf[i].assign(size_t(S) * (h + 1), 0); }
+    int16_t* at(int i, int x, int y) { return buf[i].data() + size_t(y + 1) * S + x + 1; }
+};
+// neighbours: inside the tile always; across the tile border only if the border was filled
+static inline void nbt(const int16_t* p, int S, int x, int y, int tw, bool top, bool left, int& a, int& b, int& c, int& d) {
+    bool hu = y > 0 || top, hl = x > 0 || left;
+    if (!hu) { a = hl ? p[-1] : 0; b = c = d = a; return; }
+    b = p[-S]; if (!hl) { a = c = b; } else { a = p[-1]; c = p[-S - 1]; } d = x + 1 < tw ? p[-S + 1] : b;
+}
+
+struct Enc1 { int cm, mode[3]; };
 std::vector<uint8_t> compress(const Img& im, int* pstat = nullptr, int* mstat = nullptr) {
-    const int W = im.W, H = im.H; const size_t N = size_t(W) * H; init_cls();
-    Out o; o.raw("PCX4", 4); o.var(W); o.var(H); o.var(g_rows); o.u8(uint8_t(g_ctx | g_indep << 1));
-    std::vector<int16_t> SG[7]; for (auto& p : SG) p.resize(N);
-    for (size_t i = 0; i < N; ++i) { int R = im.rgb[3 * i], G = im.rgb[3 * i + 1], B = im.rgb[3 * i + 2]; for (int id = 0; id < 7; ++id) SG[id][i] = int16_t(sig(id, R, G, B)); }
-    std::vector<uint16_t> S[NSTR]; std::vector<uint8_t> tmp; int y0 = 0;
-    auto nb = [&](const int16_t* p, int x, int y, int y0b, int& a, int& b, int& c, int& d) {
-        const int16_t* cur = p + size_t(y) * W; nbr2(cur, y ? cur - W : cur, g_indep ? y == y0b : y == 0, x, W, a, b, c, d); };
-    for (int rows : block_rows(H, g_rows)) {
-        // ---- colour mode: cost per signal, then the cheapest triple
-        int cm = 0;
-        if (g_cmode) {
-            long cost[7] = {0};
+    const int W = im.W, H = im.H; init_cls();
+    Out o; o.raw("PCX5", 4); o.var(W); o.var(H); o.var(g_rows); o.var(g_tw); o.u8(uint8_t(g_ctx | g_indep << 1));
+    auto pix = [&](int x, int y, int id) { const uint8_t* q = im.rgb.data() + (size_t(y) * W + x) * 3; return sig(id, q[0], q[1], q[2]); };
+    std::vector<uint16_t> S[NSTR]; std::vector<uint8_t> tmp; Tile T; int y0 = 0;
+    std::vector<int> cols = spans(W, g_tw);
+    for (int rows : spans(H, g_rows)) {
+        int x0 = 0;
+        for (int tw : cols) {
+            T.init(tw, rows, 7); T.top = !g_indep && y0 > 0; T.left = !g_indep && x0 > 0;
             for (int id = 0; id < 7; ++id) {
-                bool n9 = nine(id);
-                for (int y = y0; y < y0 + rows; y += (g_cmode == 1 ? 1 : 2)) for (int x = 0; x < W; ++x) {
-                    const int16_t* p = SG[id].data();
-                    if (g_cmode == 1) { if (x) cost[id] += std::abs(p[size_t(y) * W + x] - p[size_t(y) * W + x - 1]); }
-                    else { int a, b, cc, d; nb(p, x, y, y0, a, b, cc, d); int e = wrape(n9, p[size_t(y) * W + x] - med(a, b, cc)); cost[id] += bw(uint32_t(e >= 0 ? 2 * e : -2 * e - 1)); }
-                }
+                for (int y = 0; y < rows; ++y) for (int x = 0; x < tw; ++x) *T.at(id, x, y) = int16_t(pix(x0 + x, y0 + y, id));
+                if (T.top) for (int x = -1; x < tw; ++x) if (x0 + x >= 0) *T.at(id, x, -1) = int16_t(pix(x0 + x, y0 - 1, id));
+                if (T.left) for (int y = 0; y < rows; ++y) *T.at(id, -1, y) = int16_t(pix(x0 - 1, y0 + y, id));
             }
-            long best = cost[3] + cost[4] + cost[5];
-            for (int m = 1; m < 17; ++m) { long c = cost[TRI[m][0]] + cost[TRI[m][1]] + cost[TRI[m][2]]; if (c * 50 < best * 49) { best = c; cm = m; } }
+            auto cost_of = [&](int id, int m, int step) {
+                long cost = 0; bool n9 = nine(id);
+                for (int y = 0; y < rows; y += step) for (int x = 0; x < tw; ++x) {
+                    const int16_t* p = T.at(id, x, y); int a, b, cc, d; nbt(p, T.S, x, y, tw, T.top, T.left, a, b, cc, d);
+                    int e = wrape(n9, *p - pred(m, a, b, cc)); cost += bw(uint32_t(e >= 0 ? 2 * e : -2 * e - 1)); }
+                return cost; };
+            int cm = 0;
+            if (g_cmode == 1) {                                        // HALIC: sum |dx|, 2 % hysteresis
+                long cost[7] = {0};
+                for (int id = 0; id < 7; ++id) for (int y = 0; y < rows; ++y) for (int x = 1; x < tw; ++x) cost[id] += std::abs(*T.at(id, x, y) - *T.at(id, x - 1, y));
+                long best = cost[3] + cost[4] + cost[5];
+                for (int m = 1; m < 17; ++m) { long c = cost[TRI[m][0]] + cost[TRI[m][1]] + cost[TRI[m][2]]; if (c * 50 < best * 49) { best = c; cm = m; } }
+            } else if (g_cmode == 2) {
+                long cost[7]; for (int id = 0; id < 7; ++id) cost[id] = cost_of(id, 0, 2);
+                long best = cost[3] + cost[4] + cost[5];
+                for (int m = 1; m < 17; ++m) { long c = cost[TRI[m][0]] + cost[TRI[m][1]] + cost[TRI[m][2]]; if (c * 50 < best * 49) { best = c; cm = m; } }
+            }
+            o.u8(uint8_t(cm)); if (mstat) mstat[cm]++;
+            int mode[3];
+            for (int c = 0; c < 3; ++c) {
+                long best = -1; mode[c] = 0;
+                for (int m = 0; m < 4; ++m) { if (!(g_pmask >> m & 1)) continue; long cost = cost_of(TRI[cm][c], m, 2); if (best < 0 || cost < best) { best = cost; mode[c] = m; } }
+                o.u8(uint8_t(mode[c])); if (pstat) pstat[mode[c]]++;
+            }
+            for (auto& s : S) s.clear();
+            for (int y = 0; y < rows; ++y)
+                for (int x = 0; x < tw; ++x)
+                    for (int c = 0; c < 3; ++c) {
+                        int id = TRI[cm][c]; bool n9 = nine(id); const int16_t* p = T.at(id, x, y);
+                        int a, b, cc, d; nbt(p, T.S, x, y, tw, T.top, T.left, a, b, cc, d);
+                        int k = 0;
+                        if (g_ctx) { int act = std::abs(a - cc) + std::abs(cc - b) + std::abs(b - d); k = CLS[n9][act < 1023 ? act : 1023]; }
+                        int e = wrape(n9, *p - pred(mode[c], a, b, cc));
+                        S[stream_of(g_ctx, c, k)].push_back(uint16_t(e >= 0 ? 2 * e : -2 * e - 1));
+                    }
+            for (int i = 0; i < (g_ctx ? NSTR : 3); ++i) put_stream(o, S[i], tmp);
+            x0 += tw;
         }
-        o.u8(uint8_t(cm)); if (mstat) mstat[cm]++;
-        const int16_t* PL[3] = {SG[TRI[cm][0]].data(), SG[TRI[cm][1]].data(), SG[TRI[cm][2]].data()};
-        bool N9[3] = {nine(TRI[cm][0]), nine(TRI[cm][1]), nine(TRI[cm][2])};
-        // ---- predictor per plane: min sum of bit_width(zz), every 2nd row
-        int mode[3];
-        for (int c = 0; c < 3; ++c) {
-            long best = -1; mode[c] = 0;
-            for (int m = 0; m < 4; ++m) { if (!(g_pmask >> m & 1)) continue; long cost = 0;
-                for (int y = y0; y < y0 + rows; y += 2) for (int x = 0; x < W; ++x) { int a, b, cc, d; nb(PL[c], x, y, y0, a, b, cc, d);
-                    int e = wrape(N9[c], PL[c][size_t(y) * W + x] - pred(m, a, b, cc)); cost += bw(uint32_t(e >= 0 ? 2 * e : -2 * e - 1)); }
-                if (best < 0 || cost < best) { best = cost; mode[c] = m; } }
-            o.u8(uint8_t(mode[c])); if (pstat) pstat[mode[c]]++;
-        }
-        for (auto& s : S) s.clear();
-        for (int y = y0; y < y0 + rows; ++y)
-            for (int x = 0; x < W; ++x)
-                for (int c = 0; c < 3; ++c) {
-                    int a, b, cc, d; nb(PL[c], x, y, y0, a, b, cc, d);
-                    int k = 0;
-                    if (g_ctx) { int act = std::abs(a - cc) + std::abs(cc - b) + std::abs(b - d); k = CLS[N9[c]][act < 1023 ? act : 1023]; }
-                    int e = wrape(N9[c], PL[c][size_t(y) * W + x] - pred(mode[c], a, b, cc));
-                    S[stream_of(g_ctx, c, k)].push_back(uint16_t(e >= 0 ? 2 * e : -2 * e - 1));
-                }
         y0 += rows;
-        for (int i = 0; i < (g_ctx ? NSTR : 3); ++i) put_stream(o, S[i], tmp);
     }
     return std::move(o.b);
 }
 
 Img decompress(const std::vector<uint8_t>& data) {
     In in{data.data(), data.data() + data.size()}; init_cls();
-    if (std::memcmp(in.take(4), "PCX4", 4)) throw std::runtime_error("not PCX4");
-    Img im; im.W = int(in.var()); im.H = int(in.var()); int brows = int(in.var()); uint8_t fl = in.u8(); const int W = im.W, H = im.H;
+    if (std::memcmp(in.take(4), "PCX5", 4)) throw std::runtime_error("not PCX5");
+    Img im; im.W = int(in.var()); im.H = int(in.var()); int brows = int(in.var()), btw = int(in.var()); uint8_t fl = in.u8(); const int W = im.W, H = im.H;
     const int ctx = fl & 1, indep = fl >> 1 & 1;
     im.rgb.resize(size_t(W) * H * 3);
-    std::vector<int16_t> rows3[3][2]; for (auto& p : rows3) for (auto& r : p) r.assign(W + 2, 0);
-    std::vector<uint16_t> S[NSTR]; int y = 0;
-    for (int rows : block_rows(H, brows)) {
-        int cm = in.u8(); if (cm > 16) throw std::runtime_error("bad colour mode");
-        int mode[3]; for (int c = 0; c < 3; ++c) { mode[c] = in.u8(); if (mode[c] > 3) throw std::runtime_error("bad predictor"); }
-        for (int i = 0; i < (ctx ? NSTR : 3); ++i) get_stream(in, S[i]);
-        const uint16_t* sp[NSTR]; for (int i = 0; i < NSTR; ++i) sp[i] = S[i].data();
-        bool N9[3] = {nine(TRI[cm][0]), nine(TRI[cm][1]), nine(TRI[cm][2])};
-        int16_t* cur[3]; int16_t* up[3];
-        for (int c = 0; c < 3; ++c) { cur[c] = rows3[c][0].data() + 1; up[c] = rows3[c][1].data() + 1; }
-        if (!indep && y > 0) {                                           // previous row in this block's signals
-            const uint8_t* prev = im.rgb.data() + size_t(y - 1) * W * 3;
-            for (int x = 0; x < W; ++x) for (int c = 0; c < 3; ++c) up[c][x] = int16_t(sig(TRI[cm][c], prev[3 * x], prev[3 * x + 1], prev[3 * x + 2]));
-        }
-        for (int yy = 0; yy < rows; ++yy, ++y) {
-            bool first = indep ? yy == 0 : y == 0;
-            uint8_t* rgb = im.rgb.data() + size_t(y) * W * 3;
-            for (int x = 0; x < W; ++x) {
-                int val[3];
-                for (int c = 0; c < 3; ++c) {
-                    int a, b, cc, d; nbr2(cur[c], up[c], first, x, W, a, b, cc, d);
-                    int k = 0;
-                    if (ctx) { int act = std::abs(a - cc) + std::abs(cc - b) + std::abs(b - d); k = CLS[N9[c]][act < 1023 ? act : 1023]; }
-                    uint32_t z = *sp[stream_of(ctx, c, k)]++;
-                    int e = int(z >> 1) ^ -int(z & 1), v = wrapv(N9[c], pred(mode[c], a, b, cc) + e);
-                    cur[c][x] = int16_t(v); val[c] = v;
-                }
-                int R, G, B; inv(cm, val[0], val[1], val[2], R, G, B);
-                rgb[3 * x] = uint8_t(R); rgb[3 * x + 1] = uint8_t(G); rgb[3 * x + 2] = uint8_t(B);
+    std::vector<uint16_t> S[NSTR]; Tile T; int y0 = 0;
+    std::vector<int> cols = spans(W, btw);
+    for (int rows : spans(H, brows)) {
+        int x0 = 0;
+        for (int tw : cols) {
+            int cm = in.u8(); if (cm > 16) throw std::runtime_error("bad colour mode");
+            int mode[3]; for (int c = 0; c < 3; ++c) { mode[c] = in.u8(); if (mode[c] > 3) throw std::runtime_error("bad predictor"); }
+            for (int i = 0; i < (ctx ? NSTR : 3); ++i) get_stream(in, S[i]);
+            const uint16_t* sp[NSTR]; for (int i = 0; i < NSTR; ++i) sp[i] = S[i].data();
+            T.init(tw, rows, 3); T.top = !indep && y0 > 0; T.left = !indep && x0 > 0;
+            bool N9[3]; for (int c = 0; c < 3; ++c) N9[c] = nine(TRI[cm][c]);
+            auto rgbp = [&](int x, int y) { return im.rgb.data() + (size_t(y) * W + x) * 3; };
+            for (int c = 0; c < 3; ++c) {                                 // borders from the decoded picture, in this tile's signals
+                if (T.top) for (int x = -1; x < tw; ++x) if (x0 + x >= 0) { const uint8_t* q = rgbp(x0 + x, y0 - 1); *T.at(c, x, -1) = int16_t(sig(TRI[cm][c], q[0], q[1], q[2])); }
+                if (T.left) for (int y = 0; y < rows; ++y) { const uint8_t* q = rgbp(x0 - 1, y0 + y); *T.at(c, -1, y) = int16_t(sig(TRI[cm][c], q[0], q[1], q[2])); }
             }
-            for (int c = 0; c < 3; ++c) std::swap(cur[c], up[c]);
+            for (int y = 0; y < rows; ++y) {
+                uint8_t* out = rgbp(x0, y0 + y);
+                for (int x = 0; x < tw; ++x) {
+                    int val[3];
+                    for (int c = 0; c < 3; ++c) {
+                        int16_t* p = T.at(c, x, y); int a, b, cc, d; nbt(p, T.S, x, y, tw, T.top, T.left, a, b, cc, d);
+                        int k = 0;
+                        if (ctx) { int act = std::abs(a - cc) + std::abs(cc - b) + std::abs(b - d); k = CLS[N9[c]][act < 1023 ? act : 1023]; }
+                        uint32_t z = *sp[stream_of(ctx, c, k)]++;
+                        int e = int(z >> 1) ^ -int(z & 1), v = wrapv(N9[c], pred(mode[c], a, b, cc) + e);
+                        *p = int16_t(v); val[c] = v;
+                    }
+                    int R, G, B; inv(cm, val[0], val[1], val[2], R, G, B);
+                    out[3 * x] = uint8_t(R); out[3 * x + 1] = uint8_t(G); out[3 * x + 2] = uint8_t(B);
+                }
+            }
+            x0 += tw;
         }
+        y0 += rows;
     }
     return im;
 }
@@ -245,7 +272,7 @@ int main(int argc, char** argv) {
     using namespace pctx;
     if (argc < 3) { std::fprintf(stderr, "usage: pctx c in.ppm out.pcx [-k 0|1] [-C 0|1|2] [-I 0|1] [-b rows] [-P mask] | pctx d in.pcx out.ppm | pctx bench [opts] a.ppm ...\n"); return 1; }
     std::string mode = argv[1]; std::vector<const char*> pos;
-    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-b" && i + 1 < argc) g_rows = std::atoi(argv[++i]); else if (a == "-16") g_fse8 = false; else if (a == "-T" && i + 1 < argc) g_tl8 = unsigned(std::clamp(std::atoi(argv[++i]), 5, 12)); else if (a == "-P" && i + 1 < argc) g_pmask = std::atoi(argv[++i]) & 15; else if (a == "-k" && i + 1 < argc) g_ctx = std::atoi(argv[++i]) ? 1 : 0; else if (a == "-I" && i + 1 < argc) g_indep = std::atoi(argv[++i]) ? 1 : 0; else if (a == "-C" && i + 1 < argc) g_cmode = std::clamp(std::atoi(argv[++i]), 0, 2); else pos.push_back(argv[i]); }
+    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-b" && i + 1 < argc) g_rows = std::atoi(argv[++i]); else if (a == "-16") g_fse8 = false; else if (a == "-T" && i + 1 < argc) g_tl8 = unsigned(std::clamp(std::atoi(argv[++i]), 5, 12)); else if (a == "-P" && i + 1 < argc) g_pmask = std::atoi(argv[++i]) & 15; else if (a == "-w" && i + 1 < argc) g_tw = std::atoi(argv[++i]); else if (a == "-k" && i + 1 < argc) g_ctx = std::atoi(argv[++i]) ? 1 : 0; else if (a == "-I" && i + 1 < argc) g_indep = std::atoi(argv[++i]) ? 1 : 0; else if (a == "-C" && i + 1 < argc) g_cmode = std::clamp(std::atoi(argv[++i]), 0, 2); else pos.push_back(argv[i]); }
     if (!g_pmask) g_pmask = 1;
     try {
         if (mode == "c" && pos.size() == 2) { auto o = compress(read_ppm(pos[0])); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
@@ -262,7 +289,7 @@ int main(int argc, char** argv) {
                 std::printf("%-28s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s %s\n", fn, im.W, im.H, o.size(), 8.0 * o.size() / n, 3e-6 * n / be, 3e-6 * n / bd, g ? "ok" : "FAIL");
             }
             std::printf("colour modes used:"); for (int m = 0; m < 17; ++m) if (ms[m]) std::printf(" %d:%d", m, ms[m]); std::printf("\n");
-            std::printf("TOTAL %zu files  %.4f bpp  enc %.1f  dec %.1f MB/s (RGB)  k=%d I=%d C=%d b=%d  P=%d  predictors used: MED %d  3pt %d  (a+b)/2 %d  (a+c)/2 %d  %s\n", pos.size(), 8.0 * by / px, 3e-6 * px / te, 3e-6 * px / td, g_ctx, g_indep, g_cmode, g_rows, g_pmask, ps[0], ps[1], ps[2], ps[3], ok ? "all ok" : "FAIL");
+            std::printf("TOTAL %zu files  %.4f bpp  enc %.1f  dec %.1f MB/s (RGB)  k=%d I=%d C=%d w=%d b=%d  P=%d  predictors used: MED %d  3pt %d  (a+b)/2 %d  (a+c)/2 %d  %s\n", pos.size(), 8.0 * by / px, 3e-6 * px / te, 3e-6 * px / td, g_ctx, g_indep, g_cmode, g_tw, g_rows, g_pmask, ps[0], ps[1], ps[2], ps[3], ok ? "all ok" : "FAIL");
             return ok ? 0 : 3;
         }
     } catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 2; }
