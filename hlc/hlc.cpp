@@ -110,7 +110,10 @@ template <bool N9> static void restore(int16_t* p, int w, int h) {
     }
 }
 
-// ------------------------------------------------------------------ FSE stream: mode u8 (0 raw u16, 1 rle, 2 FSE-U16, 3 FSE-8, 4 raw u8), [var csize][data]
+// ------------------------------------------------------------------ FSE stream: mode u8, [var csize][data]
+// 0 raw u16, 1 rle, 2 FSE-U16, 3 FSE-8, 4 raw u8,
+// 5 FSE-8 + escape: u8 E, var c, FSE-8(min(zz,E)), var ne, u8 tb, ne x tb bits of (zz-E) LSB-first
+static int g_esc = 255;                                             // -e: escape symbol for wide (9-bit) streams, 0 = use FSE-U16
 static void put_stream(Out& o, const uint16_t* s, size_t n, std::vector<uint8_t>& tmp, std::vector<uint8_t>& b8) {
     unsigned mx = *std::max_element(s, s + n); tmp.resize(n * 2 + 4096);
     if (mx < 256) {
@@ -120,10 +123,32 @@ static void put_stream(Out& o, const uint16_t* s, size_t n, std::vector<uint8_t>
         if (!FSE_isError(c) && c > 1 && c < n) { o.u8(3); o.var(c); o.raw(tmp.data(), c); return; }
         o.u8(4); o.raw(b8.data(), n); return;
     }
+    if (g_esc > 0) {
+        const unsigned E = unsigned(g_esc), tb = bw(mx - E); b8.resize(n + 16); size_t ne = 0;
+        for (size_t i = 0; i < n; ++i) { unsigned v = s[i]; ne += v >= E; b8[i] = uint8_t(v < E ? v : E); }
+        size_t c = FSE_compress2(tmp.data(), tmp.size(), b8.data(), n, E, 12);
+        if (!FSE_isError(c) && c > 1 && c < n) {
+            if (ne * 64 > n) {                                      // escape-heavy (noise, tiny tiles): keep FSE-U16 if it is smaller
+                std::vector<uint8_t> t2(n * 2 + 4096); size_t c2 = FSE_compressU16(t2.data(), t2.size(), s, n, mx, 0);
+                if (!FSE_isError(c2) && c2 > 1 && c2 + 4 < c + (ne * tb + 7) / 8) { o.u8(2); o.var(c2); o.raw(t2.data(), c2); return; }
+            }
+            o.u8(5); o.u8(uint8_t(E)); o.var(c); o.raw(tmp.data(), c); o.var(ne); o.u8(uint8_t(tb));
+            uint64_t acc = 0; int nb = 0;
+            for (size_t i = 0; i < n; ++i) if (s[i] >= E) { acc |= uint64_t(s[i] - E) << nb; nb += tb; while (nb >= 8) { o.u8(uint8_t(acc)); acc >>= 8; nb -= 8; } }
+            if (nb) o.u8(uint8_t(acc));
+            return;
+        }
+    }
     size_t c = FSE_compressU16(tmp.data(), tmp.size(), s, n, mx, 0);
     if (!FSE_isError(c) && c == 1) { o.u8(1); o.var(s[0]); return; }
     if (FSE_isError(c) || c == 0 || c >= n * 2) { o.u8(0); o.raw(s, n * 2); return; }
     o.u8(2); o.var(c); o.raw(tmp.data(), c);
+}
+static inline void widen8(const uint8_t* b, int16_t* d, size_t n) {   // u8 -> i16, 16 per step (b has 16 slack)
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) { __m128i x = _mm_loadu_si128((const __m128i*)(b + i));
+        _mm_storeu_si128((__m128i*)(d + i), _mm_cvtepu8_epi16(x)); _mm_storeu_si128((__m128i*)(d + i + 8), _mm_cvtepu8_epi16(_mm_srli_si128(x, 8))); }
+    for (; i < n; ++i) d[i] = b[i];
 }
 // decode straight into the tile buffer (int16 holding zigzag values)
 static void get_stream(In& in, int16_t* dst, size_t n, std::vector<uint8_t>& b8) {
@@ -131,10 +156,23 @@ static void get_stream(In& in, int16_t* dst, size_t n, std::vector<uint8_t>& b8)
     if (mode == 1) { int16_t v = int16_t(in.var()); std::fill(dst, dst + n, v); return; }
     if (mode == 0) { std::memcpy(dst, in.take(n * 2), n * 2); return; }
     if (mode == 4) { const uint8_t* b = in.take(n); for (size_t i = 0; i < n; ++i) dst[i] = b[i]; return; }
+    unsigned E = mode == 5 ? in.u8() : 0;
     size_t c = in.var(); const uint8_t* src = in.take(c); size_t r;
-    if (mode == 3) { b8.resize(n + 16); r = FSE_decompress(b8.data(), n, src, c); for (size_t i = 0; i < n; ++i) dst[i] = b8[i]; }
-    else r = FSE_decompressU16((unsigned short*)dst, n, src, c);
-    if (FSE_isError(r) || r != n) throw std::runtime_error("entropy stream");
+    if (mode == 3 || mode == 5) { b8.resize(n + 16); r = FSE_decompress(b8.data(), n, src, c); if (FSE_isError(r) || r != n) throw std::runtime_error("entropy stream"); }
+    else { r = FSE_decompressU16((unsigned short*)dst, n, src, c); if (FSE_isError(r) || r != n) throw std::runtime_error("entropy stream"); return; }
+    widen8(b8.data(), dst, n);
+    if (mode == 3) return;
+    size_t ne = in.var(); const unsigned tb = in.u8(); if (tb > 9) throw std::runtime_error("escape bits");
+    const uint8_t* t = in.take((ne * tb + 7) / 8); uint64_t acc = 0; int nb = 0; const uint32_t msk = (1u << tb) - 1;
+    const __m128i ev = _mm_set1_epi8(char(E)); size_t seen = 0;
+    for (size_t i = 0; i < n && seen < ne; i += 16) {                 // find escapes 16 at a time (rare)
+        unsigned m = unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128((const __m128i*)(b8.data() + i)), ev)));
+        if (i + 16 > n) m &= (1u << (n - i)) - 1;
+        while (m) { int k = __builtin_ctz(m); m &= m - 1;
+            while (nb < int(tb)) { acc |= uint64_t(*t++) << nb; nb += 8; }
+            dst[i + k] = int16_t(E + (acc & msk)); acc >>= tb; nb -= tb; ++seen; }
+    }
+    if (seen != ne) throw std::runtime_error("escape count");
 }
 
 template <class F> static void parallel_for(int n, int threads, F f) {
@@ -335,7 +373,7 @@ int main(int argc, char** argv) {
     using namespace hlc; init_shuf();
     if (argc < 3) { std::fprintf(stderr, "usage: hlc c in.ppm out.hlc [-t N] [-n] | hlc d in.hlc out.ppm [-t N] | hlc bench [-t N] [-n] a.ppm ...\n"); return 1; }
     std::string mode = argv[1]; int threads = 1; std::vector<const char*> pos;
-    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else pos.push_back(argv[i]); }
+    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-e" && i + 1 < argc) g_esc = std::atoi(argv[++i]); else pos.push_back(argv[i]); }
     try {
         if (mode == "c" && pos.size() == 2) { auto o = compress(read_ppm(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
         if (mode == "d" && pos.size() == 2) { Img im = decompress(slurp(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fprintf(f, "P6\n%d %d\n255\n", im.W, im.H); std::fwrite(im.rgb.data(), 1, im.rgb.size(), f); std::fclose(f); return 0; }
