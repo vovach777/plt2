@@ -34,3 +34,11 @@ if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
 else()                                                                 # gcc / clang
   target_compile_options(plt2 PRIVATE -O3 -march=$<IF:$<BOOL:${PLT_ARCH}>,${PLT_ARCH},native>)
 endif()
+
+# PALIC-1 (llrans, p-conv) from palic-1/; executables land next to plt2
+option(PLT_BUILD_PALIC1 "build palic-1 (llrans, p-conv)" ON)
+if(PLT_BUILD_PALIC1)
+  add_subdirectory(palic-1)
+  set_target_properties(llrans p-conv PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+                        RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR} RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR})
+endif()

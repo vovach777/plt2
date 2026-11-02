@@ -16,7 +16,7 @@ llrans bench [-w N] [-t T] a.ppm b.ppm ...
 `convert_from_plannar_line_16to8_48` в `rgb.hpp` сломана (байты 0..31 неверны при любой перестановке аргументов) —
 в llrans не используется, обратное RCT + перемежение RGB написано заново на SSSE3 (`irct16`).
 
-`avx2.h` (амальгама SIMDe) общий с PLT2 — лежит уровнем выше. Сборка: `cmake -S palic-1 -B build-p1`.
+`avx2.h` (амальгама SIMDe) общий с PLT2 — лежит уровнем выше. Собирается из корня plt2 вместе с ним (`llrans`, `p-conv` рядом с `plt2`, ISA из `PLT_ARCH`; выключить: `-DPLT_BUILD_PALIC1=OFF`) или отдельно: `cmake -S palic-1 -B build-p1`.
 
 ## Цифры (VM Xeon, ISA Ivy Bridge, 1 поток; на реальном i5-3450 делить ≈ на 2.3)
 | | bpp (13 картинок) | +4000×3000 | enc / dec MB/s |

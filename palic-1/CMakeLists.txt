@@ -6,8 +6,11 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 find_package(Threads REQUIRED)
-# LLR_ARCH: gcc/clang/clang-cl -march value (default ivybridge = SSE4.1+AVX1, no AVX2); cl.exe: /arch value (AVX default)
+# LLR_ARCH: gcc/clang/clang-cl -march value (default native); cl.exe: /arch value (default AVX). From the plt2 root PLT_ARCH is used.
 set(LLR_ARCH "" CACHE STRING "target ISA")
+if(NOT LLR_ARCH AND PLT_ARCH)          # built from the plt2 root: follow PLT_ARCH
+  set(LLR_ARCH ${PLT_ARCH})
+endif()
 
 add_executable(p-conv main.cpp netpbm.hpp profiling.hpp rgb.hpp ../avx2.h)
 add_executable(llrans llrans.cpp rgb.hpp ../avx2.h)
