@@ -37,7 +37,7 @@ size_t FSE_buildCTableU16(FSE_CTable* ct, const short* normalizedCounter, unsign
 }
 
 namespace hlc {
-static int g_tw = 256, g_th = 256;                              // tile size (-tw, -th), stored in the header
+static int g_tw = 256, g_th = 128;                              // tile size (-tw, -th), stored in the header
 #if defined(_MSC_VER) && !defined(__clang__)
 static inline uint32_t bw(uint32_t v) { unsigned long i; return _BitScanReverse(&i, v) ? uint32_t(i) + 1 : 0; }
 #else
