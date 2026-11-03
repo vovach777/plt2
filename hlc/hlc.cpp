@@ -129,22 +129,24 @@ template <int PM> static inline __m128i pred_v(__m128i a, __m128i b, __m128i c) 
     if (PM == 2) return _mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(a, b), _mm_set1_epi16(1)), 1);
     return _mm_setzero_si128();
 }
+// one row: o[x] = zigzag(wrap(X - P)) of row y of plane p (stride w); plane unchanged
+template <bool N9, int PM> static inline void residual_row(const int16_t* p, int w, int y, int16_t* o) {
+    const int16_t* r = p + size_t(y) * w; const int16_t* u = r - w;
+    // tile borders (row 0, column 0): left / top neighbour for every mode (= MED with zero padding)
+    if (y == 0) { o[0] = int16_t(zz(wrape<N9>(r[0]))); for (int x = 1; x < w; ++x) o[x] = int16_t(zz(wrape<N9>(r[x] - r[x - 1]))); return; }
+    o[0] = int16_t(zz(wrape<N9>(r[0] - u[0])));
+    int x = 1;
+    for (; x + 8 <= w; x += 8) {
+        __m128i cur = _mm_loadu_si128((const __m128i*)(r + x)), a = _mm_loadu_si128((const __m128i*)(r + x - 1));
+        __m128i b = _mm_loadu_si128((const __m128i*)(u + x)), c = _mm_loadu_si128((const __m128i*)(u + x - 1));
+        __m128i e = wrapv8<N9>(_mm_sub_epi16(cur, pred_v<PM>(a, b, c)));
+        _mm_storeu_si128((__m128i*)(o + x), _mm_xor_si128(_mm_add_epi16(e, e), _mm_srai_epi16(e, 15)));
+    }
+    for (; x < w; ++x) o[x] = int16_t(zz(wrape<N9>(r[x] - pred_s<PM>(r[x - 1], u[x], u[x - 1]))));
+}
 // out = zigzag(wrap(X - P)), plane p (stride w) unchanged
 template <bool N9, int PM> static void residuals_pm(const int16_t* p, int w, int h, int16_t* out) {
-    for (int y = 0; y < h; ++y) {
-        const int16_t* r = p + size_t(y) * w; const int16_t* u = r - w; int16_t* o = out + size_t(y) * w;
-        // tile borders (row 0, column 0): left / top neighbour for every mode (= MED with zero padding)
-        if (y == 0) { o[0] = int16_t(zz(wrape<N9>(r[0]))); for (int x = 1; x < w; ++x) o[x] = int16_t(zz(wrape<N9>(r[x] - r[x - 1]))); continue; }
-        o[0] = int16_t(zz(wrape<N9>(r[0] - u[0])));
-        int x = 1;
-        for (; x + 8 <= w; x += 8) {
-            __m128i cur = _mm_loadu_si128((const __m128i*)(r + x)), a = _mm_loadu_si128((const __m128i*)(r + x - 1));
-            __m128i b = _mm_loadu_si128((const __m128i*)(u + x)), c = _mm_loadu_si128((const __m128i*)(u + x - 1));
-            __m128i e = wrapv8<N9>(_mm_sub_epi16(cur, pred_v<PM>(a, b, c)));
-            _mm_storeu_si128((__m128i*)(o + x), _mm_xor_si128(_mm_add_epi16(e, e), _mm_srai_epi16(e, 15)));
-        }
-        for (; x < w; ++x) o[x] = int16_t(zz(wrape<N9>(r[x] - pred_s<PM>(r[x - 1], u[x], u[x - 1]))));
-    }
+    for (int y = 0; y < h; ++y) residual_row<N9, PM>(p, w, y, out + size_t(y) * w);
 }
 template <bool N9> static void residuals_mode(int m, const int16_t* p, int w, int h, int16_t* out) {
     switch (m) { case 0: residuals_pm<N9, 0>(p, w, h, out); break; case 1: residuals_pm<N9, 1>(p, w, h, out); break;
@@ -182,10 +184,9 @@ template <bool N9, int PM> static double entropy_rows(const int16_t* p, int w, i
 }
 static std::atomic<unsigned> g_pstat[3][4];                         // chosen predictor per plane (V, U, Y) x mode, for bench
 static int g_pstep = 8;                                             // -Ps: rows sampled for the predictor choice (1 = all)
-// best predictor by entropy (HALIC: argmin, no hysteresis); out = its residuals
-template <bool N9> static int choose_pred(const int16_t* p, int w, int h, int16_t* out, std::vector<int16_t>&) {
-    if ((g_pmask & (g_pmask - 1)) == 0) {                           // a single allowed mode: no probe
-        int m = 0; while (!(g_pmask >> m & 1)) ++m; residuals_mode<N9>(m, p, w, h, out); return m; }
+// best predictor by entropy (HALIC: argmin, no hysteresis), mode only
+template <bool N9> static int choose_pred(const int16_t* p, int w, int h) {
+    if ((g_pmask & (g_pmask - 1)) == 0) { int m = 0; while (!(g_pmask >> m & 1)) ++m; return m; }   // single allowed mode: no probe
     int best = -1; double bh = 0;
     for (int m = 0; m < 4; ++m) {
         if (!(g_pmask >> m & 1)) continue;
@@ -194,7 +195,6 @@ template <bool N9> static int choose_pred(const int16_t* p, int w, int h, int16_
                      case 2: hm = entropy_rows<N9, 2>(p, w, h, g_pstep); break; default: hm = entropy_rows<N9, 3>(p, w, h, g_pstep); }
         if (best < 0 || hm < bh) { best = m; bh = hm; }
     }
-    residuals_mode<N9>(best, p, w, h, out);
     return best;
 }
 // decoder: on entry p[] holds zigzag residuals, on exit the plane
@@ -307,6 +307,32 @@ static void skew_pack(const int16_t* R, int w, int h, int16_t* S) {
             std::memcpy(S, band.data() + size_t(t) * 8 + klo, size_t(khi - klo + 1) * 2); S += khi - klo + 1;
         }
     }
+}
+// fused encoder pass: residual rows of a band go straight into the zero-padded band rows, then transpose; full
+// antidiagonals leave with one 16-byte store, only the band triangles are copied piecewise
+template <bool N9, int PM> static void residuals_pack(const int16_t* P, int w, int h, int16_t* S) {
+    const int L = w + 7, PW = w + 32; thread_local std::vector<int16_t> pad; pad.assign(size_t(8) * PW, 0);
+    thread_local std::vector<int16_t> band; band.resize(size_t(((L + 7) & ~7) + 8) * 8);
+    for (int b0 = 0; b0 < h; b0 += 8) {
+        const int hb = std::min(8, h - b0);
+        for (int k = 0; k < 8; ++k) { int16_t* row = pad.data() + size_t(k) * PW + 8;
+            if (k < hb) residual_row<N9, PM>(P, w, b0 + k, row); else std::fill(row, row + w, int16_t(0)); }
+        for (int t = 0; t < L; t += 8) {
+            __m128i v[8]; for (int k = 0; k < 8; ++k) v[k] = _mm_loadu_si128((const __m128i*)(pad.data() + size_t(k) * PW + 8 + t - k));
+            tr8x8(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            for (int j = 0; j < 8; ++j) _mm_store_si128((__m128i*)(band.data() + size_t(t + j) * 8), v[j]);
+        }
+        for (int t = 0; t < L; ++t) {
+            int klo = std::max(0, t - w + 1), khi = std::min(hb - 1, t);
+            if (klo == 0 && khi == 7) { _mm_storeu_si128((__m128i*)S, _mm_load_si128((const __m128i*)(band.data() + size_t(t) * 8))); S += 8; continue; }
+            if (klo > khi) continue;
+            std::memcpy(S, band.data() + size_t(t) * 8 + klo, size_t(khi - klo + 1) * 2); S += khi - klo + 1;
+        }
+    }
+}
+template <bool N9> static void residuals_pack_m(int m, const int16_t* P, int w, int h, int16_t* S) {
+    switch (m) { case 0: residuals_pack<N9, 0>(P, w, h, S); break; case 1: residuals_pack<N9, 1>(P, w, h, S); break;
+                 case 2: residuals_pack<N9, 2>(P, w, h, S); break; default: residuals_pack<N9, 3>(P, w, h, S); }
 }
 // in place over the skewed residuals: zigzag residuals in, plane values out; then back to raster rows of P (stride w)
 template <bool N9> static void skew_restore(const int16_t* S, int w, int h, int16_t* P) {
@@ -434,13 +460,15 @@ std::vector<uint8_t> compress(const Img& im, int threads) {
         for (auto& p : P) p.resize(n); const size_t ns = g_skew ? skew_len(w, h) : n; SK.resize(ns);
         for (int y = 0; y < h; ++y) rct_row(im.rgb.data() + (size_t(y0 + y) * W + x0) * 3, w, P[0].data() + size_t(y) * w, P[1].data() + size_t(y) * w, P[2].data() + size_t(y) * w);
         Out o;
-        thread_local std::vector<int16_t> SKp[3], RS, scratch;
+        thread_local std::vector<int16_t> SKp[3];
         const uint16_t* src[3]; uint8_t pm = 0;
         for (int c = 0; c < 3; ++c) {
-            if (g_skew) {                                                // predictor per plane, chosen by residual entropy
-                RS.resize(n); int m = c < 2 ? choose_pred<true>(P[c].data(), w, h, RS.data(), scratch) : choose_pred<false>(P[c].data(), w, h, RS.data(), scratch);
+            if (g_skew) {                                                // predictor per plane (entropy probe), residuals straight to skew order
+                const int m = c < 2 ? choose_pred<true>(P[c].data(), w, h) : choose_pred<false>(P[c].data(), w, h);
                 pm |= uint8_t(m << (2 * c)); g_pstat[c][m]++;
-                SKp[c].resize(ns); skew_pack(RS.data(), w, h, SKp[c].data()); src[c] = (const uint16_t*)SKp[c].data();
+                SKp[c].resize(ns + 8);
+                if (c < 2) residuals_pack_m<true>(m, P[c].data(), w, h, SKp[c].data()); else residuals_pack_m<false>(m, P[c].data(), w, h, SKp[c].data());
+                src[c] = (const uint16_t*)SKp[c].data();
                 continue;
             }
             if (c < 2) residuals_inplace<true>(P[c].data(), w, h); else residuals_inplace<false>(P[c].data(), w, h);
