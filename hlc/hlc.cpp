@@ -128,7 +128,7 @@ template <bool N9> static void restore(int16_t* p, int w, int h) {
 // flat u32 table (newState | nbBits << 16 | symbol << 20), reload once per 4 symbols, output straight to int16.
 // stream: mode u8 (0 raw u16, 1 rle var, 6 FSE4 var csize + data)
 static int g_tl = 12, g_tadapt = 1;
-static int g_joint = 1, g_K = 2;                                    // -J 0: three separate streams, -K states per plane
+static int g_joint = 0, g_K = 2;                                    // -J 0: three separate streams, -K states per plane
 static bool joint_put(Out& o, const uint16_t* const* s, size_t n, int K, std::vector<uint8_t>& tmp);                                               // -T: max tableLog
 static size_t fse4_enc(uint8_t* dst, size_t cap, const uint16_t* s, size_t n, unsigned mx, const unsigned* cnt) {
     // table size follows the stream: <= n/16 entries (decoder table build ~ 1/16 of the symbols), never below 9
@@ -420,7 +420,7 @@ struct RStream {
     }
 };
 // three FSE4 streams of equal length decoded in one loop: 3 bit readers x 4 states = 12 independent chains
-static int g_dec3 = 1;                                              // -d3 0: decode the planes one after another
+static int g_dec3 = 0;                                              // -d3 0: decode the planes one after another
 static void dec3(RStream* r, int16_t* o0, int16_t* o1, int16_t* o2, size_t n) {
     const uint32_t *t0 = r[0].T.data(), *t1 = r[1].T.data(), *t2 = r[2].T.data();
     BIT_DStream_t b0 = r[0].bd, b1 = r[1].bd, b2 = r[2].bd;
