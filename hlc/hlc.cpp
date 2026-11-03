@@ -44,7 +44,13 @@ static inline int med(int a, int b, int c) {                     // HALIC 0x1400
 template <bool N9> static inline int wrape(int e) { return N9 ? ((e + 256) & 511) - 256 : int(int8_t(e)); }
 template <bool N9> static inline int wrapv(int v) { return N9 ? ((v + 256) & 511) - 256 : (v & 255); }
 
-struct Img { int W = 0, H = 0; std::vector<uint8_t> rgb; };
+template <class T> struct noinit_alloc : std::allocator<T> {                // vector::resize without zero-fill (decoder output)
+    template <class U> struct rebind { using other = noinit_alloc<U>; };
+    noinit_alloc() = default; template <class U> noinit_alloc(const noinit_alloc<U>&) {}
+    template <class U> void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }
+    template <class U, class... A> void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
+};
+struct Img { int W = 0, H = 0; std::vector<uint8_t, noinit_alloc<uint8_t>> rgb; };
 struct Out { std::vector<uint8_t> b; void u8(uint8_t v) { b.push_back(v); } void var(uint64_t v) { while (v >= 128) { b.push_back(uint8_t(v | 128)); v >>= 7; } b.push_back(uint8_t(v)); } void raw(const void* p, size_t n) { b.insert(b.end(), (const uint8_t*)p, (const uint8_t*)p + n); } };
 struct In { const uint8_t* p; const uint8_t* e;
     uint8_t u8() { if (p >= e) throw std::runtime_error("truncated"); return *p++; }
@@ -241,23 +247,32 @@ template <bool N9> static void skew_restore(const int16_t* S, int w, int h, int1
 
 
 // ---- fused decoder for -s: wavefront MED of a band for all three planes, then transpose + inverse RCT straight to RGB
+// one wavefront step; Z = residual vector (zigzag for N9)
+template <bool N9> static inline __m128i wave_step(__m128i Z, __m128i& V, __m128i& Bp, int16_t topv) {
+    const __m128i one = _mm_set1_epi16(1), zero = _mm_setzero_si128(), m255 = _mm_set1_epi16(255);
+    __m128i e = _mm_xor_si128(_mm_srli_epi16(Z, 1), _mm_sub_epi16(zero, _mm_and_si128(Z, one)));
+    __m128i b = _mm_insert_epi16(_mm_slli_si128(V, 2), topv, 0), c = Bp, a = V;
+    __m128i mx = _mm_max_epi16(a, b), mn = _mm_min_epi16(a, b);
+    __m128i v = _mm_add_epi16(_mm_min_epi16(_mm_max_epi16(_mm_sub_epi16(_mm_add_epi16(a, b), c), mn), mx), e);
+    V = N9 ? _mm_srai_epi16(_mm_slli_epi16(v, 7), 7) : _mm_and_si128(v, m255); Bp = b; return V;
+}
+// g_wsplit: 0 = per-step klo/khi (old), 1 = three phases (triangle, full middle, triangle)
+static int g_wsplit = 1;
 template <bool N9> static const int16_t* wave_band(const int16_t* S, int w, int hb, const int16_t* top, int16_t* band) {
-    const int L = w + 7; const __m128i one = _mm_set1_epi16(1), zero = _mm_setzero_si128(), m255 = _mm_set1_epi16(255);
+    const int L = w + 7; const __m128i zero = _mm_setzero_si128();
     const __m128i idx = _mm_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7); __m128i V = zero, Bp = zero;
-    for (int t = 0; t < L; ++t) {
+    auto tri = [&](int t) {   // band triangle: load 8 so that lane klo = S[0], keep lanes klo..khi (the stream is padded, earlier data exists)
         int klo = std::max(0, t - w + 1), khi = std::min(hb - 1, t); __m128i Z;
         if (klo == 0 && khi == 7) { Z = _mm_loadu_si128((const __m128i*)S); S += 8; }
-        else {   // band triangle: load 8 so that lane klo = S[0], keep lanes klo..khi (the stream is padded, earlier data exists)
-            __m128i m = _mm_and_si128(_mm_cmpgt_epi16(idx, _mm_set1_epi16(short(klo - 1))), _mm_cmpgt_epi16(_mm_set1_epi16(short(khi + 1)), idx));
-            if (khi < klo) Z = zero; else { Z = _mm_and_si128(_mm_loadu_si128((const __m128i*)(S - klo)), m); S += khi - klo + 1; }
-        }
-        __m128i e = _mm_xor_si128(_mm_srli_epi16(Z, 1), _mm_sub_epi16(zero, _mm_and_si128(Z, one)));
-        __m128i b = _mm_insert_epi16(_mm_slli_si128(V, 2), top[t], 0), c = Bp, a = V;
-        __m128i mx = _mm_max_epi16(a, b), mn = _mm_min_epi16(a, b);
-        __m128i v = _mm_add_epi16(_mm_min_epi16(_mm_max_epi16(_mm_sub_epi16(_mm_add_epi16(a, b), c), mn), mx), e);
-        V = N9 ? _mm_srai_epi16(_mm_slli_epi16(v, 7), 7) : _mm_and_si128(v, m255);
-        _mm_store_si128((__m128i*)(band + size_t(t) * 8), V); Bp = b;
-    }
+        else if (khi < klo) Z = zero;
+        else { __m128i m = _mm_and_si128(_mm_cmpgt_epi16(idx, _mm_set1_epi16(short(klo - 1))), _mm_cmpgt_epi16(_mm_set1_epi16(short(khi + 1)), idx));
+               Z = _mm_and_si128(_mm_loadu_si128((const __m128i*)(S - klo)), m); S += khi - klo + 1; }
+        _mm_store_si128((__m128i*)(band + size_t(t) * 8), wave_step<N9>(Z, V, Bp, top[t]));
+    };
+    if (!g_wsplit || hb < 8 || w < 8) { for (int t = 0; t < L; ++t) tri(t); return S; }
+    for (int t = 0; t < 7; ++t) tri(t);
+    for (int t = 7; t < w; ++t) { _mm_store_si128((__m128i*)(band + size_t(t) * 8), wave_step<N9>(_mm_loadu_si128((const __m128i*)S), V, Bp, top[t])); S += 8; }
+    for (int t = w; t < L; ++t) tri(t);
     return S;
 }
 static inline void irct8(__m128i v, __m128i u, __m128i y, uint8_t* out24) {        // 8 px -> 24 bytes RGB
@@ -363,7 +378,7 @@ int main(int argc, char** argv) {
     using namespace hlc; init_shuf();
     if (argc < 3) { std::fprintf(stderr, "usage: hlc c in.ppm out.hlc [-t N] [-n] | hlc d in.hlc out.ppm [-t N] | hlc bench [-t N] [-n] a.ppm ...\n"); return 1; }
     std::string mode = argv[1]; int threads = 1; std::vector<const char*> pos;
-    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-tw" && i + 1 < argc) g_tw = std::max(8, std::atoi(argv[++i])); else if (a == "-th" && i + 1 < argc) g_th = std::max(8, std::atoi(argv[++i])); else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
+    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-tw" && i + 1 < argc) g_tw = std::max(8, std::atoi(argv[++i])); else if (a == "-th" && i + 1 < argc) g_th = std::max(8, std::atoi(argv[++i])); else if (a == "-ws" && i + 1 < argc) g_wsplit = std::atoi(argv[++i]); else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
     try {
         if (mode == "c" && pos.size() == 2) { auto o = compress(read_ppm(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
         if (mode == "d" && pos.size() == 2) { Img im = decompress(slurp(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fprintf(f, "P6\n%d %d\n255\n", im.W, im.H); std::fwrite(im.rgb.data(), 1, im.rgb.size(), f); std::fclose(f); return 0; }
