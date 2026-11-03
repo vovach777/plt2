@@ -361,7 +361,7 @@ size_t estimate_sb(const Img& im, int B, int R) {
 // block = FSE statistics region: wave steps t in [jB, (j+1)B) of all bands of the lane (a parallelogram, skew 7 px);
 //         the last block of a band takes the tail t >= (nb-1)B. One stream per plane per block.
 // lane payload: for plane c: for block j: stream.
-static int g_B = 128, g_R = 128, g_dord = 1, g_legacy = 0;           // -B, -R, -dord 0 per band / 1 per block, -L: HLC3
+static int g_B = 128, g_R = 128, g_dord = 1, g_legacy = 1;           // -B, -R, -dord 0 per band / 1 per block, -L: HLC3
 static inline int lane_nb(int W, int B) { return std::max(1, (W + B / 2) / B); }
 // symbols of band (height hb) in steps [t0, t1)
 static inline size_t seg_count(int W, int hb, int t0, int t1) {
@@ -402,6 +402,31 @@ struct RStream {
         bd = b; st[0] = s0; st[1] = s1; st[2] = s2; st[3] = s3;
     }
 };
+// three FSE4 streams of equal length decoded in one loop: 3 bit readers x 4 states = 12 independent chains
+static int g_dec3 = 1;                                              // -d3 0: decode the planes one after another
+static void dec3(RStream* r, int16_t* o0, int16_t* o1, int16_t* o2, size_t n) {
+    const uint32_t *t0 = r[0].T.data(), *t1 = r[1].T.data(), *t2 = r[2].T.data();
+    BIT_DStream_t b0 = r[0].bd, b1 = r[1].bd, b2 = r[2].bd;
+    uint32_t a0 = r[0].st[0], a1 = r[0].st[1], a2 = r[0].st[2], a3 = r[0].st[3];
+    uint32_t c0 = r[1].st[0], c1 = r[1].st[1], c2 = r[1].st[2], c3 = r[1].st[3];
+    uint32_t d0 = r[2].st[0], d1 = r[2].st[1], d2 = r[2].st[2], d3 = r[2].st[3];
+    size_t i = 0;
+#define HLC_D3(t, b, sv, o, k) { uint32_t e = t[sv]; o[i + k] = int16_t(e >> 20); sv = (e & 0xffff) + uint32_t(BIT_readBits(&b, (e >> 16) & 15)); }
+    for (; i + 4 <= n; i += 4) {
+        BIT_reloadDStream(&b0); BIT_reloadDStream(&b1); BIT_reloadDStream(&b2);
+        HLC_D3(t0, b0, a0, o0, 0) HLC_D3(t1, b1, c0, o1, 0) HLC_D3(t2, b2, d0, o2, 0)
+        HLC_D3(t0, b0, a1, o0, 1) HLC_D3(t1, b1, c1, o1, 1) HLC_D3(t2, b2, d1, o2, 1)
+        HLC_D3(t0, b0, a2, o0, 2) HLC_D3(t1, b1, c2, o1, 2) HLC_D3(t2, b2, d2, o2, 2)
+        HLC_D3(t0, b0, a3, o0, 3) HLC_D3(t1, b1, c3, o1, 3) HLC_D3(t2, b2, d3, o2, 3)
+    }
+#undef HLC_D3
+    r[0].bd = b0; r[1].bd = b1; r[2].bd = b2;
+    r[0].st[0] = a0; r[0].st[1] = a1; r[0].st[2] = a2; r[0].st[3] = a3;
+    r[1].st[0] = c0; r[1].st[1] = c1; r[1].st[2] = c2; r[1].st[3] = c3;
+    r[2].st[0] = d0; r[2].st[1] = d1; r[2].st[2] = d2; r[2].st[3] = d3;
+    for (int p = 0; p < 3; ++p) r[p].g = uint32_t(i);
+    if (i < n) { r[0].get(o0 + i, n - i); r[1].get(o1 + i, n - i); r[2].get(o2 + i, n - i); }
+}
 // fused lane decoder: fill(c, band) returns the band's skew residuals of plane c (8 valid slack values before, 16 after)
 template <class F> static void decode_lane(int w, int h, uint8_t* rgb, size_t rstride, F fill) {
     const int L = w + 7, LB = ((L + 7) & ~7) + 8;
@@ -505,8 +530,13 @@ Img decompress(const std::vector<uint8_t>& data, int threads) {
         thread_local std::vector<int16_t> P[3];
         In ti{tp[t], tp[t] + tn[t]}; const size_t ns = skew ? skew_len(w, h) : n;
         if (skew) {                                                     // fused: streams -> wavefront MED -> RGB
-            for (int c = 0; c < 3; ++c) { P[c].resize(ns + 32); int16_t* d = P[c].data() + 8; std::memset(P[c].data(), 0, 16);   // 8 slack before: masked loads read S - klo
-                if (raw) std::memcpy(d, ti.take(ns * 2), ns * 2); else get_stream(ti, d, ns); }
+            thread_local RStream rs[3];
+            for (int c = 0; c < 3; ++c) { P[c].resize(ns + 32); std::memset(P[c].data(), 0, 16);   // 8 slack before: masked loads read S - klo
+                if (raw) std::memcpy(P[c].data() + 8, ti.take(ns * 2), ns * 2); else rs[c].open(ti, ns); }
+            if (!raw) {
+                if (g_dec3 && rs[0].mode == 6 && rs[1].mode == 6 && rs[2].mode == 6) dec3(rs, P[0].data() + 8, P[1].data() + 8, P[2].data() + 8, ns);
+                else for (int c = 0; c < 3; ++c) rs[c].get(P[c].data() + 8, ns);
+            }
             decode_tile_skew(P[0].data() + 8, P[1].data() + 8, P[2].data() + 8, w, h, im.rgb.data() + (size_t(y0) * W + x0) * 3, size_t(W) * 3);
             return;
         }
@@ -536,7 +566,7 @@ int main(int argc, char** argv) {
     using namespace hlc; init_shuf();
     if (argc < 3) { std::fprintf(stderr, "usage: hlc c in.ppm out.hlc [-t N] [-n] | hlc d in.hlc out.ppm [-t N] | hlc bench [-t N] [-n] a.ppm ...\n"); return 1; }
     std::string mode = argv[1]; int threads = 1; std::vector<const char*> pos;
-    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-tw" && i + 1 < argc) g_tw = std::max(8, std::atoi(argv[++i])); else if (a == "-th" && i + 1 < argc) g_th = std::max(8, std::atoi(argv[++i])); else if (a == "-B" && i + 1 < argc) g_B = std::max(8, std::atoi(argv[++i])); else if (a == "-R" && i + 1 < argc) g_R = std::max(8, std::atoi(argv[++i]) & ~7); else if (a == "-dord" && i + 1 < argc) g_dord = std::atoi(argv[++i]); else if (a == "-L") g_legacy = 1; else if (a == "-Ta" && i + 1 < argc) g_tadapt = std::atoi(argv[++i]); else if (a == "-ws" && i + 1 < argc) g_wsplit = std::atoi(argv[++i]); else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
+    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-tw" && i + 1 < argc) g_tw = std::max(8, std::atoi(argv[++i])); else if (a == "-th" && i + 1 < argc) g_th = std::max(8, std::atoi(argv[++i])); else if (a == "-B" && i + 1 < argc) g_B = std::max(8, std::atoi(argv[++i])); else if (a == "-R" && i + 1 < argc) g_R = std::max(8, std::atoi(argv[++i]) & ~7); else if (a == "-dord" && i + 1 < argc) g_dord = std::atoi(argv[++i]); else if (a == "-L") g_legacy = 1; else if (a == "-4") g_legacy = 0; else if (a == "-d3" && i + 1 < argc) g_dec3 = std::atoi(argv[++i]); else if (a == "-Ta" && i + 1 < argc) g_tadapt = std::atoi(argv[++i]); else if (a == "-ws" && i + 1 < argc) g_wsplit = std::atoi(argv[++i]); else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
     try {
         if (mode == "c" && pos.size() == 2) { auto o = g_legacy ? compress(read_ppm(pos[0]), threads) : compress4(read_ppm(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
         if (mode == "d" && pos.size() == 2) { Img im = decompress(slurp(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fprintf(f, "P6\n%d %d\n255\n", im.W, im.H); std::fwrite(im.rgb.data(), 1, im.rgb.size(), f); std::fclose(f); return 0; }
