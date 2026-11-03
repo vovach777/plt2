@@ -25,6 +25,9 @@
 #include <thread>
 #include <vector>
 #include <smmintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 #include "../palic-1/rgb.hpp"
 extern "C" {
 #define FSE_STATIC_LINKING_ONLY
@@ -34,7 +37,11 @@ size_t FSE_buildCTableU16(FSE_CTable* ct, const short* normalizedCounter, unsign
 
 namespace hlc {
 static int g_tw = 256, g_th = 256;                              // tile size (-tw, -th), stored in the header
+#if defined(_MSC_VER) && !defined(__clang__)
+static inline uint32_t bw(uint32_t v) { unsigned long i; return _BitScanReverse(&i, v) ? uint32_t(i) + 1 : 0; }
+#else
 static inline uint32_t bw(uint32_t v) { return v ? 32 - __builtin_clz(v) : 0; }
+#endif
 static inline uint16_t zz(int e) { return uint16_t(e >= 0 ? 2 * e : -2 * e - 1); }
 static inline int unzz(uint32_t z) { return int(z >> 1) ^ -int(z & 1); }
 static inline int med(int a, int b, int c) {                     // HALIC 0x1400026e0: two cmov for min/max, two for the clamp
@@ -474,7 +481,9 @@ template <int K> static void joint_dec_t(const uint32_t* const* T, BIT_DStream_t
     size_t i = 0;
 #define HLC_J(t, sv, out) { uint32_t e = t[sv]; out[i + j] = int16_t(e >> 20); sv = (e & 0xffff) + uint32_t(BIT_readBits(&b, (e >> 16) & 15)); }
     for (; i + U <= n; i += U) {
+#if defined(__GNUC__) || defined(__clang__)
 #pragma GCC unroll 16
+#endif
         for (int j = 0; j < U; ++j) { const int k = j % K;
             if (((3 * j) & 3) == 0) BIT_reloadDStream(&b); HLC_J(t0, s0[k], o0)
             if (((3 * j + 1) & 3) == 0) BIT_reloadDStream(&b); HLC_J(t1, s1[k], o1)
