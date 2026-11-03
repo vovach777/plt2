@@ -130,6 +130,7 @@ template <bool N9> static void restore(int16_t* p, int w, int h) {
 static int g_tl = 12, g_tadapt = 1;
 static int g_joint = 0, g_K = 2;                                    // -J 0: three separate streams, -K states per plane
 static bool joint_put(Out& o, const uint16_t* const* s, size_t n, int K, std::vector<uint8_t>& tmp);                                               // -T: max tableLog
+static int g_S = 4;                                                 // -S: FSE states per stream (1, 2, 4, 8); 4 = mode 6, others = mode 8
 static size_t fse4_enc(uint8_t* dst, size_t cap, const uint16_t* s, size_t n, unsigned mx, const unsigned* cnt) {
     // table size follows the stream: <= n/16 entries (decoder table build ~ 1/16 of the symbols), never below 9
     const unsigned tcap = g_tadapt ? std::min(unsigned(g_tl), std::max(9u, bw(uint32_t(n)) - 1 - 4)) : unsigned(g_tl);
@@ -139,9 +140,9 @@ static size_t fse4_enc(uint8_t* dst, size_t cap, const uint16_t* s, size_t n, un
     thread_local std::vector<FSE_CTable> ct(FSE_CTABLE_SIZE_U32(13, 1023));
     if (FSE_isError(FSE_buildCTableU16(ct.data(), norm, mx, tl))) return 0;
     BIT_CStream_t bc; if (FSE_isError(BIT_initCStream(&bc, dst + h, cap - h))) return 0;
-    FSE_CState_t st[4]; const size_t L = std::min<size_t>(n, 4); size_t i = n;
-    for (size_t j = 0; j < L; ++j) { --i; FSE_initCState2(&st[i & 3], ct.data(), s[i]); }   // last symbol of each lane
-    while (i > 0) { --i; FSE_encodeSymbol(&bc, &st[i & 3], s[i]); if ((i & 3) == 0) BIT_flushBits(&bc); }   // <= 4 x 12 bits between flushes
+    const size_t S = size_t(g_S), M = S - 1; FSE_CState_t st[8]; const size_t L = std::min<size_t>(n, S); size_t i = n;   // S is a power of two
+    for (size_t j = 0; j < L; ++j) { --i; FSE_initCState2(&st[i & M], ct.data(), s[i]); }   // last symbol of each lane
+    while (i > 0) { --i; FSE_encodeSymbol(&bc, &st[i & M], s[i]); if ((i & 3) == 0) BIT_flushBits(&bc); }   // <= 4 x 12 bits between flushes
     for (size_t k = L; k-- > 0;) FSE_flushCState(&bc, &st[k]);    // lane 0 last -> read first
     size_t c = BIT_closeCStream(&bc); return c ? h + c : 0;
 }
@@ -171,7 +172,7 @@ static void put_stream(Out& o, const uint16_t* s, size_t n, std::vector<uint8_t>
     if (cnt[s[0]] == n) { o.u8(1); o.var(s[0]); return; }
     tmp.resize(n * 2 + 4096); size_t c = fse4_enc(tmp.data(), tmp.size(), s, n, mx, cnt);
     if (!c || c >= n * 2) { o.u8(0); o.raw(s, n * 2); return; }
-    o.u8(6); o.var(c); o.raw(tmp.data(), c);
+    if (g_S == 4) o.u8(6); else { o.u8(8); o.u8(uint8_t(g_S)); } o.var(c); o.raw(tmp.data(), c);
 }
 // decode straight into the tile buffer (int16 holding zigzag values)
 static void get_stream(In& in, int16_t* dst, size_t n) {
@@ -394,16 +395,18 @@ static size_t read_dtable(const uint8_t* src, size_t c, std::vector<uint32_t>& T
 // resumable reader: raw / rle / FSE4 with 4 interleaved states (symbol g uses state g & 3, reload when g % 4 == 0)
 struct RStream {
     uint8_t mode = 0; const uint8_t* raw = nullptr; int16_t rle = 0;
-    BIT_DStream_t bd; uint32_t st[4] = {0, 0, 0, 0}, g = 0; std::vector<uint32_t> T;
+    BIT_DStream_t bd; uint32_t st[8] = {}, g = 0, S = 4; std::vector<uint32_t> T;
     void open(In& in, size_t n) {
         mode = in.u8();
         if (mode == 1) { rle = int16_t(in.var()); return; }
         if (mode == 0) { raw = in.take(n * 2); return; }
-        if (mode != 6) throw std::runtime_error("stream mode");
+        S = 4;
+        if (mode == 8) { S = in.u8(); if (S != 1 && S != 2 && S != 4 && S != 8) throw std::runtime_error("states"); }
+        else if (mode != 6) throw std::runtime_error("stream mode");
         size_t c = in.var(); const uint8_t* src = in.take(c);
         unsigned tl; size_t h = read_dtable(src, c, T, tl);
         if (FSE_isError(BIT_initDStream(&bd, src + h, c - h))) throw std::runtime_error("bitstream");
-        const size_t L = std::min<size_t>(n, 4);
+        const size_t L = std::min<size_t>(n, S);
         for (size_t k = 0; k < L; ++k) { st[k] = uint32_t(BIT_readBits(&bd, tl)); BIT_reloadDStream(&bd); }
         g = 0;
     }
@@ -417,6 +420,23 @@ struct RStream {
         if (i < cnt) { BIT_reloadDStream(&b); while (i < cnt) { uint32_t& sv = *sp[g & 3]; HLC_D(sv) ++g; } }
 #undef HLC_D
         bd = b; st[0] = s0; st[1] = s1; st[2] = s2; st[3] = s3;
+    }
+    template <int NS> void all_t(int16_t* out, size_t n) {         // whole stream, NS states, reload every 4 symbols
+        const uint32_t* t = T.data(); BIT_DStream_t b = bd; uint32_t s[NS]; for (int k = 0; k < NS; ++k) s[k] = st[k];
+        constexpr int U = NS < 4 ? 4 : NS; size_t i = 0;
+#define HLC_DS(sv) { uint32_t e = t[sv]; out[i + j] = int16_t(e >> 20); sv = (e & 0xffff) + uint32_t(BIT_readBits(&b, (e >> 16) & 15)); }
+        for (; i + U <= n; i += U) {
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 8
+#endif
+            for (int j = 0; j < U; ++j) { if ((j & 3) == 0) BIT_reloadDStream(&b); HLC_DS(s[j % NS]) }
+        }
+        for (int j = 0; i + size_t(j) < n; ++j) { if ((j & 3) == 0) BIT_reloadDStream(&b); HLC_DS(s[j % NS]) }
+#undef HLC_DS
+    }
+    void get_all(int16_t* out, size_t n) {                          // fresh stream decoded at once
+        if (mode != 8 || S == 4) { get(out, n); return; }
+        switch (S) { case 1: all_t<1>(out, n); break; case 2: all_t<2>(out, n); break; default: all_t<8>(out, n); }
     }
 };
 // three FSE4 streams of equal length decoded in one loop: 3 bit readers x 4 states = 12 independent chains
@@ -615,7 +635,7 @@ Img decompress(const std::vector<uint8_t>& data, int threads) {
             for (int c = 0; c < 3; ++c) { if (raw) std::memcpy(P[c].data() + 8, ti.take(ns * 2), ns * 2); else rs[c].open(ti, ns); }
             if (!raw) {
                 if (g_dec3 && rs[0].mode == 6 && rs[1].mode == 6 && rs[2].mode == 6) dec3(rs, P[0].data() + 8, P[1].data() + 8, P[2].data() + 8, ns);
-                else for (int c = 0; c < 3; ++c) rs[c].get(P[c].data() + 8, ns);
+                else for (int c = 0; c < 3; ++c) rs[c].get_all(P[c].data() + 8, ns);
             }
             }
             decode_tile_skew(P[0].data() + 8, P[1].data() + 8, P[2].data() + 8, w, h, im.rgb.data() + (size_t(y0) * W + x0) * 3, size_t(W) * 3);
@@ -648,7 +668,7 @@ int main(int argc, char** argv) {
     using namespace hlc; init_shuf();
     if (argc < 3) { std::fprintf(stderr, "usage: hlc c in.ppm out.hlc [-t N] [-n] | hlc d in.hlc out.ppm [-t N] | hlc bench [opts] a.ppm|dir ... [-max N]\n"); return 1; }
     std::string mode = argv[1]; int threads = 1; std::vector<const char*> pos;
-    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-r") g_skew = false; else if (a == "-tw" && i + 1 < argc) g_tw = std::max(8, std::atoi(argv[++i])); else if (a == "-th" && i + 1 < argc) g_th = std::max(8, std::atoi(argv[++i])); else if (a == "-B" && i + 1 < argc) g_B = std::max(8, std::atoi(argv[++i])); else if (a == "-R" && i + 1 < argc) g_R = std::max(8, std::atoi(argv[++i]) & ~7); else if (a == "-dord" && i + 1 < argc) g_dord = std::atoi(argv[++i]); else if (a == "-L") g_legacy = 1; else if (a == "-4") g_legacy = 0; else if (a == "-max" && i + 1 < argc) g_max = std::atoi(argv[++i]); else if (a == "-J" && i + 1 < argc) g_joint = std::atoi(argv[++i]); else if (a == "-K" && i + 1 < argc) g_K = std::max(1, std::min(4, std::atoi(argv[++i]))); else if (a == "-d3" && i + 1 < argc) g_dec3 = std::atoi(argv[++i]); else if (a == "-Ta" && i + 1 < argc) g_tadapt = std::atoi(argv[++i]); else if (a == "-ws" && i + 1 < argc) g_wsplit = std::atoi(argv[++i]); else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
+    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-r") g_skew = false; else if (a == "-tw" && i + 1 < argc) g_tw = std::max(8, std::atoi(argv[++i])); else if (a == "-th" && i + 1 < argc) g_th = std::max(8, std::atoi(argv[++i])); else if (a == "-B" && i + 1 < argc) g_B = std::max(8, std::atoi(argv[++i])); else if (a == "-R" && i + 1 < argc) g_R = std::max(8, std::atoi(argv[++i]) & ~7); else if (a == "-dord" && i + 1 < argc) g_dord = std::atoi(argv[++i]); else if (a == "-L") g_legacy = 1; else if (a == "-4") g_legacy = 0; else if (a == "-S" && i + 1 < argc) { g_S = std::atoi(argv[++i]); if (g_S != 1 && g_S != 2 && g_S != 8) g_S = 4; } else if (a == "-max" && i + 1 < argc) g_max = std::atoi(argv[++i]); else if (a == "-J" && i + 1 < argc) g_joint = std::atoi(argv[++i]); else if (a == "-K" && i + 1 < argc) g_K = std::max(1, std::min(4, std::atoi(argv[++i]))); else if (a == "-d3" && i + 1 < argc) g_dec3 = std::atoi(argv[++i]); else if (a == "-Ta" && i + 1 < argc) g_tadapt = std::atoi(argv[++i]); else if (a == "-ws" && i + 1 < argc) g_wsplit = std::atoi(argv[++i]); else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
     try {
         if (mode == "c" && pos.size() == 2) { auto o = g_legacy ? compress(read_ppm(pos[0]), threads) : compress4(read_ppm(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
         if (mode == "d" && pos.size() == 2) { Img im = decompress(slurp(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fprintf(f, "P6\n%d %d\n255\n", im.W, im.H); std::fwrite(im.rgb.data(), 1, im.rgb.size(), f); std::fclose(f); return 0; }
