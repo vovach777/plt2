@@ -172,6 +172,7 @@ template <bool N9, int PM> static double entropy_rows(const int16_t* p, int w, i
     double t = double(n) * std::log2(double(n)); for (unsigned v = 0; v < 512; ++v) if (cnt[v]) t -= double(cnt[v]) * std::log2(double(cnt[v]));
     return t;
 }
+static std::atomic<unsigned> g_pstat[3][4];                         // chosen predictor per plane (V, U, Y) x mode, for bench
 static int g_pstep = 8;                                             // -Ps: rows sampled for the predictor choice (1 = all)
 // best predictor by entropy (HALIC: argmin, no hysteresis); out = its residuals
 template <bool N9> static int choose_pred(const int16_t* p, int w, int h, int16_t* out, std::vector<int16_t>&) {
@@ -428,7 +429,7 @@ std::vector<uint8_t> compress(const Img& im, int threads) {
         for (int c = 0; c < 3; ++c) {
             if (g_skew) {                                                // predictor per plane, chosen by residual entropy
                 RS.resize(n); int m = c < 2 ? choose_pred<true>(P[c].data(), w, h, RS.data(), scratch) : choose_pred<false>(P[c].data(), w, h, RS.data(), scratch);
-                pm |= uint8_t(m << (2 * c));
+                pm |= uint8_t(m << (2 * c)); g_pstat[c][m]++;
                 SKp[c].resize(ns); skew_pack(RS.data(), w, h, SKp[c].data()); src[c] = (const uint16_t*)SKp[c].data();
                 continue;
             }
@@ -799,6 +800,12 @@ int main(int argc, char** argv) {
                 std::printf("%-28s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s %s\n", fn, im.W, im.H, o.size(), 8.0 * o.size() / n, 3e-6 * n / be, 3e-6 * n / bd, g ? "ok" : "FAIL");
             }
             std::printf("TOTAL %zu files  %.4f bpp  enc %.1f  dec %.1f MB/s (RGB)  t=%d  %s  %s\n", pos.size(), 8.0 * by / px, 3e-6 * px / te, 3e-6 * px / td, threads, g_raw ? (g_skew ? "raw skew" : "raw") : (g_skew ? "fse skew" : "fse"), ok ? "all ok" : "FAIL");
+            {   unsigned tot = 0; for (auto& r : g_pstat) for (auto& v : r) tot += v.load();
+                if (tot) { static const char* nm[3] = {"V", "U", "Y"};             // counts are summed over the 3 bench rounds
+                    std::printf("predictors (tiles per plane: MED / (2(a+b)-c)/3 / (a+b+1)/2 / none):");
+                    for (int c = 0; c < 3; ++c) { unsigned t = 0; for (auto& v : g_pstat[c]) t += v.load();
+                        std::printf("  %s %u/%u/%u/%u", nm[c], g_pstat[c][0].load() / 3, g_pstat[c][1].load() / 3, g_pstat[c][2].load() / 3, g_pstat[c][3].load() / 3); }
+                    std::printf("\n"); } }
             return ok ? 0 : 3;
         }
     } catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 2; }
