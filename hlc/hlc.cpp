@@ -334,6 +334,25 @@ std::vector<uint8_t> compress(const Img& im, int threads) {
     return std::move(f.b);
 }
 
+// size estimate only: MED + skew over the whole image width (one wave per 8-row band), FSE statistics per
+// "parallelogram" block = wave steps t in [jB, (j+1)B) of R/8 consecutive bands; returns payload bytes
+size_t estimate_sb(const Img& im, int B, int R) {
+    const int W = im.W, H = im.H; size_t n = size_t(W) * H; std::vector<int16_t> P[3], SK(n); std::vector<uint8_t> tmp; size_t total = 0;
+    for (auto& p : P) p.resize(n);
+    for (int y = 0; y < H; ++y) rct_row(im.rgb.data() + size_t(y) * W * 3, W, P[0].data() + size_t(y) * W, P[1].data() + size_t(y) * W, P[2].data() + size_t(y) * W);
+    const int nb = std::max(1, (W + B / 2) / B), bands_per = std::max(1, R / 8), nbands = (H + 7) / 8, nrows = (nbands + bands_per - 1) / bands_per;
+    for (int c = 0; c < 3; ++c) {
+        if (c < 2) residuals_inplace<true>(P[c].data(), W, H); else residuals_inplace<false>(P[c].data(), W, H);
+        skew_pack(P[c].data(), W, H, SK.data());
+        std::vector<std::vector<uint16_t>> G(size_t(nb) * nrows); const int16_t* S = SK.data();
+        for (int b = 0; b < nbands; ++b) { const int hb = std::min(8, H - 8 * b), L = W + 7;
+            for (int t = 0; t < L; ++t) { int klo = std::max(0, t - W + 1), khi = std::min(hb - 1, t); if (klo > khi) continue;
+                auto& g = G[size_t(b / bands_per) * nb + std::min(t / B, nb - 1)]; for (int k = klo; k <= khi; ++k) g.push_back(uint16_t(*S++)); } }
+        for (auto& g : G) if (!g.empty()) { Out o; put_stream(o, g.data(), g.size(), tmp); total += o.b.size() + 2; }
+    }
+    return total;
+}
+
 Img decompress(const std::vector<uint8_t>& data, int threads) {
     In in{data.data(), data.data() + data.size()};
     if (std::memcmp(in.take(4), "HLC3", 4)) throw std::runtime_error("not HLC3");
@@ -382,6 +401,7 @@ int main(int argc, char** argv) {
     try {
         if (mode == "c" && pos.size() == 2) { auto o = compress(read_ppm(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
         if (mode == "d" && pos.size() == 2) { Img im = decompress(slurp(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fprintf(f, "P6\n%d %d\n255\n", im.W, im.H); std::fwrite(im.rgb.data(), 1, im.rgb.size(), f); std::fclose(f); return 0; }
+        if (mode == "est") { size_t px = 0, by = 0; for (auto fn : pos) { Img im = read_ppm(fn); px += size_t(im.W) * im.H; by += estimate_sb(im, g_tw, g_th); } std::printf("EST B=%d R=%d  %.4f bpp  %zu B\n", g_tw, g_th, 8.0 * by / px, by); return 0; }
         if (mode == "bench") {
             double te = 0, td = 0; size_t px = 0, by = 0; bool ok = true;
             for (auto fn : pos) {
