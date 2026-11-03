@@ -272,20 +272,22 @@ template <bool N9> static inline __m128i wave_step(__m128i Z, __m128i& V, __m128
 }
 // g_wsplit: 0 = per-step klo/khi (old), 1 = three phases (triangle, full middle, triangle)
 static int g_wsplit = 1;
-template <bool N9> static const int16_t* wave_band(const int16_t* S, int w, int hb, const int16_t* top, int16_t* band) {
+static inline __m128i ld8(const int16_t* p) { return _mm_loadu_si128((const __m128i*)p); }
+static inline __m128i ld8(const uint8_t* p) { return _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i*)p)); }   // Y residuals as bytes
+template <bool N9, class RT = int16_t> static const RT* wave_band(const RT* S, int w, int hb, const int16_t* top, int16_t* band) {
     const int L = w + 7; const __m128i zero = _mm_setzero_si128();
     const __m128i idx = _mm_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7); __m128i V = zero, Bp = zero;
     auto tri = [&](int t) {   // band triangle: load 8 so that lane klo = S[0], keep lanes klo..khi (the stream is padded, earlier data exists)
         int klo = std::max(0, t - w + 1), khi = std::min(hb - 1, t); __m128i Z;
-        if (klo == 0 && khi == 7) { Z = _mm_loadu_si128((const __m128i*)S); S += 8; }
+        if (klo == 0 && khi == 7) { Z = ld8(S); S += 8; }
         else if (khi < klo) Z = zero;
         else { __m128i m = _mm_and_si128(_mm_cmpgt_epi16(idx, _mm_set1_epi16(short(klo - 1))), _mm_cmpgt_epi16(_mm_set1_epi16(short(khi + 1)), idx));
-               Z = _mm_and_si128(_mm_loadu_si128((const __m128i*)(S - klo)), m); S += khi - klo + 1; }
+               Z = _mm_and_si128(ld8(S - klo), m); S += khi - klo + 1; }
         _mm_store_si128((__m128i*)(band + size_t(t) * 8), wave_step<N9>(Z, V, Bp, top[t]));
     };
     if (!g_wsplit || hb < 8 || w < 8) { for (int t = 0; t < L; ++t) tri(t); return S; }
     for (int t = 0; t < 7; ++t) tri(t);
-    for (int t = 7; t < w; ++t) { _mm_store_si128((__m128i*)(band + size_t(t) * 8), wave_step<N9>(_mm_loadu_si128((const __m128i*)S), V, Bp, top[t])); S += 8; }
+    for (int t = 7; t < w; ++t) { _mm_store_si128((__m128i*)(band + size_t(t) * 8), wave_step<N9>(ld8(S), V, Bp, top[t])); S += 8; }
     for (int t = w; t < L; ++t) tri(t);
     return S;
 }
@@ -298,17 +300,17 @@ static inline void irct8(__m128i v, __m128i u, __m128i y, uint8_t* out24) {     
     __m128i o1 = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(R8, _mm_load_si128((const __m128i*)SHUF[1][0])), _mm_shuffle_epi8(G8, _mm_load_si128((const __m128i*)SHUF[1][1]))), _mm_shuffle_epi8(B8, _mm_load_si128((const __m128i*)SHUF[1][2])));
     _mm_storeu_si128((__m128i*)out24, o0); _mm_storel_epi64((__m128i*)(out24 + 16), o1);
 }
-static void decode_tile_skew(const int16_t* S0, const int16_t* S1, const int16_t* S2, int w, int h, uint8_t* rgb, size_t rstride) {
+template <class YT> static void decode_tile_skew(const int16_t* S0, const int16_t* S1, const YT* S2, int w, int h, uint8_t* rgb, size_t rstride) {
     const int L = w + 7, LB = ((L + 7) & ~7) + 8;
     thread_local std::vector<int16_t> band[3], top[3];
     for (int c = 0; c < 3; ++c) { band[c].assign(size_t(LB) * 8, 0); top[c].assign(size_t(w) + 48, 0); }
-    const int16_t* S[3] = {S0, S1, S2};
+    const int16_t* S[2] = {S0, S1}; const YT* SY = S2;
     alignas(16) uint8_t tmp[32];
     for (int b0 = 0; b0 < h; b0 += 8) {
         const int hb = std::min(8, h - b0);
         S[0] = wave_band<true>(S[0], w, hb, top[0].data() + 8, band[0].data());
         S[1] = wave_band<true>(S[1], w, hb, top[1].data() + 8, band[1].data());
-        S[2] = wave_band<false>(S[2], w, hb, top[2].data() + 8, band[2].data());
+        SY = wave_band<false>(SY, w, hb, top[2].data() + 8, band[2].data());
         for (int t = 0; t < L; t += 8) {
             __m128i P[3][8];
             for (int c = 0; c < 3; ++c) { for (int j = 0; j < 8; ++j) P[c][j] = _mm_load_si128((const __m128i*)(band[c].data() + size_t(t + j) * 8));
@@ -423,10 +425,10 @@ struct RStream {
 #undef HLC_D
         bd = b; st[0] = s0; st[1] = s1; st[2] = s2; st[3] = s3;
     }
-    template <int NS> void all_t(int16_t* out, size_t n) {         // whole stream, NS states, reload every 4 symbols
+    template <int NS, class OT = int16_t> void all_t(OT* out, size_t n) {   // whole stream, NS states, reload every 4 symbols
         const uint32_t* t = T.data(); BIT_DStream_t b = bd; uint32_t s[NS]; for (int k = 0; k < NS; ++k) s[k] = st[k];
         constexpr int U = NS < 4 ? 4 : NS; size_t i = 0;
-#define HLC_DS(sv) { uint32_t e = t[sv], sx = e >> 16; out[i + j] = int16_t(sx); sv = (e & 0xffff) + uint32_t(BIT_readBits(&b, sx >> 12)); }
+#define HLC_DS(sv) { uint32_t e = t[sv], sx = e >> 16; out[i + j] = OT(sx); sv = (e & 0xffff) + uint32_t(BIT_readBits(&b, sx >> 12)); }
         for (; i + U <= n; i += U) {
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC unroll 8
@@ -436,13 +438,19 @@ struct RStream {
         for (int j = 0; i + size_t(j) < n; ++j) { if ((j & 3) == 0) BIT_reloadDStream(&b); HLC_DS(s[j % NS]) }
 #undef HLC_DS
     }
+    void get_all8(uint8_t* out, size_t n) {                         // fresh Y stream as bytes: low byte of sym | nb << 12 is the symbol (< 256)
+        if (mode == 1) { std::memset(out, uint8_t(rle), n); return; }
+        if (mode == 0) { const uint16_t* r = (const uint16_t*)raw; for (size_t i = 0; i < n; ++i) { uint16_t v; std::memcpy(&v, r + i, 2); out[i] = uint8_t(v); } raw += n * 2; return; }
+        switch (S) { case 1: all_t<1, uint8_t>(out, n); break; case 2: all_t<2, uint8_t>(out, n); break; case 4: all_t<4, uint8_t>(out, n); break; default: all_t<8, uint8_t>(out, n); }
+    }
     void get_all(int16_t* out, size_t n) {                          // fresh stream decoded at once (states stay in registers)
         if (mode != 6 && mode != 8) { get(out, n); return; }
         switch (S) { case 1: all_t<1>(out, n); break; case 2: all_t<2>(out, n); break; case 4: all_t<4>(out, n); break; default: all_t<8>(out, n); }
     }
 };
 // three FSE4 streams of equal length decoded in one loop: 3 bit readers x 4 states = 12 independent chains
-static int g_dec3 = 0;                                              // -d3 0: decode the planes one after another
+static int g_dec3 = 0, g_y8 = 0;   // -y8 1: Y residuals decoded as bytes
+                                             // -d3 0: decode the planes one after another
 static void dec3(RStream* r, int16_t* o0, int16_t* o1, int16_t* o2, size_t n) {
     const uint32_t *t0 = r[0].T.data(), *t1 = r[1].T.data(), *t2 = r[2].T.data();
     BIT_DStream_t b0 = r[0].bd, b1 = r[1].bd, b2 = r[2].bd;
@@ -637,10 +645,16 @@ Img decompress(const std::vector<uint8_t>& data, int threads) {
             for (int c = 0; c < 3; ++c) { if (raw) std::memcpy(P[c].data() + 8, ti.take(ns * 2), ns * 2); else rs[c].open(ti, ns); }
             if (!raw) {
                 if (g_dec3 && rs[0].mode == 6 && rs[1].mode == 6 && rs[2].mode == 6) dec3(rs, P[0].data() + 8, P[1].data() + 8, P[2].data() + 8, ns);
+                else if (g_y8) {                                         // Y residuals as bytes (half the buffer traffic)
+                    thread_local std::vector<uint8_t> P8; P8.resize(ns + 48); std::memset(P8.data(), 0, 16);
+                    rs[0].get_all(P[0].data() + 8, ns); rs[1].get_all(P[1].data() + 8, ns); rs[2].get_all8(P8.data() + 16, ns);
+                    decode_tile_skew(P[0].data() + 8, P[1].data() + 8, (const uint8_t*)P8.data() + 16, w, h, im.rgb.data() + (size_t(y0) * W + x0) * 3, size_t(W) * 3);
+                    return;
+                }
                 else for (int c = 0; c < 3; ++c) rs[c].get_all(P[c].data() + 8, ns);
             }
             }
-            decode_tile_skew(P[0].data() + 8, P[1].data() + 8, P[2].data() + 8, w, h, im.rgb.data() + (size_t(y0) * W + x0) * 3, size_t(W) * 3);
+            decode_tile_skew(P[0].data() + 8, P[1].data() + 8, (const int16_t*)P[2].data() + 8, w, h, im.rgb.data() + (size_t(y0) * W + x0) * 3, size_t(W) * 3);
             return;
         }
         for (int c = 0; c < 3; ++c) {
@@ -670,7 +684,7 @@ int main(int argc, char** argv) {
     using namespace hlc; init_shuf();
     if (argc < 3) { std::fprintf(stderr, "usage: hlc c in.ppm out.hlc [-t N] [-n] | hlc d in.hlc out.ppm [-t N] | hlc bench [opts] a.ppm|dir ... [-max N]\n"); return 1; }
     std::string mode = argv[1]; int threads = 1; std::vector<const char*> pos;
-    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-r") g_skew = false; else if (a == "-tw" && i + 1 < argc) g_tw = std::max(8, std::atoi(argv[++i])); else if (a == "-th" && i + 1 < argc) g_th = std::max(8, std::atoi(argv[++i])); else if (a == "-B" && i + 1 < argc) g_B = std::max(8, std::atoi(argv[++i])); else if (a == "-R" && i + 1 < argc) g_R = std::max(8, std::atoi(argv[++i]) & ~7); else if (a == "-dord" && i + 1 < argc) g_dord = std::atoi(argv[++i]); else if (a == "-L") g_legacy = 1; else if (a == "-4") g_legacy = 0; else if (a == "-S" && i + 1 < argc) { g_S = std::atoi(argv[++i]); if (g_S != 1 && g_S != 2 && g_S != 8) g_S = 4; } else if (a == "-max" && i + 1 < argc) g_max = std::atoi(argv[++i]); else if (a == "-J" && i + 1 < argc) g_joint = std::atoi(argv[++i]); else if (a == "-K" && i + 1 < argc) g_K = std::max(1, std::min(4, std::atoi(argv[++i]))); else if (a == "-d3" && i + 1 < argc) g_dec3 = std::atoi(argv[++i]); else if (a == "-Ta" && i + 1 < argc) g_tadapt = std::atoi(argv[++i]); else if (a == "-ws" && i + 1 < argc) g_wsplit = std::atoi(argv[++i]); else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
+    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-r") g_skew = false; else if (a == "-tw" && i + 1 < argc) g_tw = std::max(8, std::atoi(argv[++i])); else if (a == "-th" && i + 1 < argc) g_th = std::max(8, std::atoi(argv[++i])); else if (a == "-B" && i + 1 < argc) g_B = std::max(8, std::atoi(argv[++i])); else if (a == "-R" && i + 1 < argc) g_R = std::max(8, std::atoi(argv[++i]) & ~7); else if (a == "-dord" && i + 1 < argc) g_dord = std::atoi(argv[++i]); else if (a == "-L") g_legacy = 1; else if (a == "-4") g_legacy = 0; else if (a == "-y8" && i + 1 < argc) g_y8 = std::atoi(argv[++i]); else if (a == "-S" && i + 1 < argc) { g_S = std::atoi(argv[++i]); if (g_S != 1 && g_S != 2 && g_S != 8) g_S = 4; } else if (a == "-max" && i + 1 < argc) g_max = std::atoi(argv[++i]); else if (a == "-J" && i + 1 < argc) g_joint = std::atoi(argv[++i]); else if (a == "-K" && i + 1 < argc) g_K = std::max(1, std::min(4, std::atoi(argv[++i]))); else if (a == "-d3" && i + 1 < argc) g_dec3 = std::atoi(argv[++i]); else if (a == "-Ta" && i + 1 < argc) g_tadapt = std::atoi(argv[++i]); else if (a == "-ws" && i + 1 < argc) g_wsplit = std::atoi(argv[++i]); else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
     try {
         if (mode == "c" && pos.size() == 2) { auto o = g_legacy ? compress(read_ppm(pos[0]), threads) : compress4(read_ppm(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
         if (mode == "d" && pos.size() == 2) { Img im = decompress(slurp(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fprintf(f, "P6\n%d %d\n255\n", im.W, im.H); std::fwrite(im.rgb.data(), 1, im.rgb.size(), f); std::fclose(f); return 0; }
