@@ -270,7 +270,16 @@ static size_t fse4_enc(uint8_t* dst, size_t cap, const uint16_t* s, size_t n, un
     BIT_CStream_t bc; if (FSE_isError(BIT_initCStream(&bc, dst + h, cap - h))) return 0;
     const size_t S = size_t(g_S), M = S - 1; FSE_CState_t st[8]; const size_t L = std::min<size_t>(n, S); size_t i = n;   // S is a power of two
     for (size_t j = 0; j < L; ++j) { --i; FSE_initCState2(&st[i & M], ct.data(), s[i]); }   // last symbol of each lane
-    while (i > 0) { --i; FSE_encodeSymbol(&bc, &st[i & M], s[i]); if ((i & 3) == 0) BIT_flushBits(&bc); }   // <= 4 x 12 bits between flushes
+    while (i > 0 && (i & 3)) { --i; FSE_encodeSymbol(&bc, &st[i & M], s[i]); if ((i & 3) == 0) BIT_flushBits(&bc); }   // align to 4
+    if (S == 4) {                                                   // lanes fixed per unrolled step: states stay in registers
+        FSE_CState_t c0 = st[0], c1 = st[1], c2 = st[2], c3 = st[3];
+        for (; i >= 4; i -= 4) {
+            FSE_encodeSymbol(&bc, &c3, s[i - 1]); FSE_encodeSymbol(&bc, &c2, s[i - 2]); FSE_encodeSymbol(&bc, &c1, s[i - 3]); FSE_encodeSymbol(&bc, &c0, s[i - 4]);
+            BIT_flushBits(&bc);                                         // <= 4 x 12 bits between flushes
+        }
+        st[0] = c0; st[1] = c1; st[2] = c2; st[3] = c3;
+    }
+    while (i > 0) { --i; FSE_encodeSymbol(&bc, &st[i & M], s[i]); if ((i & 3) == 0) BIT_flushBits(&bc); }   // generic S / tail
     for (size_t k = L; k-- > 0;) FSE_flushCState(&bc, &st[k]);    // lane 0 last -> read first
     size_t c = BIT_closeCStream(&bc); return c ? h + c : 0;
 }
@@ -295,8 +304,11 @@ static void fse4_dec(int16_t* out, size_t n, const uint8_t* src, size_t c) {
 }
 // A = alphabet bound: 256 for Y (residual mod 256), 512 for U/V (mod 512)
 static void put_stream(Out& o, const uint16_t* s, size_t n, std::vector<uint8_t>& tmp, unsigned A = 512) {
-    thread_local unsigned cnt[512]; std::memset(cnt, 0, A * sizeof(unsigned)); unsigned mx = 0;
-    for (size_t i = 0; i < n; ++i) cnt[s[i]]++;
+    thread_local unsigned cnt[512], c4[4][512]; std::memset(c4, 0, sizeof c4); unsigned mx = 0;
+    size_t i = 0;                                                   // 4 interleaved histograms: repeated symbols do not serialise on one counter
+    for (; i + 4 <= n; i += 4) { c4[0][s[i]]++; c4[1][s[i + 1]]++; c4[2][s[i + 2]]++; c4[3][s[i + 3]]++; }
+    for (; i < n; ++i) c4[0][s[i]]++;
+    for (unsigned v = 0; v < A; ++v) cnt[v] = c4[0][v] + c4[1][v] + c4[2][v] + c4[3][v];
     for (unsigned v = 0; v < A; ++v) if (cnt[v]) mx = v;
     if (cnt[s[0]] == n) { o.u8(1); o.var(s[0]); return; }
     tmp.resize(n * 2 + 4096); size_t c = fse4_enc(tmp.data(), tmp.size(), s, n, mx, cnt);
