@@ -184,6 +184,8 @@ static std::atomic<unsigned> g_pstat[3][4];                         // chosen pr
 static int g_pstep = 8;                                             // -Ps: rows sampled for the predictor choice (1 = all)
 // best predictor by entropy (HALIC: argmin, no hysteresis); out = its residuals
 template <bool N9> static int choose_pred(const int16_t* p, int w, int h, int16_t* out, std::vector<int16_t>&) {
+    if ((g_pmask & (g_pmask - 1)) == 0) {                           // a single allowed mode: no probe
+        int m = 0; while (!(g_pmask >> m & 1)) ++m; residuals_mode<N9>(m, p, w, h, out); return m; }
     int best = -1; double bh = 0;
     for (int m = 0; m < 4; ++m) {
         if (!(g_pmask >> m & 1)) continue;
