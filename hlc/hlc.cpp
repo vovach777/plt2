@@ -166,9 +166,9 @@ static void fse4_dec(int16_t* out, size_t n, const uint8_t* src, size_t c) {
 #undef HLC_DEC1
 }
 static void put_stream(Out& o, const uint16_t* s, size_t n, std::vector<uint8_t>& tmp) {
-    thread_local unsigned cnt[1024]; std::memset(cnt, 0, sizeof cnt); unsigned mx = 0;
+    thread_local unsigned cnt[512]; std::memset(cnt, 0, sizeof cnt); unsigned mx = 0;   // zigzag residuals < 512
     for (size_t i = 0; i < n; ++i) cnt[s[i]]++;
-    for (unsigned v = 0; v < 1024; ++v) if (cnt[v]) mx = v;
+    for (unsigned v = 0; v < 512; ++v) if (cnt[v]) mx = v;
     if (cnt[s[0]] == n) { o.u8(1); o.var(s[0]); return; }
     tmp.resize(n * 2 + 4096); size_t c = fse4_enc(tmp.data(), tmp.size(), s, n, mx, cnt);
     if (!c || c >= n * 2) { o.u8(0); o.raw(s, n * 2); return; }
@@ -263,6 +263,7 @@ template <bool N9> static void skew_restore(const int16_t* S, int w, int h, int1
 // one wavefront step; Z = residual vector (zigzag for N9)
 template <bool N9> static inline __m128i wave_step(__m128i Z, __m128i& V, __m128i& Bp, int16_t topv) {
     const __m128i one = _mm_set1_epi16(1), zero = _mm_setzero_si128(), m255 = _mm_set1_epi16(255);
+    Z = _mm_and_si128(Z, _mm_set1_epi16(0x0fff));                    // FSE writes sym | nb << 12
     __m128i e = _mm_xor_si128(_mm_srli_epi16(Z, 1), _mm_sub_epi16(zero, _mm_and_si128(Z, one)));
     __m128i b = _mm_insert_epi16(_mm_slli_si128(V, 2), topv, 0), c = Bp, a = V;
     __m128i mx = _mm_max_epi16(a, b), mn = _mm_min_epi16(a, b);
@@ -380,7 +381,8 @@ static inline int lane_nb(int W, int B) { return std::max(1, (W + B / 2) / B); }
 static inline size_t seg_count(int W, int hb, int t0, int t1) {
     size_t n = 0; for (int t = t0; t < t1; ++t) { int klo = std::max(0, t - W + 1), khi = std::min(hb - 1, t); if (klo <= khi) n += size_t(khi - klo + 1); } return n;
 }
-// NCount header -> flat decode table T (newState | nbBits << 16 | symbol << 20); returns header size
+// NCount header -> flat decode table T: low u16 newState, high u16 sx = symbol | nbBits << 12 (sx goes to the output
+// as is, the wave masks it with 0x0fff); returns header size
 static size_t read_dtable(const uint8_t* src, size_t c, std::vector<uint32_t>& T, unsigned& tl) {
     short norm[1024]; unsigned mx = 1023;
     size_t h = FSE_readNCount(norm, &mx, &tl, src, c); if (FSE_isError(h) || tl > 13 || tl < 1) throw std::runtime_error("ncount");
@@ -389,7 +391,7 @@ static size_t read_dtable(const uint8_t* src, size_t c, std::vector<uint32_t>& T
     uint32_t pos = 0;
     for (unsigned s = 0; s <= mx; ++s) for (int k = 0; k < norm[s]; ++k) { T[pos] = s; pos = (pos + step) & mask; while (pos > hi) pos = (pos + step) & mask; }
     if (pos) throw std::runtime_error("ncount spread");
-    for (uint32_t u = 0; u < ts; ++u) { uint32_t s = T[u], ns = nxt[s]++, nb = tl - bw(ns) + 1; T[u] = (((ns << nb) - ts) & 0xffff) | nb << 16 | s << 20; }
+    for (uint32_t u = 0; u < ts; ++u) { uint32_t s = T[u], ns = nxt[s]++, nb = tl - bw(ns) + 1; T[u] = (((ns << nb) - ts) & 0xffff) | (s | nb << 12) << 16; }   // {u16 newState, u16 sym | nb << 12}
     return h;
 }
 // resumable reader: raw / rle / FSE4 with 4 interleaved states (symbol g uses state g & 3, reload when g % 4 == 0)
@@ -414,7 +416,7 @@ struct RStream {
         if (mode == 1) { std::fill(out, out + cnt, rle); return; }
         if (mode == 0) { std::memcpy(out, raw, cnt * 2); raw += cnt * 2; return; }
         const uint32_t* t = T.data(); size_t i = 0; BIT_DStream_t b = bd; uint32_t s0 = st[0], s1 = st[1], s2 = st[2], s3 = st[3]; uint32_t* sp[4] = {&s0, &s1, &s2, &s3};
-#define HLC_D(sv) { uint32_t e = t[sv]; out[i++] = int16_t(e >> 20); sv = (e & 0xffff) + uint32_t(BIT_readBits(&b, (e >> 16) & 15)); }
+#define HLC_D(sv) { uint32_t e = t[sv], sx = e >> 16; out[i++] = int16_t(sx); sv = (e & 0xffff) + uint32_t(BIT_readBits(&b, sx >> 12)); }
         while (i < cnt && (g & 3)) { uint32_t& sv = *sp[g & 3]; HLC_D(sv) ++g; }
         for (; i + 4 <= cnt; g += 4) { BIT_reloadDStream(&b); HLC_D(s0) HLC_D(s1) HLC_D(s2) HLC_D(s3) }
         if (i < cnt) { BIT_reloadDStream(&b); while (i < cnt) { uint32_t& sv = *sp[g & 3]; HLC_D(sv) ++g; } }
@@ -424,7 +426,7 @@ struct RStream {
     template <int NS> void all_t(int16_t* out, size_t n) {         // whole stream, NS states, reload every 4 symbols
         const uint32_t* t = T.data(); BIT_DStream_t b = bd; uint32_t s[NS]; for (int k = 0; k < NS; ++k) s[k] = st[k];
         constexpr int U = NS < 4 ? 4 : NS; size_t i = 0;
-#define HLC_DS(sv) { uint32_t e = t[sv]; out[i + j] = int16_t(e >> 20); sv = (e & 0xffff) + uint32_t(BIT_readBits(&b, (e >> 16) & 15)); }
+#define HLC_DS(sv) { uint32_t e = t[sv], sx = e >> 16; out[i + j] = int16_t(sx); sv = (e & 0xffff) + uint32_t(BIT_readBits(&b, sx >> 12)); }
         for (; i + U <= n; i += U) {
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC unroll 8
@@ -434,9 +436,9 @@ struct RStream {
         for (int j = 0; i + size_t(j) < n; ++j) { if ((j & 3) == 0) BIT_reloadDStream(&b); HLC_DS(s[j % NS]) }
 #undef HLC_DS
     }
-    void get_all(int16_t* out, size_t n) {                          // fresh stream decoded at once
-        if (mode != 8 || S == 4) { get(out, n); return; }
-        switch (S) { case 1: all_t<1>(out, n); break; case 2: all_t<2>(out, n); break; default: all_t<8>(out, n); }
+    void get_all(int16_t* out, size_t n) {                          // fresh stream decoded at once (states stay in registers)
+        if (mode != 6 && mode != 8) { get(out, n); return; }
+        switch (S) { case 1: all_t<1>(out, n); break; case 2: all_t<2>(out, n); break; case 4: all_t<4>(out, n); break; default: all_t<8>(out, n); }
     }
 };
 // three FSE4 streams of equal length decoded in one loop: 3 bit readers x 4 states = 12 independent chains
@@ -448,7 +450,7 @@ static void dec3(RStream* r, int16_t* o0, int16_t* o1, int16_t* o2, size_t n) {
     uint32_t c0 = r[1].st[0], c1 = r[1].st[1], c2 = r[1].st[2], c3 = r[1].st[3];
     uint32_t d0 = r[2].st[0], d1 = r[2].st[1], d2 = r[2].st[2], d3 = r[2].st[3];
     size_t i = 0;
-#define HLC_D3(t, b, sv, o, k) { uint32_t e = t[sv]; o[i + k] = int16_t(e >> 20); sv = (e & 0xffff) + uint32_t(BIT_readBits(&b, (e >> 16) & 15)); }
+#define HLC_D3(t, b, sv, o, k) { uint32_t e = t[sv], sx = e >> 16; o[i + k] = int16_t(sx); sv = (e & 0xffff) + uint32_t(BIT_readBits(&b, sx >> 12)); }
     for (; i + 4 <= n; i += 4) {
         BIT_reloadDStream(&b0); BIT_reloadDStream(&b1); BIT_reloadDStream(&b2);
         HLC_D3(t0, b0, a0, o0, 0) HLC_D3(t1, b1, c0, o1, 0) HLC_D3(t2, b2, d0, o2, 0)
@@ -468,12 +470,12 @@ static void dec3(RStream* r, int16_t* o0, int16_t* o1, int16_t* o2, size_t n) {
 // K states per plane (state of (plane p, sample i) = p*K + i mod K), each plane its own table (tableLog <= 12),
 // decoder reloads once per 4 symbols. Layout: u8 7, u8 K, 3 x NCount, var csize, bitstream.
 static bool joint_put(Out& o, const uint16_t* const* s, size_t n, int K, std::vector<uint8_t>& tmp) {
-    thread_local unsigned cnt[3][1024]; thread_local std::vector<FSE_CTable> ct[3]; unsigned mx[3], tl[3]; short norm[1024];
+    thread_local unsigned cnt[3][512]; thread_local std::vector<FSE_CTable> ct[3]; unsigned mx[3], tl[3]; short norm[1024];
     tmp.resize(n * 6 + 8192); uint8_t* op = tmp.data(); uint8_t* const oe = tmp.data() + tmp.size();
     for (int p = 0; p < 3; ++p) {
         std::memset(cnt[p], 0, sizeof cnt[p]); mx[p] = 0;
         for (size_t i = 0; i < n; ++i) cnt[p][s[p][i]]++;
-        for (unsigned v = 0; v < 1024; ++v) if (cnt[p][v]) mx[p] = v;
+        for (unsigned v = 0; v < 512; ++v) if (cnt[p][v]) mx[p] = v;
         if (cnt[p][s[p][0]] == n) return false;                      // constant plane: separate streams (rle)
         const unsigned tcap = g_tadapt ? std::min(12u, std::min(unsigned(g_tl), std::max(9u, bw(uint32_t(n)) - 1 - 4))) : std::min(12u, unsigned(g_tl));
         tl[p] = FSE_optimalTableLog(tcap, n, mx[p]); if (tl[p] > 12) return false;
@@ -500,7 +502,7 @@ template <int K> static void joint_dec_t(const uint32_t* const* T, BIT_DStream_t
     uint32_t s0[K], s1[K], s2[K]; for (int k = 0; k < K; ++k) { s0[k] = st[0][k]; s1[k] = st[1][k]; s2[k] = st[2][k]; }
     BIT_DStream_t b = bd; constexpr int U = K == 3 ? 12 : 4;           // samples per unrolled round: lane index and reload slots are constants
     size_t i = 0;
-#define HLC_J(t, sv, out) { uint32_t e = t[sv]; out[i + j] = int16_t(e >> 20); sv = (e & 0xffff) + uint32_t(BIT_readBits(&b, (e >> 16) & 15)); }
+#define HLC_J(t, sv, out) { uint32_t e = t[sv], sx = e >> 16; out[i + j] = int16_t(sx); sv = (e & 0xffff) + uint32_t(BIT_readBits(&b, sx >> 12)); }
     for (; i + U <= n; i += U) {
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC unroll 16
