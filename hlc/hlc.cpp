@@ -832,8 +832,9 @@ Img decompress4(In in, int threads) {
 // file: "HLC5" var W var H u8 flags (bit 0 raw) var CB, 11 x var n_i, then the chunks of stream 0, 1, ...
 static const int TH5Y[5] = {1, 3, 10, 18, 35}, TH5C[5] = {1, 4, 8, 16, 30};
 static int g_v5 = 0, g_cb = 0, g_g5 = 1, g_sg = 1;                 // -5, -cb, -g5 0: serial gather (old), -sg 0: no sign cells
-// -sg 1 (flags bit 1): sign cells as llcomp's mirrored contexts: g1 = sign(a-c), g2 = sign(c-b); s = first nonzero of
-// (g1, g2), else +1; the residual is coded as s*e; cell = sign(g2*s) + 3|g1| in 0..4 -> stream = sid*5 + cell (55 streams)
+// -sg 1 (flags bit 2): sign from the context: s = sign(a-c), +1 when a = c; the residual is coded as s*e (11 streams)
+// -sg 2 (flags bit 1): + sign cells as llcomp's mirrored contexts: g1 = sign(a-c), g2 = sign(c-b); s = first nonzero of
+// (g1, g2), else +1; cell = sign(g2*s) + 3|g1| in 0..4 -> stream = sid*5 + cell (55 streams)
 constexpr int NS5 = 55;
 static unsigned long long g_c5stat[NS5], g_f5stat[2];                // bench: symbols per stream; full steps uniform / mixed class
 template <bool N9> static inline int cls5(int act) { const int* th = N9 ? TH5C : TH5Y; int k = 0; for (int i = 0; i < 5; ++i) k += act >= th[i]; return k; }
@@ -841,7 +842,7 @@ static inline int sid5(int c, int k) { return k == 0 ? 0 : (c == 2 ? k : 5 + k);
 
 std::vector<uint8_t> compress5(const Img& im) {
     const int W = im.W, H = im.H; const size_t n = size_t(W) * H;
-    std::vector<int16_t> P[3], Z[3]; std::vector<uint8_t> K[3]; const int NS = g_sg ? 55 : 11;
+    std::vector<int16_t> P[3], Z[3]; std::vector<uint8_t> K[3]; const int NS = g_sg == 2 ? 55 : 11;
     for (int c = 0; c < 3; ++c) { P[c].resize(n); Z[c].resize(n + 8); K[c].resize(n); }
     for (int y = 0; y < H; ++y) rct_row(im.rgb.data() + size_t(y) * W * 3, W, P[0].data() + size_t(y) * W, P[1].data() + size_t(y) * W, P[2].data() + size_t(y) * W);
     for (int c = 0; c < 3; ++c) {
@@ -854,8 +855,8 @@ std::vector<uint8_t> compress5(const Img& im) {
                 int aa = x >= 2 ? r[x - 2] : a, act = std::abs(a - cc) + std::abs(cc - b) + std::abs(a - aa);
                 int id = sid5(c, n9 ? cls5<true>(act) : cls5<false>(act));
                 if (g_sg) {
-                    int g1 = (a > cc) - (a < cc), g2 = (cc > b) - (cc < b), sg = g1 ? g1 : (g2 ? g2 : 1);
-                    id = id * 5 + g2 * sg + 3 * (g1 != 0);
+                    int g1 = (a > cc) - (a < cc), g2 = (cc > b) - (cc < b), sg = g1 ? g1 : (g_sg == 2 && g2 ? g2 : 1);
+                    if (g_sg == 2) id = id * 5 + g2 * sg + 3 * (g1 != 0);
                     if (sg < 0) { int16_t& zr = Z[c][size_t(y) * W + x]; int e = -unzz(uint16_t(zr)); zr = int16_t(zz(n9 ? wrape<true>(e) : wrape<false>(e))); }
                 }
                 kr[x] = uint8_t(id);
@@ -873,16 +874,16 @@ std::vector<uint8_t> compress5(const Img& im) {
         }
     }
     for (int i = 0; i < NS5; ++i) g_c5stat[i] += st[i]; g_f5stat[0] += fu; g_f5stat[1] += fm;
-    Out f; f.raw("HLC5", 4); f.var(W); f.var(H); f.u8(uint8_t(g_raw | (g_sg ? 2 : 0))); f.var(size_t(g_cb));
+    Out f; f.raw("HLC5", 4); f.var(W); f.var(H); f.u8(uint8_t(g_raw | (g_sg == 2 ? 2 : 0) | (g_sg == 1 ? 4 : 0))); f.var(size_t(g_cb));
     for (int i = 0; i < NS; ++i) f.var(S[i].size());
     std::vector<uint8_t> tmp;
-    for (int i = 0; i < NS; ++i) { const size_t m = S[i].size(), cb = g_cb > 0 ? size_t(g_cb) : std::max<size_t>(m, 1); const int sid = g_sg ? i / 5 : i;
+    for (int i = 0; i < NS; ++i) { const size_t m = S[i].size(), cb = g_cb > 0 ? size_t(g_cb) : std::max<size_t>(m, 1); const int sid = g_sg == 2 ? i / 5 : i;
         for (size_t o = 0; o < m; o += cb) { const size_t k = std::min(cb, m - o);
             if (g_raw) f.raw(S[i].data() + o, k * 2); else put_stream(f, S[i].data() + o, k, tmp, (sid >= 1 && sid <= 5) ? 256 : 512); } }
     return std::move(f.b);
 }
 // one wave step of one plane with the context gather; FULL = all 8 lanes real and no border lane (x >= 2)
-template <bool N9, bool FULL, bool SG> static inline void step5(int t, int klo, int khi, __m128i& V, __m128i& Bp, __m128i& V2, int16_t topv,
+template <bool N9, bool FULL, int SG> static inline void step5(int t, int klo, int khi, __m128i& V, __m128i& Bp, __m128i& V2, int16_t topv,
                                                                 const int16_t* sb, uint32_t* pos, int16_t* out) {
     const __m128i zero = _mm_setzero_si128(), one = _mm_set1_epi16(1);
     __m128i a = V, b = _mm_insert_epi16(_mm_slli_si128(V, 2), topv, 0), cc = Bp, aa = V2, a_ = a, c_ = cc, aa_ = aa;
@@ -893,7 +894,8 @@ template <bool N9, bool FULL, bool SG> static inline void step5(int t, int klo, 
     for (int i = 0; i < 5; ++i) k = _mm_sub_epi16(k, _mm_cmpgt_epi16(act, _mm_set1_epi16(short(th[i] - 1))));
     if (N9) k = _mm_add_epi16(k, _mm_and_si128(_mm_cmpgt_epi16(k, zero), _mm_set1_epi16(5)));   // class -> stream id (U/V: 0, 6..10)
     __m128i sgn = one;
-    if (SG) {
+    if (SG == 1) { const __m128i g1 = _mm_sign_epi16(one, _mm_sub_epi16(a_, c_)); sgn = _mm_blendv_epi8(g1, one, _mm_cmpeq_epi16(g1, zero)); }
+    if (SG == 2) {
         const __m128i g1 = _mm_sign_epi16(one, _mm_sub_epi16(a_, c_)), g2 = _mm_sign_epi16(one, _mm_sub_epi16(c_, b));
         sgn = _mm_blendv_epi8(g1, _mm_blendv_epi8(g2, one, _mm_cmpeq_epi16(g2, zero)), _mm_cmpeq_epi16(g1, zero));
         const __m128i g1a = _mm_abs_epi16(g1), cell = _mm_add_epi16(_mm_sign_epi16(g2, sgn), _mm_add_epi16(g1a, _mm_add_epi16(g1a, g1a)));
@@ -930,9 +932,9 @@ template <bool N9, bool FULL, bool SG> static inline void step5(int t, int klo, 
     V2 = V; V = N9 ? _mm_srai_epi16(_mm_slli_epi16(v, 7), 7) : _mm_and_si128(v, _mm_set1_epi16(255)); Bp = b;
     _mm_store_si128((__m128i*)out, V);
 }
-template <bool SG> static void wave5(int W, int H, const int16_t* sb, uint32_t* pos, uint8_t* rgb);
+template <int SG> static void wave5(int W, int H, const int16_t* sb, uint32_t* pos, uint8_t* rgb);
 Img decompress5(In in) {
-    Img im; im.W = int(in.var()); im.H = int(in.var()); const uint8_t fl = in.u8(); const bool raw = fl & 1, sg = fl >> 1 & 1; const size_t cb0 = size_t(in.var()); const int W = im.W, H = im.H, NS = sg ? 55 : 11;
+    Img im; im.W = int(in.var()); im.H = int(in.var()); const uint8_t fl = in.u8(); const bool raw = fl & 1; const int sg = (fl & 2) ? 2 : (fl & 4) ? 1 : 0; const size_t cb0 = size_t(in.var()); const int W = im.W, H = im.H, NS = sg == 2 ? 55 : 11;
     if (W < 1 || H < 1 || W > 65536 || H > 65536) throw std::runtime_error("header");
     size_t ns[NS5], off[NS5 + 1], tot = 0; off[0] = 8;
     for (int i = 0; i < NS5; ++i) { ns[i] = i < NS ? size_t(in.var()) : 0; tot += ns[i]; off[i + 1] = off[i] + ((ns[i] + 15) & ~size_t(7)); }
@@ -944,12 +946,12 @@ Img decompress5(In in) {
             if (raw) std::memcpy(d, in.take(k * 2), k * 2); else { rs.open(in, k); rs.get_all(d, k); } } }
     im.rgb.resize(size_t(W) * H * 3 + 64);
     uint32_t pos[NS5]; for (int i = 0; i < NS5; ++i) pos[i] = uint32_t(off[i]);
-    if (sg) wave5<true>(W, H, SB.data(), pos, im.rgb.data()); else wave5<false>(W, H, SB.data(), pos, im.rgb.data());
+    if (sg == 2) wave5<2>(W, H, SB.data(), pos, im.rgb.data()); else if (sg == 1) wave5<1>(W, H, SB.data(), pos, im.rgb.data()); else wave5<0>(W, H, SB.data(), pos, im.rgb.data());
     if (g_g5 != 2) for (int i = 0; i < NS5; ++i) if (pos[i] != off[i] + ns[i]) throw std::runtime_error("context streams out of sync");
     im.rgb.resize(size_t(W) * H * 3);
     return im;
 }
-template <bool SG> static void wave5(int W, int H, const int16_t* sb, uint32_t* pos, uint8_t* rgb) {
+template <int SG> static void wave5(int W, int H, const int16_t* sb, uint32_t* pos, uint8_t* rgb) {
     const int L = W + 7, LB = ((L + 7) & ~7) + 8;
     thread_local std::vector<int16_t> band[3], top[3];
     for (int c = 0; c < 3; ++c) { band[c].assign(size_t(LB) * 8, 0); top[c].assign(size_t(W) + 48, 0); }
@@ -1084,7 +1086,7 @@ int main(int argc, char** argv) {
                     std::printf("\n");
                     std::printf("cross-chroma (tiles): off %u  U<-V %u  V<-U %u\n", g_xstat[0].load() / 3, g_xstat[1].load() / 3, g_xstat[2].load() / 3); } }
             if (g_v5) { unsigned long long t = 0; for (auto v : g_c5stat) t += v;
-                if (g_sg) { for (int i = 0; i < 11; ++i) { unsigned long long q = 0; for (int j = 0; j < 5; ++j) q += g_c5stat[i * 5 + j]; g_c5stat[i] = q; } }
+                if (g_sg == 2) { for (int i = 0; i < 11; ++i) { unsigned long long q = 0; for (int j = 0; j < 5; ++j) q += g_c5stat[i * 5 + j]; g_c5stat[i] = q; } }
                 if (t) { std::printf("contexts (%% of symbols): shared0 %.1f  Y1-5", 100.0 * g_c5stat[0] / t); for (int i = 1; i <= 5; ++i) std::printf(" %.1f", 100.0 * g_c5stat[i] / t);
                     std::printf("  UV1-5"); for (int i = 6; i <= 10; ++i) std::printf(" %.1f", 100.0 * g_c5stat[i] / t);
                     std::printf("   full steps one class %.1f%%\n", 100.0 * g_f5stat[0] / std::max(1ull, g_f5stat[0] + g_f5stat[1])); } }
