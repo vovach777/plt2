@@ -133,3 +133,20 @@ V по U) и k ∈ [−8, 8]: e_t′ = wrap9(e_t − ((k·e_s + 4) >> 3)). Ра�
 | без (`-X 0`) | 5.7612 | 4.6717 | 315 | 598 |
 | **с поправкой** | **5.6225 (−2.41%)** | **4.5500 (−2.61%)** | 260 | ~560 |
 | HALIC 0.7.2 | 5.757 | — | — | — |
+
+## HLC5 (experiment, branch ctx5): whole-image skew + activity contexts (`-5`)
+
+No tiles: MED wave over 8-row bands across the full width. Each sample gets a class from its causal
+neighbourhood, act = |a-c| + |c-b| + |a-aa| (aa = two to the left; pctx's up-right d is not decoded yet in a
+wave step), thresholds as pctx (Y 1 3 10 18 35, U/V 1 4 8 16 30). 11 streams: class 0 shared by all planes,
+classes 1..5 of Y, classes 1..5 of U/V. Symbol order = decoder order (band, step, plane V U Y, lane).
+FSE per chunk of `-cb N` symbols of a stream (0 = one table per stream). Decoder: all streams FSE-decoded into
+one buffer, then one wave pass with the three planes interleaved per step; class in SIMD, gather per lane
+(fast path: all 8 lanes one class = one 16-byte load). `-n` = raw streams (cost of the separation alone).
+`-g5 0|1|2`: serial gather / rank gather / debug (always fast path, wrong output, timing only).
+
+16 photos (JPEG 4:2:0, downscaled 2x -> 4:4:4), sandbox: HALIC 8.6530 bpp; HLC3 MED only 8.6974;
+HLC5 -cb 65536 8.1954 (-5.3 % vs HALIC), dec 418 MB/s (HLC3 613), raw dec 733 (HLC3 raw 1800).
+The step chain V(t-1) -> class -> address -> Z -> MED -> V(t) is the cost; classes from t-2 data only
+(c, aa, (y-1,x-2), (y-2,x)) would cut it to MED, entropy estimate -8.55 % instead of -10.13 % vs no contexts.
+xres (cross-chroma, HLC3) is now off by default: `-X 1`.
