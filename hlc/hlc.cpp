@@ -229,13 +229,23 @@ static size_t fse4_enc(uint8_t* dst, size_t cap, const uint16_t* s, size_t n, un
     const size_t S = size_t(g_S), M = S - 1; FSE_CState_t st[8]; const size_t L = std::min<size_t>(n, S); size_t i = n;   // S is a power of two
     for (size_t j = 0; j < L; ++j) { --i; FSE_initCState2(&st[i & M], ct.data(), s[i]); }   // last symbol of each lane
     while (i > 0 && (i & 3)) { --i; FSE_encodeSymbol(&bc, &st[i & M], s[i]); if ((i & 3) == 0) BIT_flushBits(&bc); }   // align to 4
-    if (S == 4) {                                                   // lanes fixed per unrolled step: states stay in registers
-        FSE_CState_t c0 = st[0], c1 = st[1], c2 = st[2], c3 = st[3];
+    if (S == 4 && i >= 4) {                                         // = FSE_encodeSymbol x 4 + BIT_flushBits, but with ONE pair of table
+        // pointers for the four states (FSE_CState_t carries its own copies, which spills them: 103 -> ~76 instr / 4 symbols)
+        const FSE_symbolCompressionTransform* const tt = (const FSE_symbolCompressionTransform*)st[0].symbolTT;
+        const U16* const stt = (const U16*)st[0].stateTable;
+        uint32_t v0 = uint32_t(st[0].value), v1 = uint32_t(st[1].value), v2 = uint32_t(st[2].value), v3 = uint32_t(st[3].value);   // states < 2^14
+        size_t box = bc.bitContainer; unsigned bp = bc.bitPos; char* bptr = bc.ptr; char* const bend = bc.endPtr; const unsigned* const msk = BIT_mask;
+#define HLC_ENC1(v, sym) { const FSE_symbolCompressionTransform T = tt[sym]; const uint32_t nb = (v + T.deltaNbBits) >> 16; \
+                           box |= size_t(v & msk[nb]) << bp; bp += nb; v = stt[uint32_t((v >> nb) + uint32_t(T.deltaFindState))]; }
         for (; i >= 4; i -= 4) {
-            FSE_encodeSymbol(&bc, &c3, s[i - 1]); FSE_encodeSymbol(&bc, &c2, s[i - 2]); FSE_encodeSymbol(&bc, &c1, s[i - 3]); FSE_encodeSymbol(&bc, &c0, s[i - 4]);
-            BIT_flushBits(&bc);                                         // <= 4 x 12 bits between flushes
+            HLC_ENC1(v3, s[i - 1]) HLC_ENC1(v2, s[i - 2]) HLC_ENC1(v1, s[i - 3]) HLC_ENC1(v0, s[i - 4])
+            std::memcpy(bptr, &box, sizeof box); const unsigned nbB = bp >> 3; bptr += nbB;   // <= 4 x 13 + 7 bits in the container
+            box >>= nbB * 8; bp &= 7;   // no clamp inside: <= 13 bits per symbol, the caller's buffer holds 2 bytes per symbol + slack
         }
-        st[0] = c0; st[1] = c1; st[2] = c2; st[3] = c3;
+#undef HLC_ENC1
+        if (bptr > bend) return 0;
+        bc.bitContainer = box; bc.bitPos = bp; bc.ptr = bptr;
+        st[0].value = ptrdiff_t(v0); st[1].value = ptrdiff_t(v1); st[2].value = ptrdiff_t(v2); st[3].value = ptrdiff_t(v3);
     }
     while (i > 0) { --i; FSE_encodeSymbol(&bc, &st[i & M], s[i]); if ((i & 3) == 0) BIT_flushBits(&bc); }   // generic S / tail
     for (size_t k = L; k-- > 0;) FSE_flushCState(&bc, &st[k]);    // lane 0 last -> read first
