@@ -841,6 +841,29 @@ static int g_v5 = 0, g_cb = 0, g_g5 = 1, g_sg = 1;                 // -5, -cb, -
 // Context = |q3(c-b) + 3 q3(c-a)| in 0..4, q3(x) = (x > dz) - (x < -dz). -ctx 5: 5 streams, one dead zone (dzC) for
 // all planes; -ctx 9: 0 shared, Y 1..4 (dzY), U/V 5..8 (dzC).
 static int g_tc = 0, g_dzy = 4, g_dzc = 4;
+// -ctx 8 (flags bit 6): q7 x q7 sectors merged into 8 groups per plane type (16 streams: Y 0..7, U/V 8..15).
+// q(x) = sign(x) * #(|x| >= edges), edges Y 1 3 10, U/V 1 3 7 (CLIC sweep), |x| capped at 15; sector 0..48 =
+// (3 - q(c-a)) * 7 + q(c-b) + 3 (llcomp_q7grid numbering - 1); group = greedy |e|-histogram merging of the sectors on
+// CLIC (llcomp_q7similar). Sign as -ctx 5/9: s = sign(c-a), else sign(c-b), else +1; residual coded as s*e.
+// Encoder: q from a packed 2-bit constant (no table); decoder: q by pshufb, group by 4 x pshufb over 64 bytes.
+static const int E8[2][3] = {{1, 3, 10}, {1, 3, 7}};
+static const char* const G8S[2][8] = {                                  // groups, by mean |e| (sector numbers 1..49)
+    {"25", "18 24 26 32", "17 19 31 33", "10 11 12 16 20 23 27 30 34 38 39 40", "9 13 37 41", "3 4 5 6 21 28 35 45 46 47",
+     "2 8 14 15 22 29 36 42 44 48", "1 7 43 49"},
+    {"25", "18 24 26 32", "19 31", "17 33", "10 11 12 16 20 23 27 30 34 38 39 40", "9 13 37 41",
+     "2 3 4 5 6 8 14 15 21 22 28 29 35 36 42 44 45 46 47 48", "1 7 43 49"}};
+static uint32_t QK8[2];                                                 // 2 bits per |x| = 0..15
+alignas(16) static uint8_t Q16[2][16], G64[2][64];                      // decoder: |x| -> q, sector -> stream id
+static const bool g_ctx8_init = [] {
+    for (int t = 0; t < 2; ++t) { QK8[t] = 0;
+        for (int a = 0; a < 16; ++a) { int q = (a >= E8[t][0]) + (a >= E8[t][1]) + (a >= E8[t][2]); Q16[t][a] = uint8_t(q); QK8[t] |= uint32_t(q) << (2 * a); }
+        int seen = 0; std::memset(G64[t], 0, 64);
+        for (int g = 0; g < 8; ++g) { const char* p = G8S[t][g]; while (*p) { char* e; long k = std::strtol(p, &e, 10); if (e == p) break; p = e;
+            if (k < 1 || k > 49 || G64[t][k - 1]) throw std::logic_error("ctx8 groups"); G64[t][k - 1] = uint8_t(g + 8 * t + 0x40); ++seen; } }
+        if (seen != 49) throw std::logic_error("ctx8 groups");
+        for (int i = 0; i < 64; ++i) G64[t][i] &= 0x3f; }
+    return true; }();
+template <bool N9> static inline int q8(int x) { const int a = std::min(std::abs(x), 15), q = int(QK8[N9] >> (2 * a) & 3); return x < 0 ? -q : q; }
 // -X5 1 (flags bit 5, then one byte k+8 per strip of 32 rows): cross-chroma U <- V before the sign flip,
 // e_U' = wrap9(e_U - ((k e_V + 4) >> 3)), k in [-8, 8] per 32-row strip chosen by the strip's U entropy
 static int g_x5 = 0; constexpr int XS5 = 32;
@@ -853,7 +876,7 @@ static inline int sid5(int c, int k) { return k == 0 ? 0 : (c == 2 ? k : 5 + k);
 
 std::vector<uint8_t> compress5(const Img& im) {
     const int W = im.W, H = im.H; const size_t n = size_t(W) * H;
-    std::vector<int16_t> P[3], Z[3]; std::vector<uint8_t> K[3]; const int NS = g_tc ? g_tc : (g_sg == 2 ? 55 : 11);
+    std::vector<int16_t> P[3], Z[3]; std::vector<uint8_t> K[3]; const int NS = g_tc == 8 ? 16 : g_tc ? g_tc : (g_sg == 2 ? 55 : 11);
     for (int c = 0; c < 3; ++c) { P[c].resize(n); Z[c].resize(n + 8); K[c].resize(n); }
     for (int y = 0; y < H; ++y) rct_row(im.rgb.data() + size_t(y) * W * 3, W, P[0].data() + size_t(y) * W, P[1].data() + size_t(y) * W, P[2].data() + size_t(y) * W);
     for (int c = 0; c < 3; ++c) for (int y = 0; y < H; ++y) {
@@ -887,7 +910,12 @@ std::vector<uint8_t> compress5(const Img& im) {
                 int b = y ? u[x] : 0, cc = (y && x) ? u[x - 1] : 0, a = x ? r[x - 1] : b; if (!x) cc = b;
                 int aa = x >= 2 ? r[x - 2] : a, act = std::abs(a - cc) + std::abs(cc - b) + std::abs(a - aa);
                 int id = sid5(c, n9 ? cls5<true>(act) : cls5<false>(act));
-                if (g_tc) {
+                if (g_tc == 8) {
+                    const int gca = cc - a, gcb = cc - b, sec = 24 - 7 * (n9 ? q8<true>(gca) : q8<false>(gca)) + (n9 ? q8<true>(gcb) : q8<false>(gcb));
+                    const int sg = gca ? (gca > 0 ? 1 : -1) : (gcb ? (gcb > 0 ? 1 : -1) : 1);
+                    id = G64[n9][sec];
+                    if (sg < 0) { int16_t& zr = Z[c][size_t(y) * W + x]; int e = -unzz(uint16_t(zr)); zr = int16_t(zz(n9 ? wrape<true>(e) : wrape<false>(e))); }
+                } else if (g_tc) {
                     const int gca = cc - a, gcb = cc - b, dz = (g_tc == 9 && !n9) ? g_dzy : g_dzc;
                     const int q = ((gcb > dz) - (gcb < -dz)) + 3 * ((gca > dz) - (gca < -dz)), cx = q < 0 ? -q : q;
                     const int sg = gca ? (gca > 0 ? 1 : -1) : (gcb ? (gcb > 0 ? 1 : -1) : 1);
@@ -914,12 +942,12 @@ std::vector<uint8_t> compress5(const Img& im) {
         }
     }
     for (int i = 0; i < NS5; ++i) g_c5stat[i] += st[i]; g_f5stat[0] += fu; g_f5stat[1] += fm;
-    Out f; f.raw("HLC5", 4); f.var(W); f.var(H); f.u8(uint8_t(g_raw | (g_tc ? (g_tc == 5 ? 8 : 16) : (g_sg == 2 ? 2 : 0) | (g_sg == 1 ? 4 : 0)) | (g_x5 ? 32 : 0))); f.var(size_t(g_cb));
-    if (g_tc) { f.u8(uint8_t(g_dzy)); f.u8(uint8_t(g_dzc)); }
+    Out f; f.raw("HLC5", 4); f.var(W); f.var(H); f.u8(uint8_t(g_raw | (g_tc == 8 ? 64 : g_tc ? (g_tc == 5 ? 8 : 16) : (g_sg == 2 ? 2 : 0) | (g_sg == 1 ? 4 : 0)) | (g_x5 ? 32 : 0))); f.var(size_t(g_cb));
+    if (g_tc == 5 || g_tc == 9) { f.u8(uint8_t(g_dzy)); f.u8(uint8_t(g_dzc)); }
     if (g_x5) f.raw(XK.data(), XK.size());
     for (int i = 0; i < NS; ++i) f.var(S[i].size());
     std::vector<uint8_t> tmp;
-    for (int i = 0; i < NS; ++i) { const size_t m = S[i].size(), cb = g_cb > 0 ? size_t(g_cb) : std::max<size_t>(m, 1); const int sid = g_tc == 9 ? (i >= 1 && i <= 4 ? 1 : 0) : g_tc == 5 ? 0 : g_sg == 2 ? i / 5 : i;
+    for (int i = 0; i < NS; ++i) { const size_t m = S[i].size(), cb = g_cb > 0 ? size_t(g_cb) : std::max<size_t>(m, 1); const int sid = g_tc == 8 ? (i < 8 ? 1 : 0) : g_tc == 9 ? (i >= 1 && i <= 4 ? 1 : 0) : g_tc == 5 ? 0 : g_sg == 2 ? i / 5 : i;
         for (size_t o = 0; o < m; o += cb) { const size_t k = std::min(cb, m - o);
             if (g_raw) f.raw(S[i].data() + o, k * 2); else put_stream(f, S[i].data() + o, k, tmp, (sid >= 1 && sid <= 5) ? 256 : 512); } }
     return std::move(f.b);
@@ -932,7 +960,19 @@ template <bool N9, bool FULL, int SG, int XR = 0> static inline void step5(int t
     if (!FULL) { const __m128i idx = _mm_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7), m0 = _mm_cmpeq_epi16(idx, _mm_set1_epi16(short(t))), m1 = _mm_cmpeq_epi16(idx, _mm_set1_epi16(short(t - 1)));
                  a_ = _mm_blendv_epi8(a, b, m0); c_ = _mm_blendv_epi8(cc, b, m0); aa_ = _mm_blendv_epi8(aa, a_, _mm_or_si128(m0, m1)); }
     __m128i k = zero, sgn = one;
-    if constexpr (SG >= 5) {                                           // two-axis tiny context (llcomp ModelSizeTiny)
+    if constexpr (SG == 8) {                                           // q7 x q7 sectors -> 8 groups per plane type
+        const __m128i gca = _mm_sub_epi16(c_, a_), gcb = _mm_sub_epi16(c_, b), m15 = _mm_set1_epi16(15);
+        const __m128i QT = _mm_load_si128((const __m128i*)Q16[N9]);            // |x| <= 15 in the low byte, high byte 0 -> Q16[0] = 0
+        const __m128i qa = _mm_sign_epi16(_mm_shuffle_epi8(QT, _mm_min_epi16(_mm_abs_epi16(gca), m15)), gca);
+        const __m128i qb = _mm_sign_epi16(_mm_shuffle_epi8(QT, _mm_min_epi16(_mm_abs_epi16(gcb), m15)), gcb);
+        const __m128i sec = _mm_or_si128(_mm_add_epi16(_mm_sub_epi16(_mm_set1_epi16(24), _mm_sub_epi16(_mm_slli_epi16(qa, 3), qa)), qb), _mm_set1_epi16(short(0x8000)));
+        const __m128i b70 = _mm_set1_epi16(0x0070);
+        for (int j = 0; j < 4; ++j) {                                          // sector byte - 16j in [0,16) -> 0x70.. (lookup), else bit 7 set (zero)
+            const __m128i x = _mm_adds_epu8(_mm_sub_epi8(sec, _mm_set1_epi16(short(16 * j))), b70);
+            k = _mm_or_si128(k, _mm_shuffle_epi8(_mm_load_si128((const __m128i*)(G64[N9] + 16 * j)), x)); }
+        const __m128i sa = _mm_sign_epi16(one, gca), sb_ = _mm_sign_epi16(one, gcb);
+        sgn = _mm_blendv_epi8(sa, _mm_blendv_epi8(sb_, one, _mm_cmpeq_epi16(sb_, zero)), _mm_cmpeq_epi16(sa, zero));
+    } else if constexpr (SG >= 5) {                                    // two-axis tiny context (llcomp ModelSizeTiny)
         const __m128i gca = _mm_sub_epi16(c_, a_), gcb = _mm_sub_epi16(c_, b);
         const short dz = short((SG == 9 && !N9) ? g_dzy : g_dzc); const __m128i pz = _mm_set1_epi16(dz), nz = _mm_set1_epi16(short(-dz));
         const __m128i qa = _mm_sub_epi16(_mm_cmpgt_epi16(nz, gca), _mm_cmpgt_epi16(gca, pz)), qb = _mm_sub_epi16(_mm_cmpgt_epi16(nz, gcb), _mm_cmpgt_epi16(gcb, pz));
@@ -989,8 +1029,8 @@ template <bool N9, bool FULL, int SG, int XR = 0> static inline void step5(int t
 }
 template <int SG> static void wave5(int W, int H, const int16_t* sb, uint32_t* pos, uint8_t* rgb, const std::vector<int8_t>& xk);
 Img decompress5(In in) {
-    Img im; im.W = int(in.var()); im.H = int(in.var()); const uint8_t fl = in.u8(); const bool raw = fl & 1; const int sg = (fl & 8) ? 5 : (fl & 16) ? 9 : (fl & 2) ? 2 : (fl & 4) ? 1 : 0; const size_t cb0 = size_t(in.var()); const int W = im.W, H = im.H, NS = sg >= 5 ? sg : sg == 2 ? 55 : 11;
-    if (sg >= 5) { g_dzy = in.u8(); g_dzc = in.u8(); }
+    Img im; im.W = int(in.var()); im.H = int(in.var()); const uint8_t fl = in.u8(); const bool raw = fl & 1; const int sg = (fl & 64) ? 8 : (fl & 8) ? 5 : (fl & 16) ? 9 : (fl & 2) ? 2 : (fl & 4) ? 1 : 0; const size_t cb0 = size_t(in.var()); const int W = im.W, H = im.H, NS = sg == 8 ? 16 : sg >= 5 ? sg : sg == 2 ? 55 : 11;
+    if (sg == 5 || sg == 9) { g_dzy = in.u8(); g_dzc = in.u8(); }
     std::vector<int8_t> xk; if (fl & 32) { const uint8_t* q = in.take(size_t((H + XS5 - 1) / XS5)); for (int i = 0; i < (H + XS5 - 1) / XS5; ++i) { if (q[i] > 16) throw std::runtime_error("xres k"); xk.push_back(int8_t(q[i] - 8)); } }
     if (W < 1 || H < 1 || W > 65536 || H > 65536) throw std::runtime_error("header");
     size_t ns[NS5], off[NS5 + 1], tot = 0; off[0] = 8;
@@ -1003,7 +1043,7 @@ Img decompress5(In in) {
             if (raw) std::memcpy(d, in.take(k * 2), k * 2); else { rs.open(in, k); rs.get_all(d, k); } } }
     im.rgb.resize(size_t(W) * H * 3 + 64);
     uint32_t pos[NS5]; for (int i = 0; i < NS5; ++i) pos[i] = uint32_t(off[i]);
-    if (sg == 5) wave5<5>(W, H, SB.data(), pos, im.rgb.data(), xk); else if (sg == 9) wave5<9>(W, H, SB.data(), pos, im.rgb.data(), xk); else if (sg == 2) wave5<2>(W, H, SB.data(), pos, im.rgb.data(), xk); else if (sg == 1) wave5<1>(W, H, SB.data(), pos, im.rgb.data(), xk); else wave5<0>(W, H, SB.data(), pos, im.rgb.data(), xk);
+    if (sg == 8) wave5<8>(W, H, SB.data(), pos, im.rgb.data(), xk); else if (sg == 5) wave5<5>(W, H, SB.data(), pos, im.rgb.data(), xk); else if (sg == 9) wave5<9>(W, H, SB.data(), pos, im.rgb.data(), xk); else if (sg == 2) wave5<2>(W, H, SB.data(), pos, im.rgb.data(), xk); else if (sg == 1) wave5<1>(W, H, SB.data(), pos, im.rgb.data(), xk); else wave5<0>(W, H, SB.data(), pos, im.rgb.data(), xk);
     if (g_g5 != 2) for (int i = 0; i < NS5; ++i) if (pos[i] != off[i] + ns[i]) throw std::runtime_error("context streams out of sync");
     im.rgb.resize(size_t(W) * H * 3);
     return im;
@@ -1111,7 +1151,7 @@ int main(int argc, char** argv) {
     using namespace hlc; init_shuf();
     if (argc < 3) { std::fprintf(stderr, "usage: hlc c in.ppm out.hlc [-t N] [-n] | hlc d in.hlc out.ppm [-t N] | hlc bench [opts] a.ppm|dir ... [-max N]\n"); return 1; }
     std::string mode = argv[1]; int threads = 1; std::vector<const char*> pos;
-    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-r") g_skew = false; else if (a == "-tw" && i + 1 < argc) g_tw = std::max(8, std::atoi(argv[++i])); else if (a == "-th" && i + 1 < argc) g_th = std::max(8, std::atoi(argv[++i])); else if (a == "-B" && i + 1 < argc) g_B = std::max(8, std::atoi(argv[++i])); else if (a == "-R" && i + 1 < argc) g_R = std::max(8, std::atoi(argv[++i]) & ~7); else if (a == "-dord" && i + 1 < argc) g_dord = std::atoi(argv[++i]); else if (a == "-L") g_legacy = 1; else if (a == "-4") g_legacy = 0; else if (a == "-5") g_v5 = 1; else if (a == "-sg" && i + 1 < argc) g_sg = std::atoi(argv[++i]); else if (a == "-X5" && i + 1 < argc) g_x5 = std::atoi(argv[++i]); else if (a == "-ctx" && i + 1 < argc) { g_tc = std::atoi(argv[++i]); if (g_tc != 5 && g_tc != 9) g_tc = 0; } else if (a == "-dzy" && i + 1 < argc) g_dzy = std::max(0, std::atoi(argv[++i])); else if (a == "-dzc" && i + 1 < argc) g_dzc = std::max(0, std::atoi(argv[++i])); else if (a == "-g5" && i + 1 < argc) g_g5 = std::atoi(argv[++i]); else if (a == "-cb" && i + 1 < argc) g_cb = std::max(0, std::atoi(argv[++i])); else if (a == "-X" && i + 1 < argc) g_xres = std::atoi(argv[++i]); else if (a == "-Xc" && i + 1 < argc) g_xclip = std::atoi(argv[++i]); else if (a == "-Xf" && i + 1 < argc) g_xfull = std::atoi(argv[++i]); else if (a == "-Xs" && i + 1 < argc) g_xstep = std::max(1, std::atoi(argv[++i])); else if (a == "-P" && i + 1 < argc) { g_pmask = std::atoi(argv[++i]) & 15; if (!g_pmask) g_pmask = 1; } else if (a == "-Px" && i + 1 < argc) g_pxstep = std::max(1, std::atoi(argv[++i])); else if (a == "-Ps" && i + 1 < argc) g_pstep = std::max(1, std::atoi(argv[++i])); else if (a == "-al" && i + 1 < argc) g_al = std::atoi(argv[++i]); else if (a == "-S" && i + 1 < argc) { g_S = std::atoi(argv[++i]); if (g_S != 1 && g_S != 2 && g_S != 8) g_S = 4; } else if (a == "-max" && i + 1 < argc) g_max = std::atoi(argv[++i]); else if (a == "-J" && i + 1 < argc) g_joint = std::atoi(argv[++i]); else if (a == "-K" && i + 1 < argc) g_K = std::max(1, std::min(4, std::atoi(argv[++i]))); else if (a == "-d3" && i + 1 < argc) g_dec3 = std::atoi(argv[++i]); else if (a == "-Ta" && i + 1 < argc) g_tadapt = std::atoi(argv[++i]); else if (a == "-ws" && i + 1 < argc) g_wsplit = std::atoi(argv[++i]); else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
+    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-r") g_skew = false; else if (a == "-tw" && i + 1 < argc) g_tw = std::max(8, std::atoi(argv[++i])); else if (a == "-th" && i + 1 < argc) g_th = std::max(8, std::atoi(argv[++i])); else if (a == "-B" && i + 1 < argc) g_B = std::max(8, std::atoi(argv[++i])); else if (a == "-R" && i + 1 < argc) g_R = std::max(8, std::atoi(argv[++i]) & ~7); else if (a == "-dord" && i + 1 < argc) g_dord = std::atoi(argv[++i]); else if (a == "-L") g_legacy = 1; else if (a == "-4") g_legacy = 0; else if (a == "-5") g_v5 = 1; else if (a == "-sg" && i + 1 < argc) g_sg = std::atoi(argv[++i]); else if (a == "-X5" && i + 1 < argc) g_x5 = std::atoi(argv[++i]); else if (a == "-ctx" && i + 1 < argc) { g_tc = std::atoi(argv[++i]); if (g_tc != 5 && g_tc != 9 && g_tc != 8) g_tc = 0; } else if (a == "-dzy" && i + 1 < argc) g_dzy = std::max(0, std::atoi(argv[++i])); else if (a == "-dzc" && i + 1 < argc) g_dzc = std::max(0, std::atoi(argv[++i])); else if (a == "-g5" && i + 1 < argc) g_g5 = std::atoi(argv[++i]); else if (a == "-cb" && i + 1 < argc) g_cb = std::max(0, std::atoi(argv[++i])); else if (a == "-X" && i + 1 < argc) g_xres = std::atoi(argv[++i]); else if (a == "-Xc" && i + 1 < argc) g_xclip = std::atoi(argv[++i]); else if (a == "-Xf" && i + 1 < argc) g_xfull = std::atoi(argv[++i]); else if (a == "-Xs" && i + 1 < argc) g_xstep = std::max(1, std::atoi(argv[++i])); else if (a == "-P" && i + 1 < argc) { g_pmask = std::atoi(argv[++i]) & 15; if (!g_pmask) g_pmask = 1; } else if (a == "-Px" && i + 1 < argc) g_pxstep = std::max(1, std::atoi(argv[++i])); else if (a == "-Ps" && i + 1 < argc) g_pstep = std::max(1, std::atoi(argv[++i])); else if (a == "-al" && i + 1 < argc) g_al = std::atoi(argv[++i]); else if (a == "-S" && i + 1 < argc) { g_S = std::atoi(argv[++i]); if (g_S != 1 && g_S != 2 && g_S != 8) g_S = 4; } else if (a == "-max" && i + 1 < argc) g_max = std::atoi(argv[++i]); else if (a == "-J" && i + 1 < argc) g_joint = std::atoi(argv[++i]); else if (a == "-K" && i + 1 < argc) g_K = std::max(1, std::min(4, std::atoi(argv[++i]))); else if (a == "-d3" && i + 1 < argc) g_dec3 = std::atoi(argv[++i]); else if (a == "-Ta" && i + 1 < argc) g_tadapt = std::atoi(argv[++i]); else if (a == "-ws" && i + 1 < argc) g_wsplit = std::atoi(argv[++i]); else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
     try {
         if (mode == "c" && pos.size() == 2) { auto o = g_v5 ? compress5(read_ppm(pos[0])) : g_legacy ? compress(read_ppm(pos[0]), threads) : compress4(read_ppm(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
         if (mode == "d" && pos.size() == 2) { Img im = decompress(slurp(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fprintf(f, "P6\n%d %d\n255\n", im.W, im.H); std::fwrite(im.rgb.data(), 1, im.rgb.size(), f); std::fclose(f); return 0; }
@@ -1147,7 +1187,10 @@ int main(int argc, char** argv) {
                     std::printf("cross-chroma (tiles): off %u  U<-V %u  V<-U %u\n", g_xstat[0].load() / 3, g_xstat[1].load() / 3, g_xstat[2].load() / 3); } }
             if (g_v5) { unsigned long long t = 0; for (auto v : g_c5stat) t += v;
                 if (!g_tc && g_sg == 2) { for (int i = 0; i < 11; ++i) { unsigned long long q = 0; for (int j = 0; j < 5; ++j) q += g_c5stat[i * 5 + j]; g_c5stat[i] = q; } }
-                if (t) { std::printf("contexts (%% of symbols): shared0 %.1f  Y1-5", 100.0 * g_c5stat[0] / t); for (int i = 1; i <= 5; ++i) std::printf(" %.1f", 100.0 * g_c5stat[i] / t);
+                if (t && g_tc == 8) { std::printf("contexts (%% of symbols): Y g0-7"); for (int i = 0; i < 8; ++i) std::printf(" %.1f", 100.0 * g_c5stat[i] / t);
+                    std::printf("  UV g0-7"); for (int i = 8; i < 16; ++i) std::printf(" %.1f", 100.0 * g_c5stat[i] / t);
+                    std::printf("   full steps one class %.1f%%\n", 100.0 * g_f5stat[0] / std::max(1ull, g_f5stat[0] + g_f5stat[1])); }
+                else if (t) { std::printf("contexts (%% of symbols): shared0 %.1f  Y1-5", 100.0 * g_c5stat[0] / t); for (int i = 1; i <= 5; ++i) std::printf(" %.1f", 100.0 * g_c5stat[i] / t);
                     std::printf("  UV1-5"); for (int i = 6; i <= 10; ++i) std::printf(" %.1f", 100.0 * g_c5stat[i] / t);
                     std::printf("   full steps one class %.1f%%\n", 100.0 * g_f5stat[0] / std::max(1ull, g_f5stat[0] + g_f5stat[1])); } }
             return ok ? 0 : 3;
