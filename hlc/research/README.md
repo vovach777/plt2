@@ -35,5 +35,6 @@ out of band (hlc-samples.zip / the encrypted
 | asym_q.py | asymmetric quantisation after mirror (tiny sign flip): different c-b edges on extremum vs ramp side; result: within 0.1% |
 | oct_scale.py | per-octant axis scale by least squares on |e| (8 octants / 4 after mirror); result: worse (+0.9…+2.3%) |
 | oct_scale_ent.py | per-octant radial scale fitted directly on entropy (4 octants after tiny mirror) |
+| givens_rot.py | Givens rotation of (c-a, c-b) by a small angle: worse symmetry and entropy at any angle |
 | third_axis.py | third axis instead of d: neighbour errors, |a-aa|, |b-bb| vs true |d-b| |
 | xresctx.py, xresgrain.py, xresfit.py | cross-chroma on top of contexts; granularity; threshold refit |
