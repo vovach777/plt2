@@ -31,5 +31,6 @@ out of band (hlc-samples.zip / the encrypted
 | symmetry_rank.py | entropy cost of folding q7 sectors by symmetry groups (central mirror, sign of one axis, axis swap) |
 | x_bias_fold.py | bias on the second axis after the mirror, then fold its sign (constant, per-row median, alpha*y) |
 | uv_axes.py | diagonal axes u = 2c-a-b, v = b-a: (|u|,|v|) with sign(u) flip vs q7 sectors / mirror / mirror + swap |
+| axis_scale.py | axis multipliers from the CLIC sector table: c-b x k (q axes), v x k (u,v); result: all within 0.1% |
 | third_axis.py | third axis instead of d: neighbour errors, |a-aa|, |b-bb| vs true |d-b| |
 | xresctx.py, xresgrain.py, xresfit.py | cross-chroma on top of contexts; granularity; threshold refit |
