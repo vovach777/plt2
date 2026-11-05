@@ -60,7 +60,7 @@ template <class T> struct noinit_alloc : std::allocator<T> {                // v
     template <class U> void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }
     template <class U, class... A> void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
 };
-struct Img { int W = 0, H = 0; std::vector<uint8_t, noinit_alloc<uint8_t>> rgb; };
+struct Img { int W = 0, H = 0, C = 3; std::vector<uint8_t, noinit_alloc<uint8_t>> rgb; };   // C = 1: gray (P5), rgb holds W*H*C bytes
 struct Out { std::vector<uint8_t> b; void u8(uint8_t v) { b.push_back(v); } void var(uint64_t v) { while (v >= 128) { b.push_back(uint8_t(v | 128)); v >>= 7; } b.push_back(uint8_t(v)); } void raw(const void* p, size_t n) { b.insert(b.end(), (const uint8_t*)p, (const uint8_t*)p + n); } };
 struct In { const uint8_t* p; const uint8_t* e;
     uint8_t u8() { if (p >= e) throw std::runtime_error("truncated"); return *p++; }
@@ -460,6 +460,26 @@ template <class YT> static void decode_tile_skew(const int16_t* S0, const int16_
         }
     }
 }
+// gray: one plane (Y slot, 8-bit), straight to bytes
+static void decode_tile_skew_gray(const int16_t* S, int w, int h, uint8_t* out, size_t rstride, int pm) {
+    const int L = w + 7, LB = ((L + 7) & ~7) + 8;
+    thread_local std::vector<int16_t> band, top; band.assign(size_t(LB) * 8, 0); top.assign(size_t(w) + 48, 0);
+    for (int b0 = 0; b0 < h; b0 += 8) {
+        const int hb = std::min(8, h - b0);
+        S = wave_band_m<false>(pm, S, w, hb, top.data() + 8, band.data(), b0 == 0);
+        for (int t = 0; t < L; t += 8) {
+            __m128i P[8]; for (int j = 0; j < 8; ++j) P[j] = _mm_load_si128((const __m128i*)(band.data() + size_t(t + j) * 8));
+            tr8x8(P[0], P[1], P[2], P[3], P[4], P[5], P[6], P[7]);
+            for (int k = 0; k < hb; ++k) {
+                int x0 = t - k; uint8_t* row = out + size_t(b0 + k) * rstride; alignas(16) uint8_t tmp[16];
+                const __m128i b8 = _mm_packus_epi16(P[k], P[k]);
+                if (x0 >= 0 && x0 + 8 <= w) _mm_storel_epi64((__m128i*)(row + x0), b8);
+                else { _mm_store_si128((__m128i*)tmp, b8); int xa = std::max(0, x0), xb = std::min(w, x0 + 8); if (xa < xb) std::memcpy(row + xa, tmp + (xa - x0), size_t(xb - xa)); }
+                if (k == hb - 1) _mm_storeu_si128((__m128i*)(top.data() + 8 + x0), P[k]);
+            }
+        }
+    }
+}
 
 // ---- cross-chroma residual prediction (per tile). V = R-G and U = B-G share -G, so their MED residuals correlate:
 // target' = wrap9(e_t - ((k * e_s + 4) >> 3)), k in [-8, 8], dir 1: U from V, dir 2: V from U. Works on the zigzag
@@ -519,7 +539,7 @@ static void xres_apply(uint8_t xr, int16_t* zV, int16_t* zU, size_t n, bool dec)
 
 static bool g_raw = false, g_skew = true;                          // -n: no entropy coding, -s: skewed 8-row bands
 // file: "HLC3" var W var H u8 flags var TW var TH, then per tile (raster order): var size, payload = [u8 predictors: 2 bits per plane
-// V,U,Y if flags bit 2] 3 x stream
+// V,U,Y if flags bit 2] [u8 cross-chroma if bit 3] 3 x stream (gray, bit 4: 1 stream = the Y slot)
 std::vector<uint8_t> compress(const Img& im, int threads) {
     const int W = im.W, H = im.H, TW = g_tw, TH = g_th, tx = (W + TW - 1) / TW, ty = (H + TH - 1) / TH, nt = tx * ty;
     std::vector<std::vector<uint8_t>> tiles(nt);
@@ -527,11 +547,13 @@ std::vector<uint8_t> compress(const Img& im, int threads) {
         int x0 = (t % tx) * TW, y0 = (t / tx) * TH, w = std::min(TW, W - x0), h = std::min(TH, H - y0); size_t n = size_t(w) * h;
         thread_local std::vector<int16_t> P[3], SK; thread_local std::vector<uint8_t> tmp;
         for (auto& p : P) p.resize(n); const size_t ns = g_skew ? skew_len(w, h) : n; SK.resize(ns);
-        for (int y = 0; y < h; ++y) rct_row(im.rgb.data() + (size_t(y0 + y) * W + x0) * 3, w, P[0].data() + size_t(y) * w, P[1].data() + size_t(y) * w, P[2].data() + size_t(y) * w);
+        const bool gray = im.C == 1; const int c0 = gray ? 2 : 0;         // gray: the one plane goes as Y (8-bit wrap)
+        if (gray) for (int y = 0; y < h; ++y) { const uint8_t* q = im.rgb.data() + size_t(y0 + y) * W + x0; int16_t* d = P[2].data() + size_t(y) * w; for (int x = 0; x < w; ++x) d[x] = q[x]; }
+        else for (int y = 0; y < h; ++y) rct_row(im.rgb.data() + (size_t(y0 + y) * W + x0) * 3, w, P[0].data() + size_t(y) * w, P[1].data() + size_t(y) * w, P[2].data() + size_t(y) * w);
         Out o;
         thread_local std::vector<int16_t> SKp[3];
-        const uint16_t* src[3]; uint8_t pm = 0;
-        for (int c = 0; c < 3; ++c) {
+        const uint16_t* src[3] = {}; uint8_t pm = 0;
+        for (int c = c0; c < 3; ++c) {
             if (g_skew) {                                                // predictor per plane (entropy probe), residuals straight to skew order
                 const int m = c < 2 ? choose_pred<true>(P[c].data(), w, h) : choose_pred<false>(P[c].data(), w, h);
                 pm |= uint8_t(m << (2 * c)); g_pstat[c][m]++;
@@ -544,12 +566,12 @@ std::vector<uint8_t> compress(const Img& im, int threads) {
             src[c] = (const uint16_t*)P[c].data();
         }
         uint8_t xr = 0;
-        if (g_skew) { xr = choose_xres(SKp[0].data(), SKp[1].data(), ns); g_xstat[xr & 3]++; if (xr) xres_apply(xr, SKp[0].data(), SKp[1].data(), ns, false); o.u8(pm); o.u8(xr); }
-        if (g_raw) { for (int c = 0; c < 3; ++c) o.raw(src[c], ns * 2); }
-        else if (!(g_joint && g_skew && joint_put(o, src, ns, g_K, tmp))) for (int c = 0; c < 3; ++c) put_stream(o, src[c], ns, tmp, c == 2 ? 256 : 512);
+        if (g_skew) { if (!gray) { xr = choose_xres(SKp[0].data(), SKp[1].data(), ns); g_xstat[xr & 3]++; if (xr) xres_apply(xr, SKp[0].data(), SKp[1].data(), ns, false); } o.u8(pm); o.u8(xr); }
+        if (g_raw) { for (int c = c0; c < 3; ++c) o.raw(src[c], ns * 2); }
+        else if (!(!gray && g_joint && g_skew && joint_put(o, src, ns, g_K, tmp))) for (int c = c0; c < 3; ++c) put_stream(o, src[c], ns, tmp, c == 2 ? 256 : 512);
         tiles[t] = std::move(o.b);
     });
-    Out f; f.raw("HLC3", 4); f.var(W); f.var(H); f.u8(uint8_t(g_raw | g_skew << 1 | (g_skew ? 4 | 8 : 0))); f.var(TW); f.var(TH);   // bit 2: per-tile predictor byte, bit 3: cross-chroma byte
+    Out f; f.raw("HLC3", 4); f.var(W); f.var(H); f.u8(uint8_t(g_raw | g_skew << 1 | (g_skew ? 4 | 8 : 0) | (im.C == 1 ? 16 : 0))); f.var(TW); f.var(TH);   // bit 2: per-tile predictor byte, bit 3: cross-chroma byte, bit 4: gray (one stream, Y)
     for (int t = 0; t < nt; ++t) { f.var(tiles[t].size()); f.raw(tiles[t].data(), tiles[t].size()); }
     return std::move(f.b);
 }
@@ -758,6 +780,7 @@ template <class F> static void decode_lane(int w, int h, uint8_t* rgb, size_t rs
     }
 }
 std::vector<uint8_t> compress4(const Img& im, int threads) {
+    if (im.C != 3) throw std::runtime_error("HLC4: RGB only (gray: HLC3 -L or HLC5 -5)");
     const int W = im.W, H = im.H, B = g_B, R = g_R, nl = (H + R - 1) / R, nb = lane_nb(W, B);
     std::vector<std::vector<uint8_t>> lanes(nl);
     parallel_for(nl, threads, [&](int l) {
@@ -833,7 +856,7 @@ Img decompress4(In in, int threads) {
 // Symbol order inside a stream = decoder order: band, wave step t, plane V U Y, lane 0..7.
 // Borders: x = 0 -> a = c = b; y = 0 -> b = c = 0 (as the wave's zero top row).
 // Each stream is cut into FSE chunks of -cb symbols (own table each; 0 = one table per stream).
-// file: "HLC5" var W var H u8 flags (bit 0 raw, bit 5 xres, bit 6 = 1: q7 contexts) var CB, [xres bytes],
+// file: "HLC5" var W var H u8 flags (bit 0 raw, bit 5 xres, bit 6 = 1: q7 contexts, bit 7 gray: Y streams only) var CB, [xres bytes],
 // 16 x var n_i, then the chunks of stream 0, 1, ...  (files of the removed act / tiny modes have bit 6 clear)
 static int g_v5 = 0, g_cb = 0, g_g5 = 1;                             // -5, -cb, -g5 0: serial gather, 2: no gather (bench)
 static const int E8[2][3] = {{1, 3, 10}, {1, 3, 7}};
@@ -919,12 +942,15 @@ template <class T> struct UBuf {                                      // uniniti
 std::vector<uint8_t> compress5(const Img& im) {
     const int W = im.W, H = im.H; const size_t n = size_t(W) * H;
     UBuf<int16_t> P[3], Z[3]; UBuf<uint8_t> K[3]; const int NS = NS5;
-    for (int c = 0; c < 3; ++c) { P[c].resize(n); Z[c].resize(n + 8); K[c].resize(n); }
-    for (int y = 0; y < H; ++y) rct_row(im.rgb.data() + size_t(y) * W * 3, W, P[0].data() + size_t(y) * W, P[1].data() + size_t(y) * W, P[2].data() + size_t(y) * W);
-    for (int c = 0; c < 3; ++c) for (int y = 0; y < H; ++y) {
+    const bool gray = im.C == 1; const int c0 = gray ? 2 : 0;            // gray: the one plane goes as Y (8-bit), U/V streams stay empty
+    for (int c = c0; c < 3; ++c) { P[c].resize(n); Z[c].resize(n + 8); K[c].resize(n); }
+    if (gray) for (size_t i = 0; i < n; ++i) P[2][i] = im.rgb[i];
+    else for (int y = 0; y < H; ++y) rct_row(im.rgb.data() + size_t(y) * W * 3, W, P[0].data() + size_t(y) * W, P[1].data() + size_t(y) * W, P[2].data() + size_t(y) * W);
+    for (int c = c0; c < 3; ++c) for (int y = 0; y < H; ++y) {
         if (c < 2) residual_row<true, 0>(P[c].data(), W, y, Z[c].data() + size_t(y) * W); else residual_row<false, 0>(P[c].data(), W, y, Z[c].data() + size_t(y) * W); }
     std::vector<uint8_t> XK;
-    if (g_x5) {                                                          // cross-chroma per strip, on the unflipped residuals
+    const bool x5 = g_x5 && !gray;
+    if (x5) {                                                            // cross-chroma per strip, on the unflipped residuals
         thread_local unsigned hc[512];
         for (int y0 = 0; y0 < H; y0 += XS5) { const size_t i0 = size_t(y0) * W, i1 = size_t(std::min(H, y0 + XS5)) * W;
             int bk = 0;
@@ -944,7 +970,7 @@ std::vector<uint8_t> compress5(const Img& im) {
             if (bk) for (size_t i = i0; i < i1; ++i) { int eu = unzz(uint16_t(Z[1][i])), ev = unzz(uint16_t(Z[0][i])); Z[1][i] = int16_t(zz(wrape<true>(eu - ((bk * ev + 4) >> 3)))); }
             XK.push_back(uint8_t(bk + 8)); }
     }
-    for (int c = 0; c < 3; ++c) for (int y = 0; y < H; ++y) {
+    for (int c = c0; c < 3; ++c) for (int y = 0; y < H; ++y) {
         const int16_t* r = P[c].data() + size_t(y) * W; const int16_t* u = y ? r - W : nullptr;
         int16_t* z = Z[c].data() + size_t(y) * W; uint8_t* kr = K[c].data() + size_t(y) * W;
         if (c < 2) (g_e5 ? ctx_row_simd<true> : ctx_row_scalar<true>)(r, u, W, z, kr);
@@ -952,14 +978,14 @@ std::vector<uint8_t> compress5(const Img& im) {
     }
     // streams in decoder order: sizes first (order-free count), then one pass writing through pointers
     UBuf<uint16_t> S[NS5]; size_t st[NS5] = {}; unsigned long long fu = 0, fm = 0;
-    for (int c = 0; c < 3; ++c) { size_t h[4][NS5] = {}; const uint8_t* kp = K[c].data(); size_t i = 0;
+    for (int c = c0; c < 3; ++c) { size_t h[4][NS5] = {}; const uint8_t* kp = K[c].data(); size_t i = 0;
         for (; i + 4 <= n; i += 4) { h[0][kp[i]]++; h[1][kp[i + 1]]++; h[2][kp[i + 2]]++; h[3][kp[i + 3]]++; }
         for (; i < n; ++i) h[0][kp[i]]++;
         for (int j = 0; j < NS5; ++j) st[j] += h[0][j] + h[1][j] + h[2][j] + h[3][j]; }
     uint16_t* wp[NS5]; for (int i = 0; i < NS5; ++i) { S[i].resize(st[i]); wp[i] = S[i].data(); }
     for (int b0 = 0; b0 < H; b0 += 8) { const int hb = std::min(8, H - b0), L = W + 7;
         for (int t = 0; t < L; ++t) { const int klo = std::max(0, t - W + 1), khi = std::min(hb - 1, t);
-            for (int c = 0; c < 3; ++c) {
+            for (int c = c0; c < 3; ++c) {
                 const uint8_t* kc = K[c].data(); const int16_t* zc = Z[c].data();
                 if (g_st5 && hb == 8 && t >= 9 && t < W) { bool same = true; for (int k = 1; k < 8; ++k) same &= kc[size_t(b0 + k) * W + (t - k)] == kc[size_t(b0) * W + t]; (same ? fu : fm)++; }
                 size_t i = size_t(b0 + klo) * W + (t - klo);
@@ -968,8 +994,8 @@ std::vector<uint8_t> compress5(const Img& im) {
         }
     }
     for (int i = 0; i < NS5; ++i) g_c5stat[i] += st[i]; g_f5stat[0] += fu; g_f5stat[1] += fm;
-    Out f; f.raw("HLC5", 4); f.var(W); f.var(H); f.u8(uint8_t(g_raw | 64 | (g_x5 ? 32 : 0))); f.var(size_t(g_cb));
-    if (g_x5) f.raw(XK.data(), XK.size());
+    Out f; f.raw("HLC5", 4); f.var(W); f.var(H); f.u8(uint8_t(g_raw | 64 | (x5 ? 32 : 0) | (gray ? 128 : 0))); f.var(size_t(g_cb));
+    if (x5) f.raw(XK.data(), XK.size());
     for (int i = 0; i < NS; ++i) f.var(S[i].size());
     std::vector<uint8_t> tmp;
     for (int i = 0; i < NS; ++i) { const size_t m = S[i].size(), cb = g_cb > 0 ? size_t(g_cb) : std::max<size_t>(m, 1); 
@@ -1019,23 +1045,25 @@ template <bool N9, bool FULL, int XR = 0> static inline void step5(int t, int kl
     _mm_store_si128((__m128i*)out, V);
 }
 static void wave5(int W, int H, const int16_t* sb, uint32_t* pos, uint8_t* rgb, const std::vector<int8_t>& xk);
+static void wave5_gray(int W, int H, const int16_t* sb, uint32_t* pos, uint8_t* out);
 Img decompress5(In in) {
-    Img im; im.W = int(in.var()); im.H = int(in.var()); const uint8_t fl = in.u8(); const bool raw = fl & 1; if (!(fl & 64) || (fl & 0x9e)) throw std::runtime_error("HLC5: old context mode (act / tiny) is no longer supported"); const size_t cb0 = size_t(in.var()); const int W = im.W, H = im.H, NS = NS5;
+    Img im; im.W = int(in.var()); im.H = int(in.var()); const uint8_t fl = in.u8(); const bool raw = fl & 1; if (!(fl & 64) || (fl & 0x1e)) throw std::runtime_error("HLC5: old context mode (act / tiny) is no longer supported"); const size_t cb0 = size_t(in.var()); const int W = im.W, H = im.H, NS = NS5;
+    const bool gray = fl & 128; im.C = gray ? 1 : 3; if (gray && (fl & 32)) throw std::runtime_error("HLC5: gray + xres");
     std::vector<int8_t> xk; if (fl & 32) { const uint8_t* q = in.take(size_t((H + XS5 - 1) / XS5)); for (int i = 0; i < (H + XS5 - 1) / XS5; ++i) { if (q[i] > 16) throw std::runtime_error("xres k"); xk.push_back(int8_t(q[i] - 8)); } }
     if (W < 1 || H < 1 || W > 65536 || H > 65536) throw std::runtime_error("header");
     size_t ns[NS5], off[NS5 + 1], tot = 0; off[0] = 8;
     for (int i = 0; i < NS5; ++i) { ns[i] = i < NS ? size_t(in.var()) : 0; tot += ns[i]; off[i + 1] = off[i] + ((ns[i] + 15) & ~size_t(7)); }
-    if (tot != size_t(W) * H * 3) throw std::runtime_error("stream sizes");
+    if (tot != size_t(W) * H * im.C) throw std::runtime_error("stream sizes");
     thread_local std::vector<int16_t> SB; SB.resize(off[NS5] + 32);
     thread_local RStream rs;
     for (int i = 0; i < NS5; ++i) { const size_t cb = cb0 ? cb0 : std::max<size_t>(ns[i], 1);
         for (size_t o = 0; o < ns[i]; o += cb) { const size_t k = std::min(cb, ns[i] - o); int16_t* d = SB.data() + off[i] + o;
             if (raw) std::memcpy(d, in.take(k * 2), k * 2); else { rs.open(in, k); rs.get_all(d, k); } } }
-    im.rgb.resize(size_t(W) * H * 3 + 64);
+    im.rgb.resize(size_t(W) * H * im.C + 64);
     uint32_t pos[NS5]; for (int i = 0; i < NS5; ++i) pos[i] = uint32_t(off[i]);
-    wave5(W, H, SB.data(), pos, im.rgb.data(), xk);
+    if (gray) wave5_gray(W, H, SB.data(), pos, im.rgb.data()); else wave5(W, H, SB.data(), pos, im.rgb.data(), xk);
     if (g_g5 != 2) for (int i = 0; i < NS5; ++i) if (pos[i] != off[i] + ns[i]) throw std::runtime_error("context streams out of sync");
-    im.rgb.resize(size_t(W) * H * 3);
+    im.rgb.resize(size_t(W) * H * im.C);
     return im;
 }
 template <bool XON> static void steps5(int W, int hb, const int16_t* const* tp, int16_t* const* op, const int16_t* sb, uint32_t* pos, short kx) {
@@ -1079,13 +1107,38 @@ static void wave5(int W, int H, const int16_t* sb, uint32_t* pos, uint8_t* rgb, 
         }
     }
 }
+// gray: only the Y plane steps (8-bit), straight to bytes
+static void wave5_gray(int W, int H, const int16_t* sb, uint32_t* pos, uint8_t* out) {
+    const int L = W + 7, LB = ((L + 7) & ~7) + 8;
+    thread_local std::vector<int16_t> band, top; band.assign(size_t(LB) * 8, 0); top.assign(size_t(W) + 48, 0);
+    for (int b0 = 0; b0 < H; b0 += 8) {
+        const int hb = std::min(8, H - b0); const int16_t* tp = top.data() + 8; int16_t* op = band.data();
+        __m128i V = _mm_setzero_si128(), Bp = V;
+        auto edge = [&](int t) { const int klo = std::max(0, t - W + 1), khi = std::min(hb - 1, t); step5<false, false>(t, klo, khi, V, Bp, tp[t], sb, pos, op + size_t(t) * 8); };
+        if (hb < 8 || W < 10) { for (int t = 0; t < L; ++t) edge(t); }
+        else { for (int t = 0; t < 9; ++t) edge(t);
+               for (int t = 9; t < W; ++t) step5<false, true>(t, 0, 7, V, Bp, tp[t], sb, pos, op + size_t(t) * 8);
+               for (int t = W; t < L; ++t) edge(t); }
+        for (int t = 0; t < L; t += 8) {
+            __m128i P[8]; for (int j = 0; j < 8; ++j) P[j] = _mm_load_si128((const __m128i*)(band.data() + size_t(t + j) * 8));
+            tr8x8(P[0], P[1], P[2], P[3], P[4], P[5], P[6], P[7]);
+            for (int k = 0; k < hb; ++k) {
+                int x0 = t - k; uint8_t* row = out + size_t(b0 + k) * W; alignas(16) uint8_t tmp[16];
+                const __m128i b8 = _mm_packus_epi16(P[k], P[k]);
+                if (x0 >= 0 && x0 + 8 <= W) _mm_storel_epi64((__m128i*)(row + x0), b8);
+                else { _mm_store_si128((__m128i*)tmp, b8); int xa = std::max(0, x0), xb = std::min(W, x0 + 8); if (xa < xb) std::memcpy(row + xa, tmp + (xa - x0), size_t(xb - xa)); }
+                if (k == hb - 1) _mm_storeu_si128((__m128i*)(top.data() + 8 + x0), P[k]);
+            }
+        }
+    }
+}
 
 Img decompress(const std::vector<uint8_t>& data, int threads) {
     In in{data.data(), data.data() + data.size()};
     { const uint8_t* m = in.take(4); if (!std::memcmp(m, "HLC5", 4)) return decompress5(in); if (!std::memcmp(m, "HLC4", 4)) return decompress4(in, threads); if (std::memcmp(m, "HLC3", 4)) throw std::runtime_error("not HLC3/HLC4/HLC5"); }
-    Img im; im.W = int(in.var()); im.H = int(in.var()); const uint8_t fl = in.u8(); const bool raw = fl & 1, skew = fl >> 1 & 1, haspm = fl >> 2 & 1, hasxr = fl >> 3 & 1; const int W = im.W, H = im.H, TW = int(in.var()), TH = int(in.var());
+    Img im; im.W = int(in.var()); im.H = int(in.var()); const uint8_t fl = in.u8(); const bool raw = fl & 1, skew = fl >> 1 & 1, haspm = fl >> 2 & 1, hasxr = fl >> 3 & 1, gray = fl >> 4 & 1; const int W = im.W, H = im.H, TW = int(in.var()), TH = int(in.var()); im.C = gray ? 1 : 3; const int C = im.C, c0 = gray ? 2 : 0;
     if (TW < 1 || TH < 1 || TW > 65536 || TH > 65536) throw std::runtime_error("tile size"); const int tx = (W + TW - 1) / TW, ty = (H + TH - 1) / TH, nt = tx * ty;
-    im.rgb.resize(size_t(W) * H * 3 + 64);
+    im.rgb.resize(size_t(W) * H * C + 64);
     std::vector<const uint8_t*> tp(nt); std::vector<size_t> tn(nt);
     for (int t = 0; t < nt; ++t) { tn[t] = in.var(); tp[t] = in.take(tn[t]); }
     parallel_for(nt, threads, [&](int t) {
@@ -1102,6 +1155,8 @@ Img decompress(const std::vector<uint8_t>& data, int threads) {
             int16_t* Pd[3];
             for (int c = 0; c < 3; ++c) { P[c].resize(ns + 32 + 64); int16_t* a = (int16_t*)((uintptr_t(P[c].data()) + 63) & ~uintptr_t(63));
                 Pd[c] = a + (g_al ? 12 : 8); std::memset(Pd[c] - 8, 0, 16); }
+            if (gray) { if (raw) std::memcpy(Pd[2], ti.take(ns * 2), ns * 2); else { rs[2].open(ti, ns); rs[2].get_all(Pd[2], ns); }
+                decode_tile_skew_gray(Pd[2], w, h, im.rgb.data() + size_t(y0) * W + x0, size_t(W), pmb[2]); return; }
             if (!raw && ti.p < ti.e && *ti.p == 7) { int16_t* op[3] = {Pd[0], Pd[1], Pd[2]}; joint_get(ti, op, ns); }
             else {
             for (int c = 0; c < 3; ++c) { if (raw) std::memcpy(Pd[c], ti.take(ns * 2), ns * 2); else rs[c].open(ti, ns); }
@@ -1114,14 +1169,15 @@ Img decompress(const std::vector<uint8_t>& data, int threads) {
             decode_tile_skew(Pd[0], Pd[1], (const int16_t*)Pd[2], w, h, im.rgb.data() + (size_t(y0) * W + x0) * 3, size_t(W) * 3, pmb);
             return;
         }
-        for (int c = 0; c < 3; ++c) {
+        for (int c = c0; c < 3; ++c) {
             P[c].resize(n + 16);
             if (raw) std::memcpy(P[c].data(), ti.take(n * 2), n * 2); else get_stream(ti, P[c].data(), n);
             if (c < 2) restore<true>(P[c].data(), w, h); else restore<false>(P[c].data(), w, h);
         }
+        if (gray) { for (int y = 0; y < h; ++y) { const int16_t* q = P[2].data() + size_t(y) * w; uint8_t* d = im.rgb.data() + size_t(y0 + y) * W + x0; for (int x = 0; x < w; ++x) d[x] = uint8_t(q[x]); } return; }
         for (int y = 0; y < h; ++y) irct_row(P[0].data() + size_t(y) * w, P[1].data() + size_t(y) * w, P[2].data() + size_t(y) * w, w, im.rgb.data() + (size_t(y0 + y) * W + x0) * 3);
     });
-    im.rgb.resize(size_t(W) * H * 3);
+    im.rgb.resize(size_t(W) * H * C);
     return im;
 }
 }  // namespace hlc
@@ -1129,9 +1185,9 @@ Img decompress(const std::vector<uint8_t>& data, int threads) {
 static hlc::Img read_ppm(const char* fn) {
     FILE* f = std::fopen(fn, "rb"); if (!f) throw std::runtime_error("open");
     auto tok = [&]() { int c; std::string s; while ((c = std::fgetc(f)) != EOF) { if (c == '#') { while ((c = std::fgetc(f)) != '\n' && c != EOF) {} continue; } if (isspace(c)) { if (!s.empty()) break; } else s += char(c); } return s; };
-    if (tok() != "P6") throw std::runtime_error("P6 only");
-    hlc::Img im; im.W = std::stoi(tok()); im.H = std::stoi(tok()); if (std::stoi(tok()) != 255) throw std::runtime_error("maxval 255 only");
-    im.rgb.resize(size_t(im.W) * im.H * 3); if (std::fread(im.rgb.data(), 1, im.rgb.size(), f) != im.rgb.size()) throw std::runtime_error("short");
+    const std::string mg = tok(); if (mg != "P6" && mg != "P5") throw std::runtime_error("P6 / P5 only");
+    hlc::Img im; im.C = mg == "P5" ? 1 : 3; im.W = std::stoi(tok()); im.H = std::stoi(tok()); if (std::stoi(tok()) != 255) throw std::runtime_error("maxval 255 only");
+    im.rgb.resize(size_t(im.W) * im.H * im.C); if (std::fread(im.rgb.data(), 1, im.rgb.size(), f) != im.rgb.size()) throw std::runtime_error("short");
     std::fclose(f); return im;
 }
 static std::vector<uint8_t> slurp(const char* fn) { FILE* f = std::fopen(fn, "rb"); if (!f) throw std::runtime_error("open"); std::vector<uint8_t> v; uint8_t b[1 << 16]; size_t k; while ((k = std::fread(b, 1, sizeof b, f))) v.insert(v.end(), b, b + k); std::fclose(f); return v; }
@@ -1144,8 +1200,8 @@ int main(int argc, char** argv) {
     for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-r") g_skew = false; else if (a == "-tw" && i + 1 < argc) g_tw = std::max(8, std::atoi(argv[++i])); else if (a == "-th" && i + 1 < argc) g_th = std::max(8, std::atoi(argv[++i])); else if (a == "-B" && i + 1 < argc) g_B = std::max(8, std::atoi(argv[++i])); else if (a == "-R" && i + 1 < argc) g_R = std::max(8, std::atoi(argv[++i]) & ~7); else if (a == "-dord" && i + 1 < argc) g_dord = std::atoi(argv[++i]); else if (a == "-L") g_legacy = 1; else if (a == "-4") g_legacy = 0; else if (a == "-5") g_v5 = 1; else if (a == "-X5" && i + 1 < argc) g_x5 = std::atoi(argv[++i]); else if (a == "-g5" && i + 1 < argc) g_g5 = std::atoi(argv[++i]); else if (a == "-e5" && i + 1 < argc) g_e5 = std::atoi(argv[++i]); else if (a == "-cb" && i + 1 < argc) g_cb = std::max(0, std::atoi(argv[++i])); else if (a == "-X" && i + 1 < argc) g_xres = std::atoi(argv[++i]); else if (a == "-Xc" && i + 1 < argc) g_xclip = std::atoi(argv[++i]); else if (a == "-Xf" && i + 1 < argc) g_xfull = std::atoi(argv[++i]); else if (a == "-Xs" && i + 1 < argc) g_xstep = std::max(1, std::atoi(argv[++i])); else if (a == "-P" && i + 1 < argc) { g_pmask = std::atoi(argv[++i]) & 15; if (!g_pmask) g_pmask = 1; } else if (a == "-Px" && i + 1 < argc) g_pxstep = std::max(1, std::atoi(argv[++i])); else if (a == "-Ps" && i + 1 < argc) g_pstep = std::max(1, std::atoi(argv[++i])); else if (a == "-al" && i + 1 < argc) g_al = std::atoi(argv[++i]); else if (a == "-S" && i + 1 < argc) { g_S = std::atoi(argv[++i]); if (g_S != 1 && g_S != 2 && g_S != 8) g_S = 4; } else if (a == "-max" && i + 1 < argc) g_max = std::atoi(argv[++i]); else if (a == "-J" && i + 1 < argc) g_joint = std::atoi(argv[++i]); else if (a == "-K" && i + 1 < argc) g_K = std::max(1, std::min(4, std::atoi(argv[++i]))); else if (a == "-d3" && i + 1 < argc) g_dec3 = std::atoi(argv[++i]); else if (a == "-Ta" && i + 1 < argc) g_tadapt = std::atoi(argv[++i]); else if (a == "-ws" && i + 1 < argc) g_wsplit = std::atoi(argv[++i]); else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
     try {
         if (mode == "c" && pos.size() == 2) { auto o = g_v5 ? compress5(read_ppm(pos[0])) : g_legacy ? compress(read_ppm(pos[0]), threads) : compress4(read_ppm(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
-        if (mode == "d" && pos.size() == 2) { Img im = decompress(slurp(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fprintf(f, "P6\n%d %d\n255\n", im.W, im.H); std::fwrite(im.rgb.data(), 1, im.rgb.size(), f); std::fclose(f); return 0; }
-        if (mode == "est") { size_t px = 0, by = 0; for (auto fn : pos) { Img im = read_ppm(fn); px += size_t(im.W) * im.H; by += estimate_sb(im, g_tw, g_th); } std::printf("EST B=%d R=%d  %.4f bpp  %zu B\n", g_tw, g_th, 8.0 * by / px, by); return 0; }
+        if (mode == "d" && pos.size() == 2) { Img im = decompress(slurp(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fprintf(f, "%s\n%d %d\n255\n", im.C == 1 ? "P5" : "P6", im.W, im.H); std::fwrite(im.rgb.data(), 1, im.rgb.size(), f); std::fclose(f); return 0; }
+        if (mode == "est") { size_t px = 0, by = 0; for (auto fn : pos) { Img im = read_ppm(fn); if (im.C != 3) throw std::runtime_error("est: RGB only"); px += size_t(im.W) * im.H; by += estimate_sb(im, g_tw, g_th); } std::printf("EST B=%d R=%d  %.4f bpp  %zu B\n", g_tw, g_th, 8.0 * by / px, by); return 0; }
         if (mode == "bench") { g_st5 = true;
             {   // directories expand to their .ppm/.pnm files (sorted); -max N keeps the first N
                 std::vector<std::string> ex;
@@ -1157,17 +1213,17 @@ int main(int argc, char** argv) {
                 if (g_max > 0 && ex.size() > size_t(g_max)) ex.resize(size_t(g_max));
                 g_files = std::move(ex); pos.clear(); for (auto& f : g_files) pos.push_back(f.c_str());
             }
-            double te = 0, td = 0; size_t px = 0, by = 0; bool ok = true;
+            double te = 0, td = 0; size_t px = 0, by = 0, mb = 0; bool ok = true;
             for (auto fn : pos) {
                 Img im = read_ppm(fn); double be = 1e9, bd = 1e9; std::vector<uint8_t> o; Img r;
                 for (int k = 0; k < 3; ++k) {
                     auto t0 = std::chrono::steady_clock::now(); o = g_v5 ? compress5(im) : g_legacy ? compress(im, threads) : compress4(im, threads); auto t1 = std::chrono::steady_clock::now(); r = decompress(o, threads); auto t2 = std::chrono::steady_clock::now();
                     be = std::min(be, std::chrono::duration<double>(t1 - t0).count()); bd = std::min(bd, std::chrono::duration<double>(t2 - t1).count());
                 }
-                bool g = r.rgb == im.rgb; ok &= g; size_t n = size_t(im.W) * im.H; px += n; by += o.size(); te += be; td += bd;
-                std::printf("%-28s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s %s\n", fn, im.W, im.H, o.size(), 8.0 * o.size() / n, 3e-6 * n / be, 3e-6 * n / bd, g ? "ok" : "FAIL");
+                bool g = r.rgb == im.rgb && r.C == im.C; ok &= g; size_t n = size_t(im.W) * im.H; px += n; mb += n * im.C; by += o.size(); te += be; td += bd;
+                std::printf("%-28s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s %s%s\n", fn, im.W, im.H, o.size(), 8.0 * o.size() / n, 1e-6 * n * im.C / be, 1e-6 * n * im.C / bd, g ? "ok" : "FAIL", im.C == 1 ? " gray" : "");
             }
-            std::printf("TOTAL %zu files  %.4f bpp  enc %.1f  dec %.1f MB/s (RGB)  t=%d  %s  %s\n", pos.size(), 8.0 * by / px, 3e-6 * px / te, 3e-6 * px / td, threads, g_v5 ? (g_raw ? "HLC5 raw" : "HLC5 fse") : g_raw ? (g_skew ? "raw skew" : "raw") : (g_skew ? "fse skew" : "fse"), ok ? "all ok" : "FAIL");
+            std::printf("TOTAL %zu files  %.4f bpp  enc %.1f  dec %.1f MB/s (image bytes)  t=%d  %s  %s\n", pos.size(), 8.0 * by / px, 1e-6 * mb / te, 1e-6 * mb / td, threads, g_v5 ? (g_raw ? "HLC5 raw" : "HLC5 fse") : g_raw ? (g_skew ? "raw skew" : "raw") : (g_skew ? "fse skew" : "fse"), ok ? "all ok" : "FAIL");
             {   unsigned tot = 0; for (auto& r : g_pstat) for (auto& v : r) tot += v.load();
                 if (tot) { static const char* nm[3] = {"V", "U", "Y"};             // counts are summed over the 3 bench rounds
                     std::printf("predictors (tiles per plane: MED / (2(a+b)-c)/3 / (a+b+1)/2 / none):");
