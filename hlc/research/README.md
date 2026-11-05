@@ -22,4 +22,5 @@ Test images (16 photos + cat, JPEG 4:2:0 downscaled 2x, PPM) are not in git (pri
 | tri.py, triq.py | triangle sectors + ridge c=b x radius; radius quantisation |
 | qcmp.py, q7cells.py, tinycmp.py | llcomp q3/q5/q7/q11 two-axis contexts, q7 cell table |
 | predctx.py | direction x 2-bit disagreement MED vs HALIC predictors (/3, avg, none) and planar |
+| third_axis.py | third axis instead of d: neighbour errors, |a-aa|, |b-bb| vs true |d-b| |
 | xresctx.py, xresgrain.py, xresfit.py | cross-chroma on top of contexts; granularity; threshold refit |
