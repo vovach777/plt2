@@ -23,5 +23,7 @@ Test images (16 photos + cat, JPEG 4:2:0 downscaled 2x, PPM) are not in git (pri
 | qcmp.py, q7cells.py, tinycmp.py | llcomp q3/q5/q7/q11 two-axis contexts, q7 cell table |
 | predctx.py | direction x 2-bit disagreement MED vs HALIC predictors (/3, avg, none) and planar |
 | sign_cmp.py | HLC5 sign rule vs llcomp_rc / llcomp Standard mirror signs, plus sign of neighbour errors |
+| sign_err.py | sign rule when the neighbour error is a context axis (geometric wins with mirrored q cells) |
+| q7q7e.py | q7 x q7 (mirrored) x lg2(|e_a|+|e_b|), caps |
 | third_axis.py | third axis instead of d: neighbour errors, |a-aa|, |b-bb| vs true |d-b| |
 | xresctx.py, xresgrain.py, xresfit.py | cross-chroma on top of contexts; granularity; threshold refit |
