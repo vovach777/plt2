@@ -25,5 +25,6 @@ Test images (16 photos + cat, JPEG 4:2:0 downscaled 2x, PPM) are not in git (pri
 | sign_cmp.py | HLC5 sign rule vs llcomp_rc / llcomp Standard mirror signs, plus sign of neighbour errors |
 | sign_err.py | sign rule when the neighbour error is a context axis (geometric wins with mirrored q cells) |
 | q7q7e.py | q7 x q7 (mirrored) x lg2(|e_a|+|e_b|), caps |
+| q7share_plot.py | per-photo q7 x q7 cell shares and mean |E1|+|E2|, small-multiple heatmaps + CSV |
 | third_axis.py | third axis instead of d: neighbour errors, |a-aa|, |b-bb| vs true |d-b| |
 | xresctx.py, xresgrain.py, xresfit.py | cross-chroma on top of contexts; granularity; threshold refit |
