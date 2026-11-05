@@ -5,7 +5,8 @@ FSE headers ignored). Most take image paths/globs on the command line; the older
 `cat_h.ppm` from the current directory and `exec` helpers from this folder (`ctxest.py`, `axesfit.py`, `act2.py`,
 `xresctx.py`, `buckets.py`), so run them from a directory that holds those images and these scripts.
 
-Test images (16 photos + cat, JPEG 4:2:0 downscaled 2x, PPM) are not in git (private photos): encrypted archive
+Test images (16 photos + cat, JPEG 4:2:0 downscaled 2x, PPM) are not in git (private photos); they were handed over
+out of band (hlc-samples.zip / the encrypted
 `hlc-samples.tar.xz.enc`, unpack with `./decrypt.sh <password>` (`decrypt.cmd` on Windows); files are
 `hlc-samples/p01..p16.ppm`, `cat.ppm` (rename / symlink to `photos16h/` and `cat_h.ppm` for the older scripts).
 
@@ -26,5 +27,6 @@ Test images (16 photos + cat, JPEG 4:2:0 downscaled 2x, PPM) are not in git (pri
 | sign_err.py | sign rule when the neighbour error is a context axis (geometric wins with mirrored q cells) |
 | q7q7e.py | q7 x q7 (mirrored) x lg2(|e_a|+|e_b|), caps |
 | q7share_plot.py | per-photo q7 x q7 cell shares and mean |E1|+|E2|, small-multiple heatmaps + CSV |
+| q7full.py | full unmirrored q7 x q7 grid: shares, mean signed residual, cost of folding mirror pairs |
 | third_axis.py | third axis instead of d: neighbour errors, |a-aa|, |b-bb| vs true |d-b| |
 | xresctx.py, xresgrain.py, xresfit.py | cross-chroma on top of contexts; granularity; threshold refit |
