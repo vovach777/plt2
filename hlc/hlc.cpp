@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -858,10 +859,66 @@ template <bool N9> static inline int q8(int x) { const int a = std::min(std::abs
 static int g_x5 = 0; constexpr int XS5 = 32;
 constexpr int NS5 = 16;
 static unsigned long long g_c5stat[NS5], g_f5stat[2];                // bench: symbols per stream; full steps uniform / mixed class
+static int g_e5 = 1;                                                  // -e5 0: scalar encoder context (reference), 1: SIMD
+static bool g_st5 = false;                                            // bench only: count full steps with one class
+// 8 lanes: gca = c-a, gcb = c-b -> k = stream id (group), sgn = tiny sign (+-1)
+template <bool N9> static inline void ctx8v(__m128i gca, __m128i gcb, __m128i& k, __m128i& sgn) {
+    const __m128i zero = _mm_setzero_si128(), one = _mm_set1_epi16(1), m15 = _mm_set1_epi16(15);
+    const __m128i QT = _mm_load_si128((const __m128i*)Q16[N9]);                // |x| <= 15 in the low byte, high byte 0 -> Q16[0] = 0
+    const __m128i qa = _mm_sign_epi16(_mm_shuffle_epi8(QT, _mm_min_epi16(_mm_abs_epi16(gca), m15)), gca);
+    const __m128i qb = _mm_sign_epi16(_mm_shuffle_epi8(QT, _mm_min_epi16(_mm_abs_epi16(gcb), m15)), gcb);
+    const __m128i sec = _mm_or_si128(_mm_add_epi16(_mm_sub_epi16(_mm_set1_epi16(24), _mm_sub_epi16(_mm_slli_epi16(qa, 3), qa)), qb), _mm_set1_epi16(short(0x8000)));
+    const __m128i b70 = _mm_set1_epi16(0x0070); k = zero;
+    for (int j = 0; j < 4; ++j) {                                              // sector byte - 16j in [0,16) -> 0x70.. (lookup), else bit 7 set (zero)
+        const __m128i x = _mm_adds_epu8(_mm_sub_epi8(sec, _mm_set1_epi16(short(16 * j))), b70);
+        k = _mm_or_si128(k, _mm_shuffle_epi8(_mm_load_si128((const __m128i*)(G64[N9] + 16 * j)), x)); }
+    const __m128i sa = _mm_sign_epi16(one, gca), sb = _mm_sign_epi16(one, gcb);
+    sgn = _mm_blendv_epi8(sa, _mm_blendv_epi8(sb, one, _mm_cmpeq_epi16(sb, zero)), _mm_cmpeq_epi16(sa, zero));
+}
+// encoder, one row of one plane: stream id per sample into kr, zigzag residual z flipped by the tiny sign in place.
+// r = this row, u = row above (nullptr for y = 0: b = c = 0); x = 0: a = c = b.
+template <bool N9> static void ctx_row_scalar(const int16_t* r, const int16_t* u, int W, int16_t* z, uint8_t* kr) {
+    for (int x = 0; x < W; ++x) {
+        int b = u ? u[x] : 0, cc = (u && x) ? u[x - 1] : 0, a = x ? r[x - 1] : b; if (!x) cc = b;
+        const int gca = cc - a, gcb = cc - b, sec = 24 - 7 * q8<N9>(gca) + q8<N9>(gcb);
+        const int sg = gca ? (gca > 0 ? 1 : -1) : (gcb ? (gcb > 0 ? 1 : -1) : 1);
+        if (sg < 0) z[x] = int16_t(zz(wrape<N9>(-unzz(uint16_t(z[x])))));
+        kr[x] = G64[N9][sec];
+    }
+}
+template <bool N9> static void ctx_row_simd(const int16_t* r, const int16_t* u, int W, int16_t* z, uint8_t* kr) {
+    if (W < 9) { ctx_row_scalar<N9>(r, u, W, z, kr); return; }
+    ctx_row_scalar<N9>(r, u, 1, z, kr);                                        // x = 0
+    const __m128i one = _mm_set1_epi16(1); int x = 1;
+    for (; x + 8 <= W; x += 8) {
+        const __m128i a = _mm_loadu_si128((const __m128i*)(r + x - 1));
+        const __m128i b = u ? _mm_loadu_si128((const __m128i*)(u + x)) : _mm_setzero_si128();
+        const __m128i c = u ? _mm_loadu_si128((const __m128i*)(u + x - 1)) : _mm_setzero_si128();
+        __m128i k, sgn; ctx8v<N9>(_mm_sub_epi16(c, a), _mm_sub_epi16(c, b), k, sgn);
+        __m128i zv = _mm_loadu_si128((const __m128i*)(z + x));
+        __m128i e = _mm_xor_si128(_mm_srli_epi16(zv, 1), _mm_sub_epi16(_mm_setzero_si128(), _mm_and_si128(zv, one)));
+        e = _mm_sign_epi16(e, sgn);
+        e = N9 ? _mm_srai_epi16(_mm_slli_epi16(e, 7), 7) : _mm_srai_epi16(_mm_slli_epi16(e, 8), 8);
+        _mm_storeu_si128((__m128i*)(z + x), _mm_xor_si128(_mm_add_epi16(e, e), _mm_srai_epi16(e, 15)));
+        _mm_storel_epi64((__m128i*)(kr + x), _mm_packus_epi16(k, k));
+    }
+    for (; x < W; ++x) {                                                       // tail: same formulas as the scalar row
+        const int b = u ? u[x] : 0, cc = u ? u[x - 1] : 0, a = r[x - 1];
+        const int gca = cc - a, gcb = cc - b, sec = 24 - 7 * q8<N9>(gca) + q8<N9>(gcb);
+        const int sg = gca ? (gca > 0 ? 1 : -1) : (gcb ? (gcb > 0 ? 1 : -1) : 1);
+        if (sg < 0) z[x] = int16_t(zz(wrape<N9>(-unzz(uint16_t(z[x])))));
+        kr[x] = G64[N9][sec];
+    }
+}
 
+template <class T> struct UBuf {                                      // uninitialised buffer: every element is written before it is read
+    std::unique_ptr<T[]> p; size_t n = 0;
+    void resize(size_t m) { p.reset(new T[m]); n = m; }
+    T* data() { return p.get(); } const T* data() const { return p.get(); } size_t size() const { return n; } T& operator[](size_t i) { return p[i]; }
+};
 std::vector<uint8_t> compress5(const Img& im) {
     const int W = im.W, H = im.H; const size_t n = size_t(W) * H;
-    std::vector<int16_t> P[3], Z[3]; std::vector<uint8_t> K[3]; const int NS = NS5;
+    UBuf<int16_t> P[3], Z[3]; UBuf<uint8_t> K[3]; const int NS = NS5;
     for (int c = 0; c < 3; ++c) { P[c].resize(n); Z[c].resize(n + 8); K[c].resize(n); }
     for (int y = 0; y < H; ++y) rct_row(im.rgb.data() + size_t(y) * W * 3, W, P[0].data() + size_t(y) * W, P[1].data() + size_t(y) * W, P[2].data() + size_t(y) * W);
     for (int c = 0; c < 3; ++c) for (int y = 0; y < H; ++y) {
@@ -887,26 +944,26 @@ std::vector<uint8_t> compress5(const Img& im) {
             if (bk) for (size_t i = i0; i < i1; ++i) { int eu = unzz(uint16_t(Z[1][i])), ev = unzz(uint16_t(Z[0][i])); Z[1][i] = int16_t(zz(wrape<true>(eu - ((bk * ev + 4) >> 3)))); }
             XK.push_back(uint8_t(bk + 8)); }
     }
-    for (int c = 0; c < 3; ++c) {
-        const bool n9 = c < 2; const int16_t* p = P[c].data();
-        for (int y = 0; y < H; ++y) {
-            const int16_t* r = p + size_t(y) * W; const int16_t* u = r - W; uint8_t* kr = K[c].data() + size_t(y) * W;
-            for (int x = 0; x < W; ++x) {
-                int b = y ? u[x] : 0, cc = (y && x) ? u[x - 1] : 0, a = x ? r[x - 1] : b; if (!x) cc = b;
-                const int gca = cc - a, gcb = cc - b, sec = 24 - 7 * (n9 ? q8<true>(gca) : q8<false>(gca)) + (n9 ? q8<true>(gcb) : q8<false>(gcb));
-                const int sg = gca ? (gca > 0 ? 1 : -1) : (gcb ? (gcb > 0 ? 1 : -1) : 1), id = G64[n9][sec];
-                if (sg < 0) { int16_t& zr = Z[c][size_t(y) * W + x]; int e = -unzz(uint16_t(zr)); zr = int16_t(zz(n9 ? wrape<true>(e) : wrape<false>(e))); }
-                kr[x] = uint8_t(id);
-            }
-        }
+    for (int c = 0; c < 3; ++c) for (int y = 0; y < H; ++y) {
+        const int16_t* r = P[c].data() + size_t(y) * W; const int16_t* u = y ? r - W : nullptr;
+        int16_t* z = Z[c].data() + size_t(y) * W; uint8_t* kr = K[c].data() + size_t(y) * W;
+        if (c < 2) (g_e5 ? ctx_row_simd<true> : ctx_row_scalar<true>)(r, u, W, z, kr);
+        else (g_e5 ? ctx_row_simd<false> : ctx_row_scalar<false>)(r, u, W, z, kr);
     }
-    std::vector<uint16_t> S[NS5]; for (auto& s : S) s.reserve(n / 4);
-    unsigned long long st[NS5] = {}, fu = 0, fm = 0;
+    // streams in decoder order: sizes first (order-free count), then one pass writing through pointers
+    UBuf<uint16_t> S[NS5]; size_t st[NS5] = {}; unsigned long long fu = 0, fm = 0;
+    for (int c = 0; c < 3; ++c) { size_t h[4][NS5] = {}; const uint8_t* kp = K[c].data(); size_t i = 0;
+        for (; i + 4 <= n; i += 4) { h[0][kp[i]]++; h[1][kp[i + 1]]++; h[2][kp[i + 2]]++; h[3][kp[i + 3]]++; }
+        for (; i < n; ++i) h[0][kp[i]]++;
+        for (int j = 0; j < NS5; ++j) st[j] += h[0][j] + h[1][j] + h[2][j] + h[3][j]; }
+    uint16_t* wp[NS5]; for (int i = 0; i < NS5; ++i) { S[i].resize(st[i]); wp[i] = S[i].data(); }
     for (int b0 = 0; b0 < H; b0 += 8) { const int hb = std::min(8, H - b0), L = W + 7;
         for (int t = 0; t < L; ++t) { const int klo = std::max(0, t - W + 1), khi = std::min(hb - 1, t);
             for (int c = 0; c < 3; ++c) {
-                if (hb == 8 && t >= 9 && t < W) { bool same = true; for (int k = 1; k < 8; ++k) same &= K[c][size_t(b0 + k) * W + (t - k)] == K[c][size_t(b0) * W + t]; (same ? fu : fm)++; }
-                for (int k = klo; k <= khi; ++k) { size_t i = size_t(b0 + k) * W + (t - k); int id = K[c][i]; S[id].push_back(uint16_t(Z[c][i])); st[id]++; }
+                const uint8_t* kc = K[c].data(); const int16_t* zc = Z[c].data();
+                if (g_st5 && hb == 8 && t >= 9 && t < W) { bool same = true; for (int k = 1; k < 8; ++k) same &= kc[size_t(b0 + k) * W + (t - k)] == kc[size_t(b0) * W + t]; (same ? fu : fm)++; }
+                size_t i = size_t(b0 + klo) * W + (t - klo);
+                for (int k = klo; k <= khi; ++k, i += size_t(W) - 1) *wp[kc[i]]++ = uint16_t(zc[i]);
             }
         }
     }
@@ -927,18 +984,7 @@ template <bool N9, bool FULL, int XR = 0> static inline void step5(int t, int kl
     __m128i a = V, b = _mm_insert_epi16(_mm_slli_si128(V, 2), topv, 0), cc = Bp, a_ = a, c_ = cc;
     if (!FULL) { const __m128i m0 = _mm_cmpeq_epi16(_mm_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7), _mm_set1_epi16(short(t)));
                  a_ = _mm_blendv_epi8(a, b, m0); c_ = _mm_blendv_epi8(cc, b, m0); }
-    // q7 x q7 sector -> group (stream id)
-    const __m128i gca = _mm_sub_epi16(c_, a_), gcb = _mm_sub_epi16(c_, b), m15 = _mm_set1_epi16(15);
-    const __m128i QT = _mm_load_si128((const __m128i*)Q16[N9]);                // |x| <= 15 in the low byte, high byte 0 -> Q16[0] = 0
-    const __m128i qa = _mm_sign_epi16(_mm_shuffle_epi8(QT, _mm_min_epi16(_mm_abs_epi16(gca), m15)), gca);
-    const __m128i qb = _mm_sign_epi16(_mm_shuffle_epi8(QT, _mm_min_epi16(_mm_abs_epi16(gcb), m15)), gcb);
-    const __m128i sec = _mm_or_si128(_mm_add_epi16(_mm_sub_epi16(_mm_set1_epi16(24), _mm_sub_epi16(_mm_slli_epi16(qa, 3), qa)), qb), _mm_set1_epi16(short(0x8000)));
-    const __m128i b70 = _mm_set1_epi16(0x0070); __m128i k = zero;
-    for (int j = 0; j < 4; ++j) {                                              // sector byte - 16j in [0,16) -> 0x70.. (lookup), else bit 7 set (zero)
-        const __m128i x = _mm_adds_epu8(_mm_sub_epi8(sec, _mm_set1_epi16(short(16 * j))), b70);
-        k = _mm_or_si128(k, _mm_shuffle_epi8(_mm_load_si128((const __m128i*)(G64[N9] + 16 * j)), x)); }
-    const __m128i sa = _mm_sign_epi16(one, gca), sb_ = _mm_sign_epi16(one, gcb);
-    const __m128i sgn = _mm_blendv_epi8(sa, _mm_blendv_epi8(sb_, one, _mm_cmpeq_epi16(sb_, zero)), _mm_cmpeq_epi16(sa, zero));
+    __m128i k, sgn; ctx8v<N9>(_mm_sub_epi16(c_, a_), _mm_sub_epi16(c_, b), k, sgn);   // q7 x q7 sector -> group (stream id), tiny sign
     __m128i Z; alignas(16) int16_t kl[8], zl[8];
     if (FULL) {
         const __m128i k0 = _mm_shuffle_epi8(k, _mm_set1_epi16(0x0100));
@@ -1095,12 +1141,12 @@ int main(int argc, char** argv) {
     using namespace hlc; init_shuf();
     if (argc < 3) { std::fprintf(stderr, "usage: hlc c in.ppm out.hlc [-t N] [-n] | hlc d in.hlc out.ppm [-t N] | hlc bench [opts] a.ppm|dir ... [-max N]\n"); return 1; }
     std::string mode = argv[1]; int threads = 1; std::vector<const char*> pos;
-    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-r") g_skew = false; else if (a == "-tw" && i + 1 < argc) g_tw = std::max(8, std::atoi(argv[++i])); else if (a == "-th" && i + 1 < argc) g_th = std::max(8, std::atoi(argv[++i])); else if (a == "-B" && i + 1 < argc) g_B = std::max(8, std::atoi(argv[++i])); else if (a == "-R" && i + 1 < argc) g_R = std::max(8, std::atoi(argv[++i]) & ~7); else if (a == "-dord" && i + 1 < argc) g_dord = std::atoi(argv[++i]); else if (a == "-L") g_legacy = 1; else if (a == "-4") g_legacy = 0; else if (a == "-5") g_v5 = 1; else if (a == "-X5" && i + 1 < argc) g_x5 = std::atoi(argv[++i]); else if (a == "-g5" && i + 1 < argc) g_g5 = std::atoi(argv[++i]); else if (a == "-cb" && i + 1 < argc) g_cb = std::max(0, std::atoi(argv[++i])); else if (a == "-X" && i + 1 < argc) g_xres = std::atoi(argv[++i]); else if (a == "-Xc" && i + 1 < argc) g_xclip = std::atoi(argv[++i]); else if (a == "-Xf" && i + 1 < argc) g_xfull = std::atoi(argv[++i]); else if (a == "-Xs" && i + 1 < argc) g_xstep = std::max(1, std::atoi(argv[++i])); else if (a == "-P" && i + 1 < argc) { g_pmask = std::atoi(argv[++i]) & 15; if (!g_pmask) g_pmask = 1; } else if (a == "-Px" && i + 1 < argc) g_pxstep = std::max(1, std::atoi(argv[++i])); else if (a == "-Ps" && i + 1 < argc) g_pstep = std::max(1, std::atoi(argv[++i])); else if (a == "-al" && i + 1 < argc) g_al = std::atoi(argv[++i]); else if (a == "-S" && i + 1 < argc) { g_S = std::atoi(argv[++i]); if (g_S != 1 && g_S != 2 && g_S != 8) g_S = 4; } else if (a == "-max" && i + 1 < argc) g_max = std::atoi(argv[++i]); else if (a == "-J" && i + 1 < argc) g_joint = std::atoi(argv[++i]); else if (a == "-K" && i + 1 < argc) g_K = std::max(1, std::min(4, std::atoi(argv[++i]))); else if (a == "-d3" && i + 1 < argc) g_dec3 = std::atoi(argv[++i]); else if (a == "-Ta" && i + 1 < argc) g_tadapt = std::atoi(argv[++i]); else if (a == "-ws" && i + 1 < argc) g_wsplit = std::atoi(argv[++i]); else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
+    for (int i = 2; i < argc; ++i) { std::string a = argv[i]; if (a == "-t" && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i])); else if (a == "-n") g_raw = true; else if (a == "-s") g_skew = true; else if (a == "-r") g_skew = false; else if (a == "-tw" && i + 1 < argc) g_tw = std::max(8, std::atoi(argv[++i])); else if (a == "-th" && i + 1 < argc) g_th = std::max(8, std::atoi(argv[++i])); else if (a == "-B" && i + 1 < argc) g_B = std::max(8, std::atoi(argv[++i])); else if (a == "-R" && i + 1 < argc) g_R = std::max(8, std::atoi(argv[++i]) & ~7); else if (a == "-dord" && i + 1 < argc) g_dord = std::atoi(argv[++i]); else if (a == "-L") g_legacy = 1; else if (a == "-4") g_legacy = 0; else if (a == "-5") g_v5 = 1; else if (a == "-X5" && i + 1 < argc) g_x5 = std::atoi(argv[++i]); else if (a == "-g5" && i + 1 < argc) g_g5 = std::atoi(argv[++i]); else if (a == "-e5" && i + 1 < argc) g_e5 = std::atoi(argv[++i]); else if (a == "-cb" && i + 1 < argc) g_cb = std::max(0, std::atoi(argv[++i])); else if (a == "-X" && i + 1 < argc) g_xres = std::atoi(argv[++i]); else if (a == "-Xc" && i + 1 < argc) g_xclip = std::atoi(argv[++i]); else if (a == "-Xf" && i + 1 < argc) g_xfull = std::atoi(argv[++i]); else if (a == "-Xs" && i + 1 < argc) g_xstep = std::max(1, std::atoi(argv[++i])); else if (a == "-P" && i + 1 < argc) { g_pmask = std::atoi(argv[++i]) & 15; if (!g_pmask) g_pmask = 1; } else if (a == "-Px" && i + 1 < argc) g_pxstep = std::max(1, std::atoi(argv[++i])); else if (a == "-Ps" && i + 1 < argc) g_pstep = std::max(1, std::atoi(argv[++i])); else if (a == "-al" && i + 1 < argc) g_al = std::atoi(argv[++i]); else if (a == "-S" && i + 1 < argc) { g_S = std::atoi(argv[++i]); if (g_S != 1 && g_S != 2 && g_S != 8) g_S = 4; } else if (a == "-max" && i + 1 < argc) g_max = std::atoi(argv[++i]); else if (a == "-J" && i + 1 < argc) g_joint = std::atoi(argv[++i]); else if (a == "-K" && i + 1 < argc) g_K = std::max(1, std::min(4, std::atoi(argv[++i]))); else if (a == "-d3" && i + 1 < argc) g_dec3 = std::atoi(argv[++i]); else if (a == "-Ta" && i + 1 < argc) g_tadapt = std::atoi(argv[++i]); else if (a == "-ws" && i + 1 < argc) g_wsplit = std::atoi(argv[++i]); else if (a == "-T" && i + 1 < argc) g_tl = std::max(5, std::min(13, std::atoi(argv[++i]))); else pos.push_back(argv[i]); }
     try {
         if (mode == "c" && pos.size() == 2) { auto o = g_v5 ? compress5(read_ppm(pos[0])) : g_legacy ? compress(read_ppm(pos[0]), threads) : compress4(read_ppm(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fwrite(o.data(), 1, o.size(), f); std::fclose(f); return 0; }
         if (mode == "d" && pos.size() == 2) { Img im = decompress(slurp(pos[0]), threads); FILE* f = std::fopen(pos[1], "wb"); std::fprintf(f, "P6\n%d %d\n255\n", im.W, im.H); std::fwrite(im.rgb.data(), 1, im.rgb.size(), f); std::fclose(f); return 0; }
         if (mode == "est") { size_t px = 0, by = 0; for (auto fn : pos) { Img im = read_ppm(fn); px += size_t(im.W) * im.H; by += estimate_sb(im, g_tw, g_th); } std::printf("EST B=%d R=%d  %.4f bpp  %zu B\n", g_tw, g_th, 8.0 * by / px, by); return 0; }
-        if (mode == "bench") {
+        if (mode == "bench") { g_st5 = true;
             {   // directories expand to their .ppm/.pnm files (sorted); -max N keeps the first N
                 std::vector<std::string> ex;
                 for (auto a : pos) { std::filesystem::path pa(a); std::error_code ec;
