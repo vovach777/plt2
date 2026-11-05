@@ -29,5 +29,6 @@ out of band (hlc-samples.zip / the encrypted
 | q7share_plot.py | per-photo q7 x q7 cell shares and mean |E1|+|E2|, small-multiple heatmaps + CSV |
 | q7full.py | full unmirrored q7 x q7 grid: shares, mean signed residual, cost of folding mirror pairs |
 | symmetry_rank.py | entropy cost of folding q7 sectors by symmetry groups (central mirror, sign of one axis, axis swap) |
+| x_bias_fold.py | bias on the second axis after the mirror, then fold its sign (constant, per-row median, alpha*y) |
 | third_axis.py | third axis instead of d: neighbour errors, |a-aa|, |b-bb| vs true |d-b| |
 | xresctx.py, xresgrain.py, xresfit.py | cross-chroma on top of contexts; granularity; threshold refit |
