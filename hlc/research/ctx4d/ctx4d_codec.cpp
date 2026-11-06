@@ -5,7 +5,7 @@
 //          -> inverse RCT. Streams 0..7 Y, 8..15 shared by U and V.
 // Unit (one FSE run per stream): whole bands, at least 256 compute blocks of 128 x 16 px (W = 2048: 16 bands).
 // Format "C4D1": var W, var H, then per unit and stream: var n, payload (mode u8: 0 raw u16, 1 rle var, 6 FSE4 var c).
-// usage:  ctx4d_codec c in.ppm out.c4d groups.csv | d in.c4d out.ppm groups.csv | bench groups.csv a.ppm|dir ... [-r N] [-max N]
+// usage:  ctx4d_codec c in.ppm out.c4d groups.csv | d in.c4d out.ppm groups.csv | bench groups.csv a.ppm|dir ... [-r N] [-max N] [-s]
 #define CTX4D_LANES 16                       // the format: bands of 16 rows
 #define CTX4D_NO_MAIN
 #include "ctx4d_vec.cpp"
@@ -98,6 +98,7 @@ static size_t get_stream(In& in, std::vector<uint16_t>& dst) {
     return n;
 }
 
+static bool g_serial = false;                 // -s: planes one after another inside a unit (no interleave)
 static int bands_per_unit(int W) { int bpb = (W + 127) / 128; return std::max(1, (256 + bpb - 1) / bpb); }
 struct Times { double rct = 0, ctx = 0, scat = 0, fse = 0, dfse = 0, dwave = 0, irct = 0; };
 static double msnow() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -115,13 +116,11 @@ static std::vector<uint8_t> encode(const uint8_t* rgb, int W, int H, Times& tm) 
     for (int u0 = 0; u0 < H; u0 += BU) {
         double s0 = msnow();
         for (auto& v : st) v.clear();
-        for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN)
-            for (int t = 0; t < W + 2 * (LN - 1); t++)
-                for (int k = 0; k < 3; k++) {
-                    const uint16_t* pl = pk.data() + k * N;
-                    for (int l = 0; l < LN; l++) { int x = t - 2 * l, y = y0 + l; if (x < 0 || x >= W || y >= H) continue;
-                        uint16_t p = pl[(size_t)y * W + x]; st[p & 15].push_back(p >> 4); }
-                }
+        auto put = [&](int k, int y0, int t) { const uint16_t* pl = pk.data() + k * N;
+            for (int l = 0; l < LN; l++) { int x = t - 2 * l, y = y0 + l; if (x < 0 || x >= W || y >= H) continue;
+                uint16_t p = pl[(size_t)y * W + x]; st[p & 15].push_back(p >> 4); } };
+        if (g_serial) { for (int k = 0; k < 3; k++) for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) for (int t = 0; t < W + 2 * (LN - 1); t++) put(k, y0, t); }
+        else for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) for (int t = 0; t < W + 2 * (LN - 1); t++) for (int k = 0; k < 3; k++) put(k, y0, t);
         double s1 = msnow();
         for (int s = 0; s < 16; s++) put_stream(o, st[s].data(), st[s].size(), tmp, s < 8 ? 256 : 512);
         tm.scat += s1 - s0; tm.fse += msnow() - s1;
@@ -142,7 +141,11 @@ static void decode(const uint8_t* buf, size_t len, std::vector<uint8_t>& rgb, in
         for (int s = 0; s < 16; s++) get_stream(in, sb[s]);
         for (int g = 0; g < 8; g++) { SY[g] = sb[g].data(); SUV[g] = sb[8 + g].data(); }
         double f1 = msnow();
-        for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) {
+        if (g_serial) {
+            for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) { pdY.begin(y0); for (int t = 0; t < pdY.T; t++) pdY.step(t); pdY.end(y0); }
+            for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) { pdU.begin(y0); for (int t = 0; t < pdU.T; t++) pdU.step(t); pdU.end(y0); }
+            for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) { pdV.begin(y0); for (int t = 0; t < pdV.T; t++) pdV.step(t); pdV.end(y0); }
+        } else for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) {
             pdY.begin(y0); pdU.begin(y0); pdV.begin(y0);
             for (int t = 0; t < pdY.T; t++) { pdY.step(t); pdU.step(t); pdV.step(t); }
             pdY.end(y0); pdU.end(y0); pdV.end(y0);
@@ -164,7 +167,7 @@ static std::vector<uint8_t> read_file(const char* f) { std::vector<uint8_t> b; F
     fseek(fp, 0, SEEK_END); b.resize(ftell(fp)); fseek(fp, 0, SEEK_SET); if (fread(b.data(), 1, b.size(), fp) != b.size()) b.clear(); fclose(fp); return b; }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { fprintf(stderr, "usage: %s c in.ppm out.c4d groups.csv | d in.c4d out.ppm groups.csv | bench groups.csv a.ppm|dir ... [-r N] [-max N]\n", argv[0]); return 1; }
+    if (argc < 3) { fprintf(stderr, "usage: %s c in.ppm out.c4d groups.csv | d in.c4d out.ppm groups.csv | bench groups.csv a.ppm|dir ... [-r N] [-max N] [-s]\n", argv[0]); return 1; }
     std::string cmd = argv[1];
     try {
         if (cmd == "c" && argc >= 5) {
@@ -184,6 +187,7 @@ int main(int argc, char** argv) {
             for (int i = 3; i < argc; i++) {
                 if (!strcmp(argv[i], "-r") && i + 1 < argc) { reps = atoi(argv[++i]); continue; }
                 if (!strcmp(argv[i], "-max") && i + 1 < argc) { mx = atoi(argv[++i]); continue; }
+                if (!strcmp(argv[i], "-s")) { g_serial = true; continue; }
                 if (std::filesystem::is_directory(argv[i])) {                 // a folder: its *.ppm / *.pnm, sorted
                     std::vector<std::string> d;
                     for (auto& e : std::filesystem::directory_iterator(argv[i])) { auto x = e.path().extension().string();
