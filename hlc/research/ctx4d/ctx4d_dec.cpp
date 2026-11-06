@@ -11,6 +11,7 @@
 // The test encodes with the scalar reference, scatters into streams in wave order, decodes, compares every pixel.
 // build:  g++ -O3 -mavx2 -std=c++17 ctx4d_dec_avx2.cpp -o ctx4d_dec_avx2
 // usage:  ctx4d_dec_avx2 image.ppm groups.csv [reps]
+#include <cmath>
 #include "simd.h"
 #include <cstdio>
 #include <cstdlib>

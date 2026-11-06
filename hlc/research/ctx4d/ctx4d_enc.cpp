@@ -6,6 +6,7 @@
 // a scalar loop over the 16 lanes (what an SSE build would do) - both are timed.
 // build:  g++ -O3 -mavx2 -std=c++17 ctx4d_avx2.cpp -o ctx4d_avx2        (SIMDe: include simde/x86/avx2.h instead)
 // usage:  ctx4d_avx2 image.ppm groups.csv [reps]
+#include <cmath>
 #include "simd.h"
 #include <cstdio>
 #include <cstdlib>
