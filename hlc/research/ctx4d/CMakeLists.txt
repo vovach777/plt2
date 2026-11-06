@@ -15,7 +15,7 @@ if(CTX4D_NO_AVX1 AND (NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR
   check_cxx_source_compiles("#ifndef __AVX2__\n#error no avx2\n#endif\nint main(){return 0;}" CTX4D_TARGET_AVX2)
   unset(CMAKE_REQUIRED_FLAGS)
   if(NOT CTX4D_TARGET_AVX2)
-    set(CTX4D_EXTRA -mno-avx)
+    set(CTX4D_EXTRA -mno-avx -Wno-psabi)
     message(STATUS "ctx4d: target without AVX2 -> SIMDe on SSE (-mno-avx)")
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
       message(WARNING "ctx4d: gcc turns the SIMDe 256-bit integer emulation into element loops (~8x slower); use clang++ for this target")
