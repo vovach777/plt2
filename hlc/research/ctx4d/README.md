@@ -144,3 +144,8 @@ lane = tile, raster inside the tile (no lane shifts, no border masks, two rows x
 
 The cheaper step (no shifts / masks) does not pay: the scalar stream reads per lane dominate both. Independent tiles
 cost ~1.2 % bits for ~4 % decoder core; their gain would be thread / random-access parallelism, not single-core speed.
+
+Edge blocks absorb the remainder (last column up to 255 wide, last row up to 127 high), grouped by shape (inner,
+right column, bottom row, corner), all through the same SIMD decoder (lanes = blocks, unused lanes idle):
+6.0688 bpp (wave 6.0081, +1.0 %), encoder 234 MB/s (wave 239), decoder 233 MB/s (wave 257, HLC5 316);
+decode core over all pixels 8.13 ns/px AVX2 / 7.72 SSE (edge groups run with fewer lanes and wider rows).
