@@ -26,6 +26,8 @@ struct In { const uint8_t* p; const uint8_t* e;
     uint64_t var() { uint64_t v = 0; int s = 0; for (;;) { uint8_t c = u8(); v |= uint64_t(c & 127) << s; if (!(c & 128)) return v; s += 7; } }
     const uint8_t* take(size_t n) { if (size_t(e - p) < n) throw std::runtime_error("truncated"); const uint8_t* r = p; p += n; return r; } };
 
+struct Times { double rct = 0, ctx = 0, scat = 0, fse = 0, dfse = 0, dwave = 0, irct = 0, hist = 0, dstep = 0, dend = 0, dtab = 0; };
+static Times* g_tm = nullptr;
 // ---------------- FSE4 (copied from hlc.cpp: 4 interleaved states, one bitstream, own decoder) ----------------
 static size_t fse4_enc(uint8_t* dst, size_t cap, const uint16_t* s, size_t n, unsigned mx, const unsigned* cnt) {
     const unsigned tcap = std::min(12u, std::max(9u, bw(uint32_t(n)) - 1 - 4));
@@ -58,7 +60,9 @@ static size_t fse4_enc(uint8_t* dst, size_t cap, const uint16_t* s, size_t n, un
     for (size_t k = L; k-- > 0;) FSE_flushCState(&bc, &st[k]);
     size_t c = BIT_closeCStream(&bc); return c ? h + c : 0;
 }
+static double msnow();
 static void fse4_dec(uint16_t* out, size_t n, const uint8_t* src, size_t c) {
+    double tb0 = msnow();
     short norm[1024]; unsigned mx = 1023, tl;
     size_t h = FSE_readNCount(norm, &mx, &tl, src, c); if (FSE_isError(h) || tl > 13 || tl < 1) throw std::runtime_error("ncount");
     static std::vector<uint32_t> T(1 << 13); static std::vector<uint16_t> nxt(1024);
@@ -68,6 +72,7 @@ static void fse4_dec(uint16_t* out, size_t n, const uint8_t* src, size_t c) {
     for (unsigned s = 0; s <= mx; ++s) for (int k = 0; k < norm[s]; ++k) { T[pos] = s; pos = (pos + step) & mask; while (pos > hi) pos = (pos + step) & mask; }
     if (pos) throw std::runtime_error("ncount spread");
     for (uint32_t u = 0; u < ts; ++u) { uint32_t s = T[u], ns = nxt[s]++, nb = tl - bw(ns) + 1; T[u] = (((ns << nb) - ts) & 0xffff) | nb << 16 | s << 20; }
+    if (g_tm) g_tm->dtab += msnow() - tb0;
     BIT_DStream_t bd; if (FSE_isError(BIT_initDStream(&bd, src + h, c - h))) throw std::runtime_error("bitstream");
     const size_t L = std::min<size_t>(n, 4); uint32_t st[4] = {0, 0, 0, 0};
     for (size_t k = 0; k < L; ++k) { st[k] = uint32_t(BIT_readBits(&bd, tl)); BIT_reloadDStream(&bd); }
@@ -77,12 +82,15 @@ static void fse4_dec(uint16_t* out, size_t n, const uint8_t* src, size_t c) {
     BIT_reloadDStream(&bd); for (size_t k = 0; i < n; ++i, ++k) { uint32_t e = t[st[k]]; out[i] = uint16_t(e >> 20); st[k] = (e & 0xffff) + uint32_t(BIT_readBits(&bd, (e >> 16) & 15)); }
 #undef C4_DEC1
 }
+static double msnow();
 static void put_stream(Out& o, const uint16_t* s, size_t n, std::vector<uint8_t>& tmp, unsigned A) {
     o.var(n); if (!n) return;
+    double h0 = msnow();
     static unsigned cnt[512], c4[4][512]; memset(c4, 0, sizeof c4); unsigned mx = 0; size_t i = 0;
     for (; i + 4 <= n; i += 4) { c4[0][s[i]]++; c4[1][s[i + 1]]++; c4[2][s[i + 2]]++; c4[3][s[i + 3]]++; }
     for (; i < n; ++i) c4[0][s[i]]++;
     for (unsigned v = 0; v < A; ++v) { cnt[v] = c4[0][v] + c4[1][v] + c4[2][v] + c4[3][v]; if (cnt[v]) mx = v; }
+    if (g_tm) g_tm->hist += msnow() - h0;
     if (cnt[s[0]] == n) { o.u8(1); o.var(s[0]); return; }
     tmp.resize(n * 2 + 4096); size_t c = fse4_enc(tmp.data(), tmp.size(), s, n, mx, cnt);
     if (!c || c >= n * 2) { o.u8(0); o.raw(s, n * 2); return; }
@@ -100,10 +108,10 @@ static size_t get_stream(In& in, std::vector<uint16_t>& dst) {
 
 static bool g_serial = false;                 // -s: planes one after another inside a unit (no interleave)
 static int bands_per_unit(int W) { int bpb = (W + 127) / 128; return std::max(1, (256 + bpb - 1) / bpb); }
-struct Times { double rct = 0, ctx = 0, scat = 0, fse = 0, dfse = 0, dwave = 0, irct = 0; };
 static double msnow() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 static std::vector<uint8_t> encode(const uint8_t* rgb, int W, int H, Times& tm) {
+    g_tm = &tm;
     size_t N = (size_t)W * H; std::vector<int16_t> P[3]; for (auto& p : P) p.resize(N);
     double t0 = msnow();
     for (size_t i = 0; i < N; i++) { int R = rgb[3 * i], Gc = rgb[3 * i + 1], B = rgb[3 * i + 2]; P[0][i] = (int16_t)((R + 2 * Gc + B) >> 2); P[1][i] = (int16_t)(B - Gc); P[2][i] = (int16_t)(R - Gc); }
@@ -129,6 +137,7 @@ static std::vector<uint8_t> encode(const uint8_t* rgb, int W, int H, Times& tm) 
 }
 
 static void decode(const uint8_t* buf, size_t len, std::vector<uint8_t>& rgb, int& W, int& H, Times& tm) {
+    g_tm = &tm;
     In in{buf, buf + len}; if (len < 4 || memcmp(in.take(4), "C4D1", 4)) throw std::runtime_error("not C4D1");
     W = (int)in.var(); H = (int)in.var(); size_t N = (size_t)W * H;
     std::vector<int16_t> D[3]; for (auto& d : D) d.resize(N);
@@ -142,9 +151,11 @@ static void decode(const uint8_t* buf, size_t len, std::vector<uint8_t>& rgb, in
         for (int g = 0; g < 8; g++) { SY[g] = sb[g].data(); SUV[g] = sb[8 + g].data(); }
         double f1 = msnow();
         if (g_serial) {
-            for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) { pdY.begin(y0); for (int t = 0; t < pdY.T; t++) pdY.step(t); pdY.end(y0); }
-            for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) { pdU.begin(y0); for (int t = 0; t < pdU.T; t++) pdU.step(t); pdU.end(y0); }
-            for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) { pdV.begin(y0); for (int t = 0; t < pdV.T; t++) pdV.step(t); pdV.end(y0); }
+            double se = 0;
+            for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) { pdY.begin(y0); for (int t = 0; t < pdY.T; t++) pdY.step(t); double e0 = msnow(); pdY.end(y0); se += msnow() - e0; }
+            for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) { pdU.begin(y0); for (int t = 0; t < pdU.T; t++) pdU.step(t); double e0 = msnow(); pdU.end(y0); se += msnow() - e0; }
+            for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) { pdV.begin(y0); for (int t = 0; t < pdV.T; t++) pdV.step(t); double e0 = msnow(); pdV.end(y0); se += msnow() - e0; }
+            tm.dend += se;
         } else for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) {
             pdY.begin(y0); pdU.begin(y0); pdV.begin(y0);
             for (int t = 0; t < pdY.T; t++) { pdY.step(t); pdU.step(t); pdV.step(t); }
@@ -209,11 +220,12 @@ int main(int argc, char** argv) {
                 bool ok = out == rgb; allok &= ok; double px = (double)W * H;
                 printf("%-60s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s %s\n", f, W, H, b.size(), 8.0 * b.size() / px, 3 * px / be / 1e3, 3 * px / bd / 1e3, ok ? "ok" : "MISMATCH");
                 tb += b.size(); tpx += px; te += be; td += bd;
-                T.rct += bt.rct; T.ctx += bt.ctx; T.scat += bt.scat; T.fse += bt.fse; T.dfse += bdt.dfse; T.dwave += bdt.dwave; T.irct += bdt.irct;
+                T.rct += bt.rct; T.ctx += bt.ctx; T.scat += bt.scat; T.fse += bt.fse; T.hist += bt.hist; T.dfse += bdt.dfse; T.dwave += bdt.dwave; T.irct += bdt.irct; T.dend += bdt.dend; T.dtab += bdt.dtab;
             }
             printf("TOTAL %zu files %.4f bpp  enc %.1f dec %.1f MB/s (image bytes)  %s\n", files.size(), 8.0 * tb / tpx, 3 * tpx / te / 1e3, 3 * tpx / td / 1e3, allok ? "all ok" : "MISMATCH");
-            printf("ns/px  enc: RCT %.2f  context+symbol %.2f  wave scatter %.2f  FSE %.2f | dec: FSE %.2f  wave %.2f  inverse RCT %.2f\n",
-                   T.rct * 1e6 / tpx, T.ctx * 1e6 / tpx, T.scat * 1e6 / tpx, T.fse * 1e6 / tpx, T.dfse * 1e6 / tpx, T.dwave * 1e6 / tpx, T.irct * 1e6 / tpx);
+            printf("ns/px  enc: RCT %.2f  context+symbol %.2f  wave scatter %.2f  FSE %.2f (histogram %.2f, coding %.2f) | dec: FSE %.2f (tables %.2f, decoding %.2f)  wave %.2f (steps %.2f, unskew+top %.2f)  inverse RCT %.2f\n",
+                   T.rct * 1e6 / tpx, T.ctx * 1e6 / tpx, T.scat * 1e6 / tpx, T.fse * 1e6 / tpx, T.hist * 1e6 / tpx, (T.fse - T.hist) * 1e6 / tpx,
+                   T.dfse * 1e6 / tpx, T.dtab * 1e6 / tpx, (T.dfse - T.dtab) * 1e6 / tpx, T.dwave * 1e6 / tpx, (T.dwave - T.dend) * 1e6 / tpx, T.dend * 1e6 / tpx, T.irct * 1e6 / tpx);
             return allok ? 0 : 2;
         }
     } catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 3; }
