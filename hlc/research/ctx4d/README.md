@@ -11,6 +11,9 @@ zigzag, packed `(z << 4) | stream`. Spec and scalar reference: `../ctx4d_ref.cpp
   in decoder order (band of 16 rows, step t = x + 2k, lane), decodes with the AVX2 wavefront, compares every pixel.
   Timed: the decode only (context + stream read + reconstruction, 3 planes), no FSE.
 
+* `ctx4d_vec image.ppm q7d_max3_groups.csv [reps]` — both kernels written with GCC/Clang vector types only
+  (`vector_size(32)`, plain operators, `__builtin_shufflevector`), no intrinsics, no SIMDe; same checks.
+
 Input: binary P6 PPM, width ≤ 32700.
 
 ## Build
@@ -41,3 +44,19 @@ By hand from this folder: `clang++ -O3 -march=native -std=c++17 ctx4d_dec.cpp -o
   On an AVX1-only CPU (Ivy Bridge) clang with `-mno-avx` was the fastest SIMDe variant here.
 * The decoder is latency bound: the SSE build is faster than native AVX2, the cross-128-bit lane shift
   (`vperm2i128` + `vpalignr`) sits on the step-to-step chain.
+
+### Vector types (`ctx4d_vec`) vs intrinsics, ns per pixel, 3 planes, 1008x756 (sandbox Xeon)
+
+| build | encoder | decoder |
+|---|---|---|
+| clang 18 -march=haswell, vector types | 3.12 | 6.87 |
+| clang 18 -march=haswell, intrinsics (gather / scalar group) | 1.78 / 2.39 | 6.71 |
+| clang 18 -march=ivybridge -mno-avx, vector types | 3.83 | 6.12 |
+| clang 18 -march=ivybridge -mno-avx, SIMDe | 3.78 | 6.29 |
+| g++ 13 -march=haswell, vector types | 3.60 | 8.77 |
+| g++ 13 -march=ivybridge -mno-avx, vector types | 23 | 44 |
+
+* Element access `v[i]` on a vector variable inside the loop is a trap (clang: 5x slower encoder, 3x decoder):
+  go through an aligned array (`store`, scalar loop, `load`).
+* clang lowers 256-bit vector types to SSE as well as SIMDe does; gcc 13 does not (same element loops as with SIMDe).
+* The encoder gap on AVX2 is the group lookup: the intrinsics version uses `vpgatherdd`.
