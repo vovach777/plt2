@@ -15,21 +15,16 @@ Input: binary P6 PPM, width ≤ 32700.
 
 ## Build
 
-With AVX2 the intrinsics are native; without AVX2 (Ivy Bridge, ARM) the same code goes through
-[SIMDe](https://github.com/simd-everywhere/simde) — `simd.h` picks it, the output line says which one ran.
+Part of the plt2 CMake build (option `PLT_BUILD_CTX4D`, ON): the binaries land next to `plt2` / `hlc`, the target ISA
+is the root `PLT_ARCH`. With AVX2 the intrinsics are native; without AVX2 (Ivy Bridge, ARM) the same code goes through
+the SIMDe amalgam bundled in the plt2 root (`avx2.h`) — `simd.h` picks it, the output line says which one ran.
 
-CMake (downloads SIMDe v0.8.2 unless `-DSIMDE_DIR=...` points to a checkout):
+    cmake -B build                                          # native
+    cmake -B build_ivy -DCMAKE_CXX_COMPILER=clang++ -DPLT_ARCH=ivybridge   # SIMDe path on Ivy
+    cmake --build build --config Release --target ctx4d_enc ctx4d_dec
 
-    cmake -B build -DCTX4D_ARCH=native        # or avx2 / ivybridge / ...
-    cmake --build build --config Release
-
-By hand (SIMDe is header-only: `git clone --depth 1 -b v0.8.2 https://github.com/simd-everywhere/simde`):
-
-    g++ -O3 -march=native -std=c++17 -I simde ctx4d_enc.cpp -o ctx4d_enc
-    g++ -O3 -march=native -std=c++17 -I simde ctx4d_dec.cpp -o ctx4d_dec
-
-`-DFORCE_SIMDE` (CMake: `-DCTX4D_FORCE_SIMDE=ON`) runs SIMDe on an AVX2 machine too, to see its cost.
-MSVC: `/arch:AVX2` is set; without it SIMDe is used.
+`-DCTX4D_FORCE_SIMDE=ON` runs SIMDe on an AVX2 machine too, to see its cost.
+By hand from this folder: `clang++ -O3 -march=native -std=c++17 ctx4d_dec.cpp -o ctx4d_dec`.
 
 ## Compiler notes (measured in the sandbox, Xeon with AVX2; ns per pixel, 3 planes, 1008x756 / 12 Mpx)
 

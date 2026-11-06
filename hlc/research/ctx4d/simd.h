@@ -1,5 +1,5 @@
-// simd.h - native AVX2 when the compiler targets it, SIMDe (https://github.com/simd-everywhere/simde) otherwise
-// (SSE-only x86 such as Ivy Bridge, ARM NEON, ...). -DFORCE_SIMDE uses SIMDe even on AVX2 builds.
+// simd.h - native AVX2 when the compiler targets it, otherwise the SIMDe amalgam bundled in the plt2 root
+// (../../../avx2.h, SIMDe 0.8.2): SSE-only x86 such as Ivy Bridge, ARM NEON, ... -DFORCE_SIMDE uses SIMDe always.
 #pragma once
 #include <cstdlib>
 #if defined(__AVX2__) && !defined(FORCE_SIMDE)
@@ -7,7 +7,7 @@
   #define CTX4D_SIMD "native AVX2"
 #else
   #define SIMDE_ENABLE_NATIVE_ALIASES
-  #include <simde/x86/avx2.h>
+  #include "../../../avx2.h"
   #define CTX4D_SIMD "SIMDe AVX2 emulation"
 #endif
 #if defined(_MSC_VER)

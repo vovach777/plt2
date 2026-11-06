@@ -59,3 +59,9 @@ if(PLT_BUILD_HLC AND PLT_BUILD_PCTX)
   set_target_properties(hlc PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
                         RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR} RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR})
 endif()
+
+# ctx4d research kernels (HLC5 4-D context: AVX2 encoder kernel + wavefront decoder, SIMDe fallback) from hlc/research/ctx4d
+option(PLT_BUILD_CTX4D "build the ctx4d research kernels (ctx4d_enc, ctx4d_dec)" ON)
+if(PLT_BUILD_CTX4D)
+  add_subdirectory(hlc/research/ctx4d ctx4d_build)
+endif()
