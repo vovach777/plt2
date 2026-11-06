@@ -18,8 +18,14 @@ def grow(H,thr,rel,cap):
                     blk=rid[c:e,a:b]
                     if (blk>=0).any(): continue
                     if cap and n+blk.size>cap: continue
-                    blk_=H[c:e,a:b]; dm=1-(np.minimum(blk_,m)/np.maximum(np.maximum(blk_,m),1e-9)).min()
-                    if (dm<=t or n==1) and (best is None or dm<best[0]): best=(dm,d,a,b,c,e)
+                    blk_=H[c:e,a:b].ravel(); rr=1-np.minimum(blk_,m)/np.maximum(np.maximum(blk_,m),1e-9)
+                    if MODE==1: dm=1-min(blk_.mean(),m)/max(blk_.mean(),m,1e-9)
+                    elif MODE==2 and blk_.size>=3: dm=np.sort(rr)[-2]
+                    else: dm=rr.max()
+                    w_=max(x1,b)-min(x0,a); h_=max(y1,e)-min(y0,c); asp=max(w_,h_)/min(w_,h_)
+                    if ASPMAX and n>1 and asp>ASPMAX: continue
+                    key=(asp if SQ else 0, dm)
+                    if (dm<=t or n==1) and (best is None or key<best[0]): best=(key,d,a,b,c,e)
                 if best is None: break
                 _,d,a,b,c,e=best; rid[c:e,a:b]=r; s+=H[c:e,a:b].sum(); n+=(b-a)*(e-c)
                 x0,x1,y0,y1=min(x0,a),max(x1,b),min(y0,c),max(y1,e)
