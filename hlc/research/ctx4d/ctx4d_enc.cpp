@@ -6,7 +6,7 @@
 // a scalar loop over the 16 lanes (what an SSE build would do) - both are timed.
 // build:  g++ -O3 -mavx2 -std=c++17 ctx4d_avx2.cpp -o ctx4d_avx2        (SIMDe: include simde/x86/avx2.h instead)
 // usage:  ctx4d_avx2 image.ppm groups.csv [reps]
-#include <immintrin.h>
+#include "simd.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -80,15 +80,15 @@ static inline __m256i q7v(__m256i g, __m256i e0, __m256i e1, __m256i e2) {   // 
     return _mm256_sign_epi16(nq, _mm256_sub_epi16(_mm256_setzero_si256(), g));
 }
 
-template <bool GATHER>
-static void encode_plane_avx2(const int16_t* __restrict P, uint16_t* __restrict out, int W, int H, int k) {
-    const int t = k ? 1 : 0, sh = k ? 7 : 8;
+template <bool GATHER, int SH>      // SH = 16 - plane bits, a compile-time shift (SIMDe without AVX2 loops on run-time shifts)
+static void encode_plane_k(const int16_t* __restrict P, uint16_t* __restrict out, int W, int H, int k) {
+    const int t = k ? 1 : 0; constexpr int sh = SH;
     const __m256i e0 = _mm256_set1_epi16(EDGE[t][0] - 1), e1 = _mm256_set1_epi16(EDGE[t][1] - 1), e2 = _mm256_set1_epi16(EDGE[t][2] - 1);
     const __m256i v0 = _mm256_set1_epi16(VT[t][0] - 1), v1 = _mm256_set1_epi16(VT[t][1] - 1);
     const __m256i one = _mm256_set1_epi16(1), sb = _mm256_set1_epi16(t * 8), m8 = _mm256_set1_epi32(0xFF);
     const uint8_t* Gt = G[t];
     const int L = 32, Wp = (W + 15) & ~15, stride = Wp + 2 * L;                 // 32 elements (64 B) halo on each side
-    int16_t* buf = (int16_t*)aligned_alloc(64, sizeof(int16_t) * stride * 4);
+    int16_t* buf = (int16_t*)simd_alloc(64, sizeof(int16_t) * stride * 4);
     memset(buf, 0, sizeof(int16_t) * stride * 4);
     int16_t *Pu = buf + L, *Pc = buf + stride + L, *Zu = buf + 2 * stride + L, *Zc = buf + 3 * stride + L;
     alignas(32) uint16_t tmp[16];
@@ -134,7 +134,12 @@ static void encode_plane_avx2(const int16_t* __restrict P, uint16_t* __restrict 
         }
         std::swap(Pu, Pc); std::swap(Zu, Zc);
     }
-    free(buf);
+    simd_free(buf);
+}
+
+template <bool GATHER>
+static void encode_plane_avx2(const int16_t* P, uint16_t* out, int W, int H, int k) {
+    if (k) encode_plane_k<GATHER, 7>(P, out, W, H, k); else encode_plane_k<GATHER, 8>(P, out, W, H, k);
 }
 
 int main(int argc, char** argv) {
@@ -166,7 +171,7 @@ int main(int argc, char** argv) {
     std::vector<uint16_t> sc(N * 3); for (int k = 0; k < 3; k++) encode_plane_avx2<false>(P[k].data(), sc.data() + k * N, W, H, k);
     size_t bad2 = 0; for (size_t i = 0; i < N * 3; i++) bad2 += ref[i] != sc[i];
     double mp = N / 1e6;
-    printf("%dx%d (%.2f Mpx), best of %d:\n", W, H, mp, reps);
+    printf("%dx%d (%.2f Mpx), best of %d, %s:\n", W, H, mp, reps, CTX4D_SIMD);
     printf("  RCT AVX2                      %7.3f ms  %6.2f ns/px\n", best[0], best[0] * 1e6 / N);
     printf("  context+symbol AVX2, gather   %7.3f ms  %6.2f ns/px (3 planes)\n", best[1], best[1] * 1e6 / N);
     printf("  context+symbol AVX2, scalar G %7.3f ms  %6.2f ns/px (3 planes)\n", best[2], best[2] * 1e6 / N);

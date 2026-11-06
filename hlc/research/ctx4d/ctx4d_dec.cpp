@@ -11,7 +11,7 @@
 // The test encodes with the scalar reference, scatters into streams in wave order, decodes, compares every pixel.
 // build:  g++ -O3 -mavx2 -std=c++17 ctx4d_dec_avx2.cpp -o ctx4d_dec_avx2
 // usage:  ctx4d_dec_avx2 image.ppm groups.csv [reps]
-#include <immintrin.h>
+#include "simd.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -83,8 +83,9 @@ static inline __m256i shl1(__m256i v, int16_t ins) {
 
 struct Streams { const uint16_t* p[16]; };
 
-static void decode_plane_avx2(int16_t* __restrict out, int W, int H, int k, Streams& S) {
-    const int t8 = k ? 1 : 0, sh = k ? 7 : 8;
+template <int SH>                   // SH = 16 - plane bits, compile-time (SIMDe without AVX2 loops on run-time shifts)
+static void decode_plane_k(int16_t* __restrict out, int W, int H, int k, Streams& S) {
+    const int t8 = k ? 1 : 0; constexpr int sh = SH;
     const __m256i e0 = _mm256_set1_epi16(EDGE[t8][0] - 1), e1 = _mm256_set1_epi16(EDGE[t8][1] - 1), e2 = _mm256_set1_epi16(EDGE[t8][2] - 1);
     const __m256i v0 = _mm256_set1_epi16(VT[t8][0] - 1), v1 = _mm256_set1_epi16(VT[t8][1] - 1), one = _mm256_set1_epi16(1);
     const __m256i lane2k = _mm256_setr_epi16(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
@@ -94,8 +95,8 @@ static void decode_plane_avx2(int16_t* __restrict out, int W, int H, int k, Stre
     const int T = W + 2 * (LN - 1), PAD = 40;
     std::vector<int16_t> topP(W + 2 * PAD, 0), topZ(W + 2 * PAD, 0);        // last row of the band above
     int16_t* tp = topP.data() + PAD; int16_t* tz = topZ.data() + PAD;
-    int16_t* wave = (int16_t*)aligned_alloc(32, sizeof(int16_t) * LN * T);    // pixels in wave layout [t][lane]
-    int16_t* wavez = (int16_t*)aligned_alloc(32, sizeof(int16_t) * LN * T);
+    int16_t* wave = (int16_t*)simd_alloc(32, sizeof(int16_t) * LN * T);    // pixels in wave layout [t][lane]
+    int16_t* wavez = (int16_t*)simd_alloc(32, sizeof(int16_t) * LN * T);
     alignas(32) int16_t cell[16], zz[16];
     for (int y0 = 0; y0 < H; y0 += LN) {
         const __m256i vrows = _mm256_set1_epi16((int16_t)std::min(LN, H - y0));
@@ -145,7 +146,11 @@ static void decode_plane_avx2(int16_t* __restrict out, int W, int H, int k, Stre
         const int16_t* srcp = wave + 2 * (LN - 1) * LN + (LN - 1); const int16_t* srcz = wavez + 2 * (LN - 1) * LN + (LN - 1);
         if (rows == LN) for (int x = 0; x < W; x++) { tp[x] = srcp[(size_t)x * LN]; tz[x] = srcz[(size_t)x * LN]; }
     }
-    free(wave); free(wavez);
+    simd_free(wave); simd_free(wavez);
+}
+
+static void decode_plane_avx2(int16_t* out, int W, int H, int k, Streams& S) {
+    if (k) decode_plane_k<7>(out, W, H, k, S); else decode_plane_k<8>(out, W, H, k, S);
 }
 
 int main(int argc, char** argv) {
@@ -169,7 +174,7 @@ int main(int argc, char** argv) {
         best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
     size_t bad = 0; for (int k = 0; k < 3; k++) for (size_t i = 0; i < N; i++) if (D[k][i] != P[k][i]) { if (bad < 5) printf("MISMATCH plane %d x %zu y %zu: %d vs %d\n", k, i % W, i / W, D[k][i], P[k][i]); bad++; }
-    printf("%dx%d (%.2f Mpx): AVX2 wavefront decode (context + symbol + reconstruct, 3 planes) %.3f ms = %.2f ns/px; %s (%zu bad)\n",
-           W, H, N / 1e6, best, best * 1e6 / N, bad ? "FAIL" : "round trip OK", bad);
+    printf("[%s] %dx%d (%.2f Mpx): AVX2 wavefront decode (context + symbol + reconstruct, 3 planes) %.3f ms = %.2f ns/px; %s (%zu bad)\n",
+           CTX4D_SIMD, W, H, N / 1e6, best, best * 1e6 / N, bad ? "FAIL" : "round trip OK", bad);
     return bad ? 2 : 0;
 }
