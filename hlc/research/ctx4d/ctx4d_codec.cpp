@@ -5,7 +5,7 @@
 //          -> inverse RCT. Streams 0..7 Y, 8..15 shared by U and V.
 // Unit (one FSE run per stream): whole bands, at least 256 compute blocks of 128 x 16 px (W = 2048: 16 bands).
 // Format "C4D1": var W, var H, then per unit and stream: var n, payload (mode u8: 0 raw u16, 1 rle var, 6 FSE4 var c).
-// usage:  ctx4d_codec c in.ppm out.c4d groups.csv | d in.c4d out.ppm groups.csv | bench groups.csv a.ppm|dir ... [-r N] [-max N] [-cb N]
+// usage:  ctx4d_codec c in.ppm out.c4d groups.csv | d in.c4d out.ppm groups.csv | bench groups.csv a.ppm|dir ... [-r N] [-max N] [-cb N] [-planes]
 #define CTX4D_LANES 16                       // the format: bands of 16 rows
 #define CTX4D_NO_MAIN
 #include "ctx4d_vec.cpp"
@@ -119,7 +119,7 @@ static size_t get_stream(In& in, UBuf<uint16_t>& dst) {
 static size_t CHUNK = 65536; static const size_t SLACK = 4096;   // -cb N: flush threshold (symbols in one stream)   // a block range adds <= (128 + 2 LN) * 16 symbols per plane
 static double msnow() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-static std::vector<uint8_t> encode(const uint8_t* rgb, int W, int H, Times& tm) {
+static std::vector<uint8_t> encode_planes(const uint8_t* rgb, int W, int H, Times& tm) {
     g_tm = &tm;
     const size_t N = (size_t)W * H; static UBuf<int16_t> P[3]; static UBuf<uint16_t> pk; for (auto& q : P) q.need(N); pk.need(N * 3);
     double t0 = msnow();
@@ -173,6 +173,100 @@ static std::vector<uint8_t> encode(const uint8_t* rgb, int W, int H, Times& tm) 
     return o.b;
 }
 
+// ---------------- fused block encoder: one pass per compute block (128 x 16) in L1 ----------------
+// Band of 16 rows; block bx covers, in row k, the columns [x0 - k, x0 + 128 - k) (a parallelogram: the error axis
+// needs the z of the top-right neighbour, which then is already computed one row up). Per row segment: RGB -> RCT
+// into the band buffer, context + symbol into packed (z << 4 | stream) and z; after the block the complete wave steps
+// t < x0 + 128 go into the streams, then the flush check. Same symbols, order and chunks as encode_planes.
+static inline V vsplat(int x) { return splat(x); }
+template <int SH>
+static void ctx_seg(const int16_t* Pc, const int16_t* Pu, const int16_t* Zu, int16_t* Zc, uint16_t* Kc, int xs, int xe, int W, int t, bool top) {
+    const V e0 = splat(EDGE[t][0] - 1), e1 = splat(EDGE[t][1] - 1), e2 = splat(EDGE[t][2] - 1), v0 = splat(VT[t][0] - 1), v1 = splat(VT[t][1] - 1);
+    const V one = splat(1), c24 = splat(24), c9 = splat(9), sb = splat(t * 8), lanes = iota(1), zero = splat(0);
+    const uint8_t* Gt = G[t];
+    for (int x = xs; x < xe; x += NL) {
+        V vx = ld(Pc + x), va = ld(Pc + x - 1), vb = ld(Pu + x), vc = ld(Pu + x - 1), vd = ld(Pu + x + 1);
+        V zl = ld(Zu + x - 1), zc = ld(Zu + x), zr = ld(Zu + x + 1);
+        if (top) { vb = zero; vc = zero; vd = zero; zl = zero; zc = zero; zr = zero; }          // image row 0
+        if (x == 0 || x + NL > W - 1) {                                       // border lanes: x = 0: a = c = b, zl = 0; x = W-1: d = b, zr = 0
+            V xv = splat(x) + lanes, m0 = xv == zero, mr = xv == splat(W - 1);
+            va = vsel(m0, vb, va); vc = vsel(m0, vb, vc); zl = zl & ~m0; vd = vsel(mr, vb, vd); zr = zr & ~mr;
+        }
+        V ga = vc - va, gb = vc - vb, gd = vd - vb;
+        V qa = q7v(ga, e0, e1, e2), qb = q7v(gb, e0, e1, e2), qd = q7v(gd, e0, e1, e2);
+        V sec = qb + c24 - ((qa << 3) - qa);
+        V vv = vmax(vmax(zl, zc), zr);
+        V lev = -((V)(vv > v0) + (V)(vv > v1));
+        V cell = (sec << 4) + (sec << 2) + sec + qd + qd + qd + lev + c9;
+        alignas(64) int16_t ca[CTX4D_LANES], ga16[CTX4D_LANES]; st(ca, cell);
+        for (int i = 0; i < NL; i++) ga16[i] = Gt[ca[i]];
+        V grp = ld(ga16);
+        V f = vmin(vmax(ga + gb, vmin(ga, gb)), vmax(ga, gb));
+        V sgb = (V)(gb < 0) - (V)(gb > 0), s = (ga + ga + sgb) | one;
+        V e = vnegif(vx - vc + f, s);
+        e = (V)(e << SH) >> SH;
+        V z = (e + e) ^ (e >> 15);
+        st(Zc + x, z); st((int16_t*)Kc + x, (z << 4) | (sb + grp));
+    }
+}
+static std::vector<uint8_t> encode_fused(const uint8_t* rgb, int W, int H, Times& tm) {
+    g_tm = &tm;
+    const int T = W + 2 * (LN - 1), PADL = 32, STR = W + 2 * PADL + NL;      // band rows: index -1 .. 15, halo left/right
+    static UBuf<int16_t> Pb[3], Zb[3]; static UBuf<uint16_t> Kb[3];
+    for (int k = 0; k < 3; k++) { Pb[k].need((size_t)STR * (LN + 1)); Zb[k].need((size_t)STR * (LN + 1)); Kb[k].need((size_t)STR * LN); }
+    auto P = [&](int k, int r) { return Pb[k].data() + (size_t)(r + 1) * STR + PADL; };   // r = -1 .. 15
+    auto Z = [&](int k, int r) { return Zb[k].data() + (size_t)(r + 1) * STR + PADL; };
+    auto K = [&](int k, int r) { return Kb[k].data() + (size_t)r * STR + PADL; };
+    for (int k = 0; k < 3; k++) { memset(Pb[k].data(), 0, (size_t)STR * 2); memset(Zb[k].data(), 0, (size_t)STR * 2); }   // row -1 of band 0
+    Out o; o.raw("C4D2", 4); o.var(W); o.var(H);
+    static UBuf<uint16_t> sb[24], cat; for (auto& q : sb) q.need(CHUNK + SLACK); cat.need(2 * (CHUNK + SLACK));
+    uint16_t* wp[24]; for (int i = 0; i < 24; i++) wp[i] = sb[i].data();
+    std::vector<uint8_t> tmp; long steps = 0;
+    auto flush = [&]() {
+        double f0 = msnow(); o.var((uint64_t)steps);
+        for (int g = 0; g < 8; g++) put_stream(o, sb[g].data(), wp[g] - sb[g].data(), 256, tmp);
+        for (int g = 0; g < 8; g++) { size_t nu = wp[8 + g] - sb[8 + g].data(), nv = wp[16 + g] - sb[16 + g].data();
+            memcpy(cat.data(), sb[8 + g].data(), nu * 2); memcpy(cat.data() + nu, sb[16 + g].data(), nv * 2); put_stream(o, cat.data(), nu + nv, 512, tmp); }
+        for (int i = 0; i < 24; i++) wp[i] = sb[i].data(); steps = 0; tm.fse += msnow() - f0;
+    };
+    for (int y0 = 0; y0 < H; y0 += LN) {
+        const int rows = std::min(LN, H - y0); int tdone = 0;
+        const int nblk = (W + 127) / 128;
+        for (int bx = 0; bx < nblk; bx++) {
+            const int x0 = bx * 128; const bool last = bx == nblk - 1;
+            double b0 = msnow();
+            for (int r = 0; r < rows; r++) {
+                const int xs = bx ? x0 - r : 0, xe = last ? W : x0 + 128 - r;
+                const uint8_t* src = rgb + ((size_t)(y0 + r) * W) * 3;
+                int16_t *Y = P(0, r), *U = P(1, r), *Vv = P(2, r);
+                for (int x = xs; x < xe; x++) { int R = src[3 * x], Gc = src[3 * x + 1], B = src[3 * x + 2]; Y[x] = (int16_t)((R + 2 * Gc + B) >> 2); U[x] = (int16_t)(B - Gc); Vv[x] = (int16_t)(R - Gc); }
+                const bool top = y0 + r == 0;
+                ctx_seg<8>(P(0, r), P(0, r - 1), Z(0, r - 1), Z(0, r), K(0, r), xs, xe, W, 0, top);
+                ctx_seg<7>(P(1, r), P(1, r - 1), Z(1, r - 1), Z(1, r), K(1, r), xs, xe, W, 1, top);
+                ctx_seg<7>(P(2, r), P(2, r - 1), Z(2, r - 1), Z(2, r), K(2, r), xs, xe, W, 1, top);
+            }
+            double b1 = msnow();
+            const int tf = last ? T : x0 + 128;
+            for (int k = 0; k < 3; k++) {
+                uint16_t** w = wp + k * 8; const uint16_t* rp[LN]; for (int l = 0; l < LN; l++) rp[l] = K(k, std::min(l, rows - 1)) - 2 * l;
+                for (int t = tdone; t < tf; t++) {
+                    if (rows == LN && t >= 2 * (LN - 1) && t < W) { for (int l = 0; l < LN; l++) { uint16_t p = rp[l][t]; *w[p & 7]++ = uint16_t(p >> 4); } }
+                    else for (int l = 0; l < rows; l++) { int x = t - 2 * l; if (x < 0 || x >= W) continue; uint16_t p = rp[l][t]; *w[p & 7]++ = uint16_t(p >> 4); }
+                }
+            }
+            steps += tf - tdone; tdone = tf; double b2 = msnow(); tm.ctx += b1 - b0; tm.scat += b2 - b1;
+            bool full = false;
+            for (int g = 0; g < 8; g++) full |= size_t(wp[g] - sb[g].data()) >= CHUNK || size_t((wp[8 + g] - sb[8 + g].data()) + (wp[16 + g] - sb[16 + g].data())) >= CHUNK;
+            if (full) flush();
+        }
+        for (int k = 0; k < 3; k++) { memcpy(P(k, -1) - PADL, P(k, rows - 1) - PADL, (size_t)STR * 2); memcpy(Z(k, -1) - PADL, Z(k, rows - 1) - PADL, (size_t)STR * 2); }
+    }
+    if (steps) flush();
+    return o.b;
+}
+static bool g_planes = false;                                                  // -planes: the old per-plane encoder
+static std::vector<uint8_t> encode(const uint8_t* rgb, int W, int H, Times& tm) { return g_planes ? encode_planes(rgb, W, H, tm) : encode_fused(rgb, W, H, tm); }
+
 template <class PD> static void run_steps(PD& pd, int& band, int& t, long rem, double& tend) {
     while (rem > 0) {
         if (t == 0) pd.begin(band * LN);
@@ -219,10 +313,11 @@ static std::vector<uint8_t> read_file(const char* f) { std::vector<uint8_t> b; F
 
 #ifndef CTX4D_CODEC_NO_MAIN
 int main(int argc, char** argv) {
-    if (argc < 3) { fprintf(stderr, "usage: %s c in.ppm out.c4d groups.csv | d in.c4d out.ppm groups.csv | bench groups.csv a.ppm|dir ... [-r N] [-max N] [-cb N]\n", argv[0]); return 1; }
+    if (argc < 3) { fprintf(stderr, "usage: %s c in.ppm out.c4d groups.csv | d in.c4d out.ppm groups.csv | bench groups.csv a.ppm|dir ... [-r N] [-max N] [-cb N] [-planes]\n", argv[0]); return 1; }
     std::string cmd = argv[1];
     try {
         if (cmd == "c" && argc >= 5) {
+            if (argc >= 6 && !strcmp(argv[5], "-planes")) g_planes = true;
             if (!load_groups(argv[4])) { fprintf(stderr, "bad groups CSV\n"); return 1; }
             std::vector<uint8_t> rgb; int W, H; if (!read_ppm(argv[2], rgb, W, H)) { fprintf(stderr, "need a binary P6 PPM (8 bit)\n"); return 1; }
             Times tm; auto b = encode(rgb.data(), W, H, tm); FILE* fp = fopen(argv[3], "wb"); fwrite(b.data(), 1, b.size(), fp); fclose(fp);
@@ -240,6 +335,7 @@ int main(int argc, char** argv) {
                 if (!strcmp(argv[i], "-r") && i + 1 < argc) { reps = atoi(argv[++i]); continue; }
                 if (!strcmp(argv[i], "-max") && i + 1 < argc) { mx = atoi(argv[++i]); continue; }
                 if (!strcmp(argv[i], "-cb") && i + 1 < argc) { CHUNK = (size_t)atol(argv[++i]); continue; }
+                if (!strcmp(argv[i], "-planes")) { g_planes = true; continue; }
                 if (std::filesystem::is_directory(argv[i])) {                 // a folder: its *.ppm / *.pnm, sorted
                     std::vector<std::string> d;
                     for (auto& e : std::filesystem::directory_iterator(argv[i])) { auto x = e.path().extension().string();

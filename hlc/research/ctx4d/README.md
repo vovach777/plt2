@@ -149,3 +149,11 @@ Edge blocks absorb the remainder (last column up to 255 wide, last row up to 127
 right column, bottom row, corner), all through the same SIMD decoder (lanes = blocks, unused lanes idle):
 6.0688 bpp (wave 6.0081, +1.0 %), encoder 234 MB/s (wave 239), decoder 233 MB/s (wave 257, HLC5 316);
 decode core over all pixels 8.13 ns/px AVX2 / 7.72 SSE (edge groups run with fewer lanes and wider rows).
+
+### Fused block encoder (default; `-planes` = the old per-plane passes)
+
+Per compute block 128 x 16 in one pass: RGB -> RCT -> context + symbol -> wave scatter of the complete steps,
+then the flush check; the block is a parallelogram (row k: columns x0 - k .. x0 + 127 - k) so the top-right z of
+the error axis is already computed. Output byte-identical to `-planes` (26 files incl. edge sizes).
+Sandbox (L2 4 MB, L3 480 MB: every plane fits in cache, memory effects invisible): no gain, fused 235 vs 242 MB/s
+(AVX2), 212 vs 211 (SSE); 48 Mpx the same. The real test is a small-cache machine (Ivy: L2 256 KB, L3 6 MB).
