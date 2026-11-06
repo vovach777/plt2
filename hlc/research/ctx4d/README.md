@@ -116,3 +116,17 @@ First numbers (sandbox Xeon, clang, AVX2, 1 thread) on the 18 photos + cat + 12 
 5.9822 bpp vs HLC5 (-5 -cb 65536) 6.0093 (-0.45 %; photos -0.3 .. -1.9 %, smooth images +0.2 .. +1.6 %);
 encoder 203 vs 201 MB/s, decoder 271 vs 316 MB/s. ns/px: enc RCT 0.42, context 4.0, wave scatter (scalar) 5.7,
 FSE 4.3; dec FSE 3.6, wave 6.2, inverse RCT 0.9.
+
+### C4D2: block-wise flush, no plane interleave (sandbox Xeon, clang, AVX2, 20 images)
+
+Symbols of each compute block (128 x 16) go into staging streams (Y g, U g, V g); after a block, when one stream
+(Y g, or U g + V g) holds >= CHUNK symbols, everything is flushed. The chunk boundary is a wave step (header: number
+of steps), the decoder continues the wave across it, also mid-band. Inside a chunk: Y, then U, then V.
+Raw (uninitialised) buffers, scatter through plain pointers, histograms in a separate 4-way pass.
+
+encoder 240 MB/s (HLC5 201), decoder 254 MB/s (HLC5 316). ns/px: enc RCT 0.44, context 3.15, wave scatter 4.30,
+FSE 4.52 (histograms 1.33); dec FSE 3.76 (tables 0.43), wave 7.27 (steps 6.50, unskew 0.77), inverse RCT 0.79.
+
+| -cb (flush threshold) | 32K | 64K | 128K | 256K | 1M |
+|---|---|---|---|---|---|
+| bpp | 6.0380 | 6.0081 | 5.9885 | **5.9822** | 5.9936 |

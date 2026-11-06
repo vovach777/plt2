@@ -5,13 +5,14 @@
 //          -> inverse RCT. Streams 0..7 Y, 8..15 shared by U and V.
 // Unit (one FSE run per stream): whole bands, at least 256 compute blocks of 128 x 16 px (W = 2048: 16 bands).
 // Format "C4D1": var W, var H, then per unit and stream: var n, payload (mode u8: 0 raw u16, 1 rle var, 6 FSE4 var c).
-// usage:  ctx4d_codec c in.ppm out.c4d groups.csv | d in.c4d out.ppm groups.csv | bench groups.csv a.ppm|dir ... [-r N] [-max N] [-s]
+// usage:  ctx4d_codec c in.ppm out.c4d groups.csv | d in.c4d out.ppm groups.csv | bench groups.csv a.ppm|dir ... [-r N] [-max N] [-cb N]
 #define CTX4D_LANES 16                       // the format: bands of 16 rows
 #define CTX4D_NO_MAIN
 #include "ctx4d_vec.cpp"
 #include <stdexcept>
 #include <string>
 #include <filesystem>
+#include <memory>
 #include <algorithm>
 extern "C" {
 #define FSE_STATIC_LINKING_ONLY
@@ -28,6 +29,7 @@ struct In { const uint8_t* p; const uint8_t* e;
 
 struct Times { double rct = 0, ctx = 0, scat = 0, fse = 0, dfse = 0, dwave = 0, irct = 0, hist = 0, dstep = 0, dend = 0, dtab = 0; };
 static Times* g_tm = nullptr;
+static double msnow();
 // ---------------- FSE4 (copied from hlc.cpp: 4 interleaved states, one bitstream, own decoder) ----------------
 static size_t fse4_enc(uint8_t* dst, size_t cap, const uint16_t* s, size_t n, unsigned mx, const unsigned* cnt) {
     const unsigned tcap = std::min(12u, std::max(9u, bw(uint32_t(n)) - 1 - 4));
@@ -60,7 +62,6 @@ static size_t fse4_enc(uint8_t* dst, size_t cap, const uint16_t* s, size_t n, un
     for (size_t k = L; k-- > 0;) FSE_flushCState(&bc, &st[k]);
     size_t c = BIT_closeCStream(&bc); return c ? h + c : 0;
 }
-static double msnow();
 static void fse4_dec(uint16_t* out, size_t n, const uint8_t* src, size_t c) {
     double tb0 = msnow();
     short norm[1024]; unsigned mx = 1023, tl;
@@ -82,11 +83,15 @@ static void fse4_dec(uint16_t* out, size_t n, const uint8_t* src, size_t c) {
     BIT_reloadDStream(&bd); for (size_t k = 0; i < n; ++i, ++k) { uint32_t e = t[st[k]]; out[i] = uint16_t(e >> 20); st[k] = (e & 0xffff) + uint32_t(BIT_readBits(&bd, (e >> 16) & 15)); }
 #undef C4_DEC1
 }
-static double msnow();
-static void put_stream(Out& o, const uint16_t* s, size_t n, std::vector<uint8_t>& tmp, unsigned A) {
+template <class T> struct UBuf {                                             // uninitialised growable buffer
+    std::unique_ptr<T[]> p; size_t n = 0;
+    void need(size_t m) { if (m > n) { p.reset(new T[m]); n = m; } }
+    T* data() { return p.get(); }
+};
+static void put_stream(Out& o, const uint16_t* s, size_t n, unsigned A, std::vector<uint8_t>& tmp) {
     o.var(n); if (!n) return;
     double h0 = msnow();
-    static unsigned cnt[512], c4[4][512]; memset(c4, 0, sizeof c4); unsigned mx = 0; size_t i = 0;
+    static unsigned cnt[512], c4[4][512]; memset(c4, 0, sizeof c4); unsigned mx = 0; size_t i = 0;   // 4 sub-histograms
     for (; i + 4 <= n; i += 4) { c4[0][s[i]]++; c4[1][s[i + 1]]++; c4[2][s[i + 2]]++; c4[3][s[i + 3]]++; }
     for (; i < n; ++i) c4[0][s[i]]++;
     for (unsigned v = 0; v < A; ++v) { cnt[v] = c4[0][v] + c4[1][v] + c4[2][v] + c4[3][v]; if (cnt[v]) mx = v; }
@@ -96,75 +101,110 @@ static void put_stream(Out& o, const uint16_t* s, size_t n, std::vector<uint8_t>
     if (!c || c >= n * 2) { o.u8(0); o.raw(s, n * 2); return; }
     o.u8(6); o.var(c); o.raw(tmp.data(), c);
 }
-static size_t get_stream(In& in, std::vector<uint16_t>& dst) {
-    size_t n = in.var(); dst.resize(n + 2); if (!n) return 0;
+static size_t get_stream(In& in, UBuf<uint16_t>& dst) {
+    size_t n = in.var(); dst.need(n + 2); if (!n) return 0;
     uint8_t mode = in.u8();
-    if (mode == 1) { uint16_t v = uint16_t(in.var()); std::fill(dst.begin(), dst.begin() + n, v); }
+    if (mode == 1) { uint16_t v = uint16_t(in.var()); std::fill(dst.data(), dst.data() + n, v); }
     else if (mode == 0) memcpy(dst.data(), in.take(n * 2), n * 2);
     else if (mode == 6) { size_t c = in.var(); fse4_dec(dst.data(), n, in.take(c), c); }
     else throw std::runtime_error("stream mode");
     return n;
 }
 
-static bool g_serial = false;                 // -s: planes one after another inside a unit (no interleave)
-static int bands_per_unit(int W) { int bpb = (W + 127) / 128; return std::max(1, (256 + bpb - 1) / bpb); }
+// Chunking: the symbols of one compute block (128 x 16 px) are put into the streams; after the block, if one stream
+// (Y g, or U g + V g: they share stream 8 + g) holds >= CHUNK symbols, every stream is flushed. The chunk boundary is a
+// wave step: after block x0..x0+127 of a band all steps t < x0 + 128 are complete (pixel x = t - 2k <= x0 + 127), the
+// last block of a band completes the band. Chunk header: var number of wave steps (global step = band * T + t).
+// Inside a chunk the planes are not interleaved: Y, then U, then V (streams 8..15 = U symbols, then V symbols).
+static size_t CHUNK = 65536; static const size_t SLACK = 4096;   // -cb N: flush threshold (symbols in one stream)   // a block range adds <= (128 + 2 LN) * 16 symbols per plane
 static double msnow() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 static std::vector<uint8_t> encode(const uint8_t* rgb, int W, int H, Times& tm) {
     g_tm = &tm;
-    size_t N = (size_t)W * H; std::vector<int16_t> P[3]; for (auto& p : P) p.resize(N);
+    const size_t N = (size_t)W * H; static UBuf<int16_t> P[3]; static UBuf<uint16_t> pk; for (auto& q : P) q.need(N); pk.need(N * 3);
     double t0 = msnow();
-    for (size_t i = 0; i < N; i++) { int R = rgb[3 * i], Gc = rgb[3 * i + 1], B = rgb[3 * i + 2]; P[0][i] = (int16_t)((R + 2 * Gc + B) >> 2); P[1][i] = (int16_t)(B - Gc); P[2][i] = (int16_t)(R - Gc); }
+    int16_t *P0 = P[0].data(), *P1 = P[1].data(), *P2 = P[2].data();
+    for (size_t i = 0; i < N; i++) { int R = rgb[3 * i], Gc = rgb[3 * i + 1], B = rgb[3 * i + 2]; P0[i] = (int16_t)((R + 2 * Gc + B) >> 2); P1[i] = (int16_t)(B - Gc); P2[i] = (int16_t)(R - Gc); }
     double t1 = msnow();
-    std::vector<uint16_t> pk(N * 3);
-    encode_plane_vec<8>(P[0].data(), pk.data(), W, H, 0); encode_plane_vec<7>(P[1].data(), pk.data() + N, W, H, 1); encode_plane_vec<7>(P[2].data(), pk.data() + 2 * N, W, H, 2);
+    encode_plane_vec<8>(P0, pk.data(), W, H, 0); encode_plane_vec<7>(P1, pk.data() + N, W, H, 1); encode_plane_vec<7>(P2, pk.data() + 2 * N, W, H, 2);
     double t2 = msnow(); tm.rct += t1 - t0; tm.ctx += t2 - t1;
-    Out o; o.raw("C4D1", 4); o.var(W); o.var(H);
-    const int BU = bands_per_unit(W) * LN; std::vector<uint16_t> st[16]; std::vector<uint8_t> tmp;
-    for (int u0 = 0; u0 < H; u0 += BU) {
-        double s0 = msnow();
-        for (auto& v : st) v.clear();
-        auto put = [&](int k, int y0, int t) { const uint16_t* pl = pk.data() + k * N;
-            for (int l = 0; l < LN; l++) { int x = t - 2 * l, y = y0 + l; if (x < 0 || x >= W || y >= H) continue;
-                uint16_t p = pl[(size_t)y * W + x]; st[p & 15].push_back(p >> 4); } };
-        if (g_serial) { for (int k = 0; k < 3; k++) for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) for (int t = 0; t < W + 2 * (LN - 1); t++) put(k, y0, t); }
-        else for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) for (int t = 0; t < W + 2 * (LN - 1); t++) for (int k = 0; k < 3; k++) put(k, y0, t);
-        double s1 = msnow();
-        for (int s = 0; s < 16; s++) put_stream(o, st[s].data(), st[s].size(), tmp, s < 8 ? 256 : 512);
-        tm.scat += s1 - s0; tm.fse += msnow() - s1;
+    Out o; o.raw("C4D2", 4); o.var(W); o.var(H);
+    const int T = W + 2 * (LN - 1);
+    static UBuf<uint16_t> sb[24], cat;                                       // staging: Y g, U g, V g
+    for (auto& q : sb) q.need(CHUNK + SLACK); cat.need(2 * (CHUNK + SLACK));
+    uint16_t* wp[24]; for (int i = 0; i < 24; i++) wp[i] = sb[i].data();
+    std::vector<uint8_t> tmp; long steps = 0;
+    auto flush = [&]() {
+        double f0 = msnow();
+        o.var((uint64_t)steps);
+        for (int g = 0; g < 8; g++) put_stream(o, sb[g].data(), wp[g] - sb[g].data(), 256, tmp);
+        for (int g = 0; g < 8; g++) {
+            size_t nu = wp[8 + g] - sb[8 + g].data(), nv = wp[16 + g] - sb[16 + g].data();
+            memcpy(cat.data(), sb[8 + g].data(), nu * 2); memcpy(cat.data() + nu, sb[16 + g].data(), nv * 2);
+            put_stream(o, cat.data(), nu + nv, 512, tmp);
+        }
+        for (int i = 0; i < 24; i++) wp[i] = sb[i].data();
+        steps = 0; tm.fse += msnow() - f0;
+    };
+    for (int y0 = 0; y0 < H; y0 += LN) {
+        const int rows = std::min(LN, H - y0); int tdone = 0;
+        for (int x0 = 0; x0 < W; x0 += 128) {
+            const int tf = x0 + 128 >= W ? T : x0 + 128;
+            double s0 = msnow();
+            for (int k = 0; k < 3; k++) {
+                const uint16_t* pl = pk.data() + k * N; uint16_t** w = wp + k * 8;
+                const uint16_t* rp[LN]; for (int l = 0; l < LN; l++) rp[l] = pl + (size_t)(y0 + std::min(l, rows - 1)) * W - 2 * l;
+                for (int t = tdone; t < tf; t++) {
+                    if (rows == LN && t >= 2 * (LN - 1) && t < W) {           // interior: all 16 lanes inside the image
+                        for (int l = 0; l < LN; l++) { uint16_t p = rp[l][t]; *w[p & 7]++ = uint16_t(p >> 4); }
+                    } else {
+                        for (int l = 0; l < rows; l++) { int x = t - 2 * l; if (x < 0 || x >= W) continue;
+                            uint16_t p = rp[l][t]; *w[p & 7]++ = uint16_t(p >> 4); }
+                    }
+                }
+            }
+            steps += tf - tdone; tdone = tf; tm.scat += msnow() - s0;
+            bool full = false;
+            for (int g = 0; g < 8; g++) full |= size_t(wp[g] - sb[g].data()) >= CHUNK || size_t((wp[8 + g] - sb[8 + g].data()) + (wp[16 + g] - sb[16 + g].data())) >= CHUNK;
+            if (full) flush();
+        }
     }
+    if (steps) flush();
     return o.b;
 }
 
+template <class PD> static void run_steps(PD& pd, int& band, int& t, long rem, double& tend) {
+    while (rem > 0) {
+        if (t == 0) pd.begin(band * LN);
+        long run = std::min<long>(rem, pd.T - t);
+        for (long i = 0; i < run; i++) pd.step(t + (int)i);
+        t += (int)run; rem -= run;
+        if (t == pd.T) { double e0 = msnow(); pd.end(band * LN); tend += msnow() - e0; band++; t = 0; }
+    }
+}
 static void decode(const uint8_t* buf, size_t len, std::vector<uint8_t>& rgb, int& W, int& H, Times& tm) {
     g_tm = &tm;
-    In in{buf, buf + len}; if (len < 4 || memcmp(in.take(4), "C4D1", 4)) throw std::runtime_error("not C4D1");
-    W = (int)in.var(); H = (int)in.var(); size_t N = (size_t)W * H;
-    std::vector<int16_t> D[3]; for (auto& d : D) d.resize(N);
+    In in{buf, buf + len}; if (len < 4 || memcmp(in.take(4), "C4D2", 4)) throw std::runtime_error("not C4D2");
+    W = (int)in.var(); H = (int)in.var(); const size_t N = (size_t)W * H;
+    static UBuf<int16_t> D[3]; for (auto& d : D) d.need(N);
     pdY.init(D[0].data(), W, H, 0, nullptr, nullptr, nullptr); pdU.init(D[1].data(), W, H, 1, nullptr, nullptr, nullptr); pdV.init(D[2].data(), W, H, 2, nullptr, nullptr, nullptr);
-    std::vector<uint16_t> sb[16]; const uint16_t *SY[8], *SUV[8];
+    static UBuf<uint16_t> sb[16]; const uint16_t *SY[8], *SUV[8];
     pdY.Sp = SY; pdU.Sp = SUV; pdV.Sp = SUV;                                   // U and V share streams 8..15
-    const int BU = bands_per_unit(W) * LN;
-    for (int u0 = 0; u0 < H; u0 += BU) {
+    const long total = (long)((H + LN - 1) / LN) * pdY.T; long done = 0;
+    int bY = 0, tY = 0, bU = 0, tU = 0, bV = 0, tV = 0; double tend = 0;
+    while (done < total) {
         double f0 = msnow();
+        long steps = (long)in.var(); if (steps <= 0 || done + steps > total) throw std::runtime_error("chunk steps");
         for (int s = 0; s < 16; s++) get_stream(in, sb[s]);
         for (int g = 0; g < 8; g++) { SY[g] = sb[g].data(); SUV[g] = sb[8 + g].data(); }
         double f1 = msnow();
-        if (g_serial) {
-            double se = 0;
-            for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) { pdY.begin(y0); for (int t = 0; t < pdY.T; t++) pdY.step(t); double e0 = msnow(); pdY.end(y0); se += msnow() - e0; }
-            for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) { pdU.begin(y0); for (int t = 0; t < pdU.T; t++) pdU.step(t); double e0 = msnow(); pdU.end(y0); se += msnow() - e0; }
-            for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) { pdV.begin(y0); for (int t = 0; t < pdV.T; t++) pdV.step(t); double e0 = msnow(); pdV.end(y0); se += msnow() - e0; }
-            tm.dend += se;
-        } else for (int y0 = u0; y0 < std::min(H, u0 + BU); y0 += LN) {
-            pdY.begin(y0); pdU.begin(y0); pdV.begin(y0);
-            for (int t = 0; t < pdY.T; t++) { pdY.step(t); pdU.step(t); pdV.step(t); }
-            pdY.end(y0); pdU.end(y0); pdV.end(y0);
-        }
-        tm.dfse += f1 - f0; tm.dwave += msnow() - f1;
+        run_steps(pdY, bY, tY, steps, tend); run_steps(pdU, bU, tU, steps, tend); run_steps(pdV, bV, tV, steps, tend);
+        done += steps; tm.dfse += f1 - f0; tm.dwave += msnow() - f1;
     }
+    tm.dend += tend;
     double r0 = msnow(); rgb.resize(N * 3);
-    for (size_t i = 0; i < N; i++) { int Y = D[0][i], U = D[1][i], V2 = D[2][i], Gc = Y - ((U + V2) >> 2);
+    const int16_t *D0 = D[0].data(), *D1 = D[1].data(), *D2 = D[2].data();
+    for (size_t i = 0; i < N; i++) { int Y = D0[i], U = D1[i], V2 = D2[i], Gc = Y - ((U + V2) >> 2);
         rgb[3 * i] = (uint8_t)(V2 + Gc); rgb[3 * i + 1] = (uint8_t)Gc; rgb[3 * i + 2] = (uint8_t)(U + Gc); }
     tm.irct += msnow() - r0;
 }
@@ -178,7 +218,7 @@ static std::vector<uint8_t> read_file(const char* f) { std::vector<uint8_t> b; F
     fseek(fp, 0, SEEK_END); b.resize(ftell(fp)); fseek(fp, 0, SEEK_SET); if (fread(b.data(), 1, b.size(), fp) != b.size()) b.clear(); fclose(fp); return b; }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { fprintf(stderr, "usage: %s c in.ppm out.c4d groups.csv | d in.c4d out.ppm groups.csv | bench groups.csv a.ppm|dir ... [-r N] [-max N] [-s]\n", argv[0]); return 1; }
+    if (argc < 3) { fprintf(stderr, "usage: %s c in.ppm out.c4d groups.csv | d in.c4d out.ppm groups.csv | bench groups.csv a.ppm|dir ... [-r N] [-max N] [-cb N]\n", argv[0]); return 1; }
     std::string cmd = argv[1];
     try {
         if (cmd == "c" && argc >= 5) {
@@ -198,7 +238,7 @@ int main(int argc, char** argv) {
             for (int i = 3; i < argc; i++) {
                 if (!strcmp(argv[i], "-r") && i + 1 < argc) { reps = atoi(argv[++i]); continue; }
                 if (!strcmp(argv[i], "-max") && i + 1 < argc) { mx = atoi(argv[++i]); continue; }
-                if (!strcmp(argv[i], "-s")) { g_serial = true; continue; }
+                if (!strcmp(argv[i], "-cb") && i + 1 < argc) { CHUNK = (size_t)atol(argv[++i]); continue; }
                 if (std::filesystem::is_directory(argv[i])) {                 // a folder: its *.ppm / *.pnm, sorted
                     std::vector<std::string> d;
                     for (auto& e : std::filesystem::directory_iterator(argv[i])) { auto x = e.path().extension().string();
@@ -223,8 +263,8 @@ int main(int argc, char** argv) {
                 T.rct += bt.rct; T.ctx += bt.ctx; T.scat += bt.scat; T.fse += bt.fse; T.hist += bt.hist; T.dfse += bdt.dfse; T.dwave += bdt.dwave; T.irct += bdt.irct; T.dend += bdt.dend; T.dtab += bdt.dtab;
             }
             printf("TOTAL %zu files %.4f bpp  enc %.1f dec %.1f MB/s (image bytes)  %s\n", files.size(), 8.0 * tb / tpx, 3 * tpx / te / 1e3, 3 * tpx / td / 1e3, allok ? "all ok" : "MISMATCH");
-            printf("ns/px  enc: RCT %.2f  context+symbol %.2f  wave scatter %.2f  FSE %.2f (histogram %.2f, coding %.2f) | dec: FSE %.2f (tables %.2f, decoding %.2f)  wave %.2f (steps %.2f, unskew+top %.2f)  inverse RCT %.2f\n",
-                   T.rct * 1e6 / tpx, T.ctx * 1e6 / tpx, T.scat * 1e6 / tpx, T.fse * 1e6 / tpx, T.hist * 1e6 / tpx, (T.fse - T.hist) * 1e6 / tpx,
+            printf("ns/px  enc: RCT %.2f  context+symbol %.2f  wave scatter %.2f  FSE %.2f (histograms %.2f) | dec: FSE %.2f (tables %.2f, decoding %.2f)  wave %.2f (steps %.2f, unskew+top %.2f)  inverse RCT %.2f\n",
+                   T.rct * 1e6 / tpx, T.ctx * 1e6 / tpx, T.scat * 1e6 / tpx, T.fse * 1e6 / tpx, T.hist * 1e6 / tpx,
                    T.dfse * 1e6 / tpx, T.dtab * 1e6 / tpx, (T.dfse - T.dtab) * 1e6 / tpx, T.dwave * 1e6 / tpx, (T.dwave - T.dend) * 1e6 / tpx, T.dend * 1e6 / tpx, T.irct * 1e6 / tpx);
             return allok ? 0 : 2;
         }
