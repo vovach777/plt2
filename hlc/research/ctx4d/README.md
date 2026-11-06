@@ -130,3 +130,17 @@ FSE 4.52 (histograms 1.33); dec FSE 3.76 (tables 0.43), wave 7.27 (steps 6.50, u
 | -cb (flush threshold) | 32K | 64K | 128K | 256K | 1M |
 |---|---|---|---|---|---|
 | bpp | 6.0380 | 6.0081 | 5.9885 | **5.9822** | 5.9936 |
+
+### Experiment: independent 128 x 64 tiles, no wavefront (`ctx4d_tiles`)
+
+Each tile coded as a separate image (same 4-D context, tile borders = image borders). Decoder: 16 full tiles at once,
+lane = tile, raster inside the tile (no lane shifts, no border masks, two rows x 16 lanes in L1); partial tiles scalar.
+20 images, -cb 64K:
+
+| | bpp | full-tile decode core, ns/px (AVX2 / SSE) |
+|---|---|---|
+| C4D2 wavefront | 6.0081 | 7.27 (steps 6.50 + unskew 0.77) / 6.55 |
+| independent tiles | 6.0790 (+1.18 %) | 7.00 / 6.25 |
+
+The cheaper step (no shifts / masks) does not pay: the scalar stream reads per lane dominate both. Independent tiles
+cost ~1.2 % bits for ~4 % decoder core; their gain would be thread / random-access parallelism, not single-core speed.

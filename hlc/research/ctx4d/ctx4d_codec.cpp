@@ -217,6 +217,7 @@ static bool read_ppm(const char* f, std::vector<uint8_t>& rgb, int& W, int& H) {
 static std::vector<uint8_t> read_file(const char* f) { std::vector<uint8_t> b; FILE* fp = fopen(f, "rb"); if (!fp) return b;
     fseek(fp, 0, SEEK_END); b.resize(ftell(fp)); fseek(fp, 0, SEEK_SET); if (fread(b.data(), 1, b.size(), fp) != b.size()) b.clear(); fclose(fp); return b; }
 
+#ifndef CTX4D_CODEC_NO_MAIN
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s c in.ppm out.c4d groups.csv | d in.c4d out.ppm groups.csv | bench groups.csv a.ppm|dir ... [-r N] [-max N] [-cb N]\n", argv[0]); return 1; }
     std::string cmd = argv[1];
@@ -271,3 +272,4 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 3; }
     fprintf(stderr, "bad command\n"); return 1;
 }
+#endif
