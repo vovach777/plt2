@@ -42,3 +42,17 @@ foreach(t ctx4d_enc ctx4d_dec ctx4d_vec)
   set_target_properties(${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
                         RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR} RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR})
 endforeach()
+
+# prototype codec (ctx4d kernels + hlc's FSE4); needs fse_huf from palic-ctx (plt2 root, PLT_BUILD_PCTX)
+if(TARGET fse_huf)
+  add_executable(ctx4d_codec ctx4d_codec.cpp ctx4d_vec.cpp)
+  set_source_files_properties(ctx4d_vec.cpp PROPERTIES HEADER_FILE_ONLY ON)
+  target_link_libraries(ctx4d_codec PRIVATE fse_huf)
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    target_compile_options(ctx4d_codec PRIVATE /O2 -march=$<IF:$<BOOL:${PLT_ARCH}>,${PLT_ARCH},native> ${CTX4D_EXTRA})
+  else()
+    target_compile_options(ctx4d_codec PRIVATE -O3 -march=$<IF:$<BOOL:${PLT_ARCH}>,${PLT_ARCH},native> ${CTX4D_EXTRA})
+  endif()
+  set_target_properties(ctx4d_codec PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+                        RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR} RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR})
+endif()

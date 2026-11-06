@@ -102,3 +102,17 @@ By hand from this folder: `clang++ -O3 -march=native -std=c++17 ctx4d_dec.cpp -o
 
 Interleaving gives 10-20 % on AVX2/AVX-512 and nothing on SSE (the 256-bit ops are already two independent
 128-bit halves there): the step is now mostly throughput bound (instruction count), not latency bound.
+
+## ctx4d_codec — prototype codec (4-D context + FSE)
+
+`ctx4d_codec c in.ppm out.c4d groups.csv | d in.c4d out.ppm groups.csv | bench groups.csv a.ppm|dir ... [-r N] [-max N]`
+
+RCT -> context + symbol (vector kernel, raster) -> 16 streams in decoder order (band of 16 rows, step t = x + 2k,
+plane Y U V, lane; streams 0..7 Y, 8..15 shared by U and V) -> FSE4 (hlc's 4-state coder) per unit of whole bands
+>= 256 compute blocks of 128 x 16 px -> file. Decoder: FSE per unit, wavefront decode of the three planes in one t
+loop, inverse RCT. Built with the plt2 root (needs fse_huf).
+
+First numbers (sandbox Xeon, clang, AVX2, 1 thread) on the 18 photos + cat + 12 Mpx upscale:
+5.9822 bpp vs HLC5 (-5 -cb 65536) 6.0093 (-0.45 %; photos -0.3 .. -1.9 %, smooth images +0.2 .. +1.6 %);
+encoder 203 vs 201 MB/s, decoder 271 vs 316 MB/s. ns/px: enc RCT 0.42, context 4.0, wave scatter (scalar) 5.7,
+FSE 4.3; dec FSE 3.6, wave 6.2, inverse RCT 0.9.

@@ -173,7 +173,7 @@ template <int SH>
 struct PlaneDec {
     int W, H, k, t8, T;
     V e0, e1, e2, v0, v1, one, c24, c9, zero, lane2k, lanek, vW, vWm1, m1, lanes_ok, P1, Z1, Dp, Bp, Dz, Bz;
-    const uint8_t* Gt; const uint16_t* S8[8]; int16_t* out;
+    const uint8_t* Gt; const uint16_t* S8[8]; const uint16_t** Sp; int16_t* out;    // Sp: stream read pointers (own S8 or shared U/V)
 #ifdef CTX4D_VBMI
     GTab GT;
 #endif
@@ -185,7 +185,7 @@ struct PlaneDec {
         out = o; W = W_; H = H_; k = k_; t8 = k ? 1 : 0; T = W + 2 * (LN - 1);
         e0 = splat(EDGE[t8][0] - 1); e1 = splat(EDGE[t8][1] - 1); e2 = splat(EDGE[t8][2] - 1); v0 = splat(VT[t8][0] - 1); v1 = splat(VT[t8][1] - 1);
         one = splat(1); c24 = splat(24); c9 = splat(9); zero = splat(0); lane2k = iota(2); lanek = iota(1); vW = splat(W); vWm1 = splat(W - 1); m1 = splat(-1);
-        Gt = G[t8]; for (int g = 0; g < 8; g++) S8[g] = S[t8 * 8 + g];
+        Gt = G[t8]; for (int g = 0; g < 8; g++) S8[g] = S ? S[t8 * 8 + g] : nullptr; Sp = S8;
 #ifdef CTX4D_VBMI
         gtab_init(GT, Gt);
 #endif
@@ -232,7 +232,7 @@ struct PlaneDec {
 #else
         alignas(64) int16_t ca[CTX4D_LANES], va16[CTX4D_LANES], za[CTX4D_LANES];
         st(ca, cell); st(va16, valid);
-        for (int i = 0; i < NL; i++) za[i] = va16[i] ? (int16_t)*S8[Gt[ca[i]]]++ : 0;
+        for (int i = 0; i < NL; i++) za[i] = va16[i] ? (int16_t)*Sp[Gt[ca[i]]]++ : 0;
         V z = ld(za);
 #endif
         V f = vmin(vmax(ga + gb, vmin(ga, gb)), vmax(ga, gb));
@@ -277,6 +277,7 @@ static void decode_interleaved(DecIn* in, int W, int H) {                     //
     }
 }
 
+#ifndef CTX4D_NO_MAIN
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s image.ppm groups.csv [reps]\n", argv[0]); return 1; }
     if (!load_groups(argv[2])) { fprintf(stderr, "bad groups CSV\n"); return 1; }
@@ -335,3 +336,4 @@ int main(int argc, char** argv) {
            W, H, be * 1e6 / N, bad_e ? "FAIL" : "bit-exact", bd * 1e6 / N, bi * 1e6 / N, bad_d ? "FAIL" : "round trip OK");
     return bad_e || bad_d ? 2 : 0;
 }
+#endif
