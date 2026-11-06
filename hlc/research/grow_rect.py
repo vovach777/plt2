@@ -19,7 +19,7 @@ def grow(H,thr,rel,cap):
                     if (blk>=0).any(): continue
                     if cap and n+blk.size>cap: continue
                     dm=abs(H[c:e,a:b]-m).max() if MAXD else abs(H[c:e,a:b].mean()-m)
-                    if dm<=t and (best is None or dm<best[0]): best=(dm,d,a,b,c,e)
+                    if (dm<=t or n==1) and (best is None or dm<best[0]): best=(dm,d,a,b,c,e)
                 if best is None: break
                 _,d,a,b,c,e=best; rid[c:e,a:b]=r; s+=H[c:e,a:b].sum(); n+=(b-a)*(e-c)
                 x0,x1,y0,y1=min(x0,a),max(x1,b),min(y0,c),max(y1,e)
@@ -45,5 +45,5 @@ for thr,rel,cap in cfgs:
                 d.rectangle([x0*96+1,y0*96+1,min(x1*96,2*Ww)-2,min(y1*96,2*Hh)-2],outline=(255,255,255),width=3)
                 d.text((x0*96+8,y0*96+6),f'{m:.1f}',fill=(0,0,0)); d.text((x0*96+7,y0*96+5),f'{m:.1f}',fill=(255,255,255))
             d.rectangle([0,0,420,26],fill=(255,255,255)); d.text((8,8),f'{name}: {len(R)} rects, thr {thr}{"*H" if rel else ""}',fill=(0,0,0))
-            im.save(f'{S}/vis/c8/{name}_growmax_{tag}.png')
+            im.save(f'{S}/vis/c8/{name}_growf_{tag}.png')
     print(f'{(str(thr)+("*H" if rel else " abs")+(" cap14" if cap else "")):22s} {nreg:5d}  {nt/nreg:6.1f}     {100*(b/b1-1):+.2f}%    p05 {per["p05"]} p15 {per["p15"]} p12 {per["p12"]}')
