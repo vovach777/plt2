@@ -60,3 +60,19 @@ By hand from this folder: `clang++ -O3 -march=native -std=c++17 ctx4d_dec.cpp -o
   go through an aligned array (`store`, scalar loop, `load`).
 * clang lowers 256-bit vector types to SSE as well as SIMDe does; gcc 13 does not (same element loops as with SIMDe).
 * The encoder gap on AVX2 is the group lookup: the intrinsics version uses `vpgatherdd`.
+
+### AVX-512 (`ctx4d_vec`, lanes = 32 when `__AVX512BW__`, `-DCTX4D_LANES=16|32` to force), sandbox Xeon
+
+| build | encoder | decoder |
+|---|---|---|
+| clang -march=sapphirerapids, x32, VBMI group lookup | 2.23 | 6.98 |
+| g++ -march=sapphirerapids, x32, VBMI group lookup | 2.41 | 6.82 |
+| clang -march=skylake-avx512, x32, scalar group lookup | 3.72 | 7.17 |
+| clang -march=sapphirerapids, x16 | 2.99 | 7.26 |
+
+* Wider vectors alone do not help: both kernels carry a per-lane scalar part (group lookup in the encoder,
+  stream reads in the decoder) that grows with the lane count.
+* AVX-512 VBMI: the 1029-byte group table as 9 x 128 bytes in registers, `vpermi2b` by the low 7 bits of the cell
+  and a masked select by the high bits - no memory access.
+* The decoder needs the stream reads vectorised to gain from width (AVX-512: `vpconflictd` gives each lane the count
+  of earlier lanes in the same stream = its offset; then one gather and a per-stream pointer update).

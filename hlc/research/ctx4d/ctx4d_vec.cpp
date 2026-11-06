@@ -11,12 +11,24 @@
 #include <chrono>
 #include <algorithm>
 
-typedef int16_t  V  __attribute__((vector_size(32)));
-typedef uint16_t VU __attribute__((vector_size(32)));
+#include <utility>
+#if defined(__AVX512VBMI__)
+#include <immintrin.h>
+#endif
+#ifndef CTX4D_LANES
+  #if defined(__AVX512BW__)
+    #define CTX4D_LANES 32                       // 512-bit vectors
+  #else
+    #define CTX4D_LANES 16                       // 256-bit vectors (2 x 128 on SSE / NEON)
+  #endif
+#endif
+static const int NL = CTX4D_LANES;               // int16 lanes per vector = pixels per encoder step = rows per decoder band
+typedef int16_t  V  __attribute__((vector_size(2 * CTX4D_LANES)));
+typedef uint16_t VU __attribute__((vector_size(2 * CTX4D_LANES)));
 static const int EDGE[2][3] = {{1, 3, 10}, {1, 3, 7}};
 static const int VT[2][2]   = {{8, 32}, {3, 8}};
 static uint8_t G[2][1029];
-static const int LN = 16;
+static const int LN = NL;
 
 static bool load_groups(const char* path) {
     FILE* fp = fopen(path, "r"); if (!fp) return false;
@@ -81,10 +93,28 @@ static inline V q7v(V g, V e0, V e1, V e2) {                                    
     return vnegif(-nq, g);
 }
 // lane k <- v[k-1], lane 0 <- ins
-static inline V shl1(V v, int16_t ins) {
-    V w = splat(ins);                                                          // only w[0] is used
-    return __builtin_shufflevector(v, w, 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+template <size_t... I> static inline V shl1_(V v, V w, std::index_sequence<I...>) { return __builtin_shufflevector(v, w, NL, (int)I...); }
+static inline V shl1(V v, int16_t ins) { return shl1_(v, splat(ins), std::make_index_sequence<CTX4D_LANES - 1>{}); }
+#if defined(__AVX512VBMI__) && CTX4D_LANES == 32
+// group lookup in registers: 1029-byte table as 9 x 128 bytes, vpermi2b by the low 7 bits of the cell,
+// the high bits (0..8) pick the table slice: 9 vpermi2b + 9 compares + 9 masked moves per 32 cells, no memory gather
+struct GTab { __m512i a[9], b[9]; };
+static inline void gtab_init(GTab& T, const uint8_t* g) {
+    alignas(64) uint8_t buf[9 * 128] = {0}; memcpy(buf, g, 1029);
+    for (int j = 0; j < 9; j++) { T.a[j] = _mm512_load_si512(buf + 128 * j); T.b[j] = _mm512_load_si512(buf + 128 * j + 64); }
 }
+static inline V glookup(const GTab& T, V cell) {
+    __m512i c = (__m512i)cell;                                          // 32 x u16 cells
+    __m512i lo = _mm512_castsi256_si512(_mm512_cvtepi16_epi8(_mm512_and_si512(c, _mm512_set1_epi16(127))));
+    __m512i hi = _mm512_castsi256_si512(_mm512_cvtepi16_epi8(_mm512_srli_epi16(c, 7)));
+    __m512i r = _mm512_setzero_si512();
+    for (int j = 0; j < 9; j++)
+        r = _mm512_mask_mov_epi8(r, _mm512_cmpeq_epi8_mask(hi, _mm512_set1_epi8((char)j)), _mm512_permutex2var_epi8(T.a[j], lo, T.b[j]));
+    return (V)_mm512_cvtepu8_epi16(_mm512_castsi512_si256(r));
+}
+#define CTX4D_VBMI 1
+#endif
+static inline V iota(int mul) { alignas(64) int16_t a[CTX4D_LANES]; for (int i = 0; i < NL; i++) a[i] = (int16_t)(i * mul); return ld(a); }
 
 // ---------------- encoder kernel (raster, 16 px per step) ----------------
 template <int SH>
@@ -93,7 +123,10 @@ static void encode_plane_vec(const int16_t* __restrict P, uint16_t* __restrict o
     const V e0 = splat(EDGE[t][0] - 1), e1 = splat(EDGE[t][1] - 1), e2 = splat(EDGE[t][2] - 1), v0 = splat(VT[t][0] - 1), v1 = splat(VT[t][1] - 1);
     const V one = splat(1), c24 = splat(24), c9 = splat(9), sb = splat(t * 8);
     const uint8_t* Gt = G[t];
-    const int L = 32, Wp = (W + 15) & ~15, stride = Wp + 2 * L;
+#ifdef CTX4D_VBMI
+    GTab GT; gtab_init(GT, Gt);
+#endif
+    const int L = 2 * NL, Wp = (W + NL - 1) / NL * NL, stride = Wp + 2 * L;
     std::vector<int16_t> buf((size_t)stride * 4, 0);
     int16_t *Pu = buf.data() + L, *Pc = Pu + stride, *Zu = Pc + stride, *Zc = Zu + stride;
     for (int y = 0; y < H; y++) {
@@ -101,7 +134,7 @@ static void encode_plane_vec(const int16_t* __restrict P, uint16_t* __restrict o
         if (y == 0) { memset(Pu - 1, 0, (Wp + 2) * 2); memset(Zu - 1, 0, (Wp + 2) * 2); Pc[-1] = 0; }
         else { Pc[-1] = Pu[0]; Pu[-1] = Pu[0]; Pu[W] = Pu[W - 1]; Zu[-1] = 0; Zu[W] = 0; }
         uint16_t* orow = out + (size_t)y * W;
-        for (int x = 0; x < W; x += 16) {
+        for (int x = 0; x < W; x += NL) {
             V vx = ld(Pc + x), va = ld(Pc + x - 1), vb = ld(Pu + x), vc = ld(Pu + x - 1), vd = ld(Pu + x + 1);
             V ga = vc - va, gb = vc - vb, gd = vd - vb;
             V qa = q7v(ga, e0, e1, e2), qb = q7v(gb, e0, e1, e2), qd = q7v(gd, e0, e1, e2);
@@ -109,9 +142,13 @@ static void encode_plane_vec(const int16_t* __restrict P, uint16_t* __restrict o
             V vv = vmax(vmax(ld(Zu + x - 1), ld(Zu + x)), ld(Zu + x + 1));
             V lev = -((V)(vv > v0) + (V)(vv > v1));
             V cell = (sec << 4) + (sec << 2) + sec + qd + qd + qd + lev + c9;
-            alignas(32) int16_t ca[16], ga16[16];                                 // element loops through arrays, not v[i]
-            st(ca, cell); for (int i = 0; i < 16; i++) ga16[i] = Gt[ca[i]];
+#ifdef CTX4D_VBMI
+            V grp = glookup(GT, cell);
+#else
+            alignas(64) int16_t ca[CTX4D_LANES], ga16[CTX4D_LANES];               // element loops through arrays, not v[i]
+            st(ca, cell); for (int i = 0; i < NL; i++) ga16[i] = Gt[ca[i]];
             V grp = ld(ga16);
+#endif
             V f = vmin(vmax(ga + gb, vmin(ga, gb)), vmax(ga, gb));
             V sgb = (V)(gb < 0) - (V)(gb > 0);                                      // sign(gb)
             V s = (ga + ga + sgb) | one;
@@ -120,7 +157,7 @@ static void encode_plane_vec(const int16_t* __restrict P, uint16_t* __restrict o
             V z = (e + e) ^ (e >> 15);
             st(Zc + x, z);
             V pk = (z << 4) | (sb + grp);
-            if (x + 16 <= W) memcpy(orow + x, &pk, 32); else memcpy(orow + x, &pk, (W - x) * 2);
+            if (x + NL <= W) memcpy(orow + x, &pk, sizeof pk); else memcpy(orow + x, &pk, (W - x) * 2);
         }
         std::swap(Pu, Pc); std::swap(Zu, Zc);
     }
@@ -132,10 +169,10 @@ static void decode_plane_vec(int16_t* __restrict out, int W, int H, int k, const
     const int t8 = k ? 1 : 0;
     const V e0 = splat(EDGE[t8][0] - 1), e1 = splat(EDGE[t8][1] - 1), e2 = splat(EDGE[t8][2] - 1), v0 = splat(VT[t8][0] - 1), v1 = splat(VT[t8][1] - 1);
     const V one = splat(1), c24 = splat(24), c9 = splat(9), zero = splat(0);
-    const V lane2k = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30}, lanek = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    const V lane2k = iota(2), lanek = iota(1);
     const V vW = splat(W), vWm1 = splat(W - 1), m1 = splat(-1);
     const uint8_t* Gt = G[t8];
-    const int T = W + 2 * (LN - 1), PAD = 40;
+    const int T = W + 2 * (LN - 1), PAD = 2 * LN + 8;
     std::vector<int16_t> topP(W + 2 * PAD, 0), topZ(W + 2 * PAD, 0), wave((size_t)LN * T), wavez((size_t)LN * T);
     int16_t* tp = topP.data() + PAD; int16_t* tz = topZ.data() + PAD;
     for (int y0 = 0; y0 < H; y0 += LN) {
@@ -153,9 +190,9 @@ static void decode_plane_vec(int16_t* __restrict out, int W, int H, int k, const
             V sec = qb + c24 - ((qa << 3) - qa);
             V lev = -((V)(vmax(vmax(zl, zc), zr) > v0) + (V)(vmax(vmax(zl, zc), zr) > v1));
             V cell = ((sec << 4) + (sec << 2) + sec + qd + qd + qd + lev + c9) & valid;
-            alignas(32) int16_t ca[16], va16[16], za[16];
+            alignas(64) int16_t ca[CTX4D_LANES], va16[CTX4D_LANES], za[CTX4D_LANES];
             st(ca, cell); st(va16, valid);
-            for (int i = 0; i < 16; i++) za[i] = va16[i] ? (int16_t)*S[t8 * 8 + Gt[ca[i]]]++ : 0;
+            for (int i = 0; i < NL; i++) za[i] = va16[i] ? (int16_t)*S[t8 * 8 + Gt[ca[i]]]++ : 0;
             V z = ld(za);
             V f = vmin(vmax(ga + gb, vmin(ga, gb)), vmax(ga, gb));
             V sgb = (V)(gb < 0) - (V)(gb > 0), s = (ga + ga + sgb) | one;
@@ -203,8 +240,12 @@ int main(int argc, char** argv) {
     size_t bad_e = 0, bad_d = 0;
     for (size_t i = 0; i < N * 3; i++) bad_e += ref[i] != vec[i];
     for (int k = 0; k < 3; k++) for (size_t i = 0; i < N; i++) bad_d += D[k][i] != P[k][i];
-    printf("[vector types, %s] %dx%d: encoder %.2f ns/px (%s), decoder %.2f ns/px (%s)\n",
-#if defined(__AVX2__)
+    printf("[vector types x%d, %s] %dx%d: encoder %.2f ns/px (%s), decoder %.2f ns/px (%s)\n", NL,
+#if defined(CTX4D_VBMI)
+           "AVX-512 + VBMI group lookup",
+#elif defined(__AVX512BW__)
+           "AVX-512",
+#elif defined(__AVX2__)
            "AVX2",
 #elif defined(__AVX__)
            "AVX1",
