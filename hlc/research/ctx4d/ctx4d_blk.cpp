@@ -92,6 +92,44 @@ static inline void row_kernel(Rows& R, int k, int y, int nl, uint16_t** wp, cons
     }
 }
 
+// ---- RGB -> RCT -> [x][lane], vector types: per lane 48 B = 16 px deinterleaved (two shuffles per colour),
+// RCT on 16 x i16, then a 16 x 16 transpose (4 butterfly rounds) -> 16 rows of [lane]. Tail (w % 16 px): scalar.
+typedef uint8_t U8 __attribute__((vector_size(16)));
+static inline U8 ldu8(const uint8_t* p) { U8 v; memcpy(&v, p, 16); return v; }
+#define SV __builtin_shufflevector
+static inline void deint(const uint8_t* s, V& Y, V& Uo, V& Vo) {
+    U8 a0 = ldu8(s), a1 = ldu8(s + 16), a2 = ldu8(s + 32);
+    U8 r = SV(SV(a0, a1, 0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 0, 0, 0, 0, 0), a2, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 17, 20, 23, 26, 29);
+    U8 g = SV(SV(a0, a1, 1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31, 0, 0, 0, 0, 0), a2, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 18, 21, 24, 27, 30);
+    U8 b = SV(SV(a0, a1, 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 0, 0, 0, 0, 0, 0), a2, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 19, 22, 25, 28, 31);
+    V R = __builtin_convertvector(r, V), G = __builtin_convertvector(g, V), B = __builtin_convertvector(b, V);
+    Y = (R + G + G + B) >> 2; Uo = B - G; Vo = R - G;
+}
+static inline void tr16(V* m) {                                               // in-place 16 x 16 transpose
+    for (int i = 0; i < 16; i++) if (!(i & 8)) { V a = m[i], b = m[i + 8];
+        m[i] = SV(a, b, 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23); m[i + 8] = SV(a, b, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31); }
+    for (int i = 0; i < 16; i++) if (!(i & 4)) { V a = m[i], b = m[i + 4];
+        m[i] = SV(a, b, 0, 1, 2, 3, 16, 17, 18, 19, 8, 9, 10, 11, 24, 25, 26, 27); m[i + 4] = SV(a, b, 4, 5, 6, 7, 20, 21, 22, 23, 12, 13, 14, 15, 28, 29, 30, 31); }
+    for (int i = 0; i < 16; i++) if (!(i & 2)) { V a = m[i], b = m[i + 2];
+        m[i] = SV(a, b, 0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29); m[i + 2] = SV(a, b, 2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31); }
+    for (int i = 0; i < 16; i += 2) { V a = m[i], b = m[i + 1];
+        m[i] = SV(a, b, 0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30); m[i + 1] = SV(a, b, 1, 17, 3, 19, 5, 21, 7, 23, 9, 25, 11, 27, 13, 29, 15, 31); }
+}
+#undef SV
+static void rct_rows(const uint8_t* const* src, int nl, int w, int16_t* PY, int16_t* PU, int16_t* PV) {
+    V my[NLB], mu[NLB], mv[NLB];
+    const int wv = w & ~15;
+    for (int x0 = 0; x0 < wv; x0 += 16) {
+        for (int i = 0; i < nl; i++) deint(src[i] + 3 * x0, my[i], mu[i], mv[i]);
+        for (int i = nl; i < NLB; i++) my[i] = mu[i] = mv[i] = splat(0);
+        tr16(my); tr16(mu); tr16(mv);
+        for (int j = 0; j < 16; j++) { const size_t o = (size_t)(x0 + j) * NLB; st(PY + o, my[j]); st(PU + o, mu[j]); st(PV + o, mv[j]); }
+    }
+    for (int i = 0; i < nl; i++) { const uint8_t* s = src[i];
+        for (int x = wv; x < w; x++) { int r = s[3 * x], g = s[3 * x + 1], b = s[3 * x + 2]; size_t j = (size_t)x * NLB + i;
+            PY[j] = (int16_t)((r + 2 * g + b) >> 2); PU[j] = (int16_t)(b - g); PV[j] = (int16_t)(r - g); } }
+}
+
 static std::vector<uint8_t> enc_blk(const uint8_t* rgb, int W, int H, BT& tm) {
     const std::vector<Unit> U = layout(W, H, TW, TH);
     Out o; o.raw("C4B1", 4); o.var(W); o.var(H); o.var(TW); o.var(TH);
@@ -110,11 +148,9 @@ static std::vector<uint8_t> enc_blk(const uint8_t* rgb, int W, int H, BT& tm) {
         for (int y = 0; y < u.h; y++) {
             const int cur = y & 1;
             int16_t* PY = R.P[0][cur].data() + NLB; int16_t* PU = R.P[1][cur].data() + NLB; int16_t* PV = R.P[2][cur].data() + NLB;
-            for (int i = 0; i < nl; i++) {                                     // RCT of the 16 block rows -> [x][lane]
-                const uint8_t* s = rgb + ((size_t)(u.y[i] + y) * W + u.x[i]) * 3;
-                for (int x = 0; x < w; x++) { int r = s[3 * x], g = s[3 * x + 1], b = s[3 * x + 2]; size_t j = (size_t)x * NLB + i;
-                    PY[j] = (int16_t)((r + 2 * g + b) >> 2); PU[j] = (int16_t)(b - g); PV[j] = (int16_t)(r - g); }
-            }
+            const uint8_t* src[NLB];
+            for (int i = 0; i < nl; i++) src[i] = rgb + ((size_t)(u.y[i] + y) * W + u.x[i]) * 3;
+            rct_rows(src, nl, w, PY, PU, PV);
             row_kernel<8, true>(R, 0, y, nl, wp, nullptr);
             row_kernel<7, true>(R, 1, y, nl, wp + 8, nullptr);
             row_kernel<7, true>(R, 2, y, nl, wp + 8, nullptr);
