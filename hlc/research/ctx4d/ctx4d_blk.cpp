@@ -92,6 +92,10 @@ static inline void row_kernel(Rows& R, int k, int y, int nl, uint16_t** wp, cons
     }
 }
 
+#ifndef BLK_PALIC_RGB
+#define BLK_PALIC_RGB 1                                                         // 0: own shufflevector deinterleave
+#endif
+#include "../../../palic-1/rgb.hpp"                                             // conv::convert_to_plannar_line_8to16_48 (its 16to8 is broken, unused)
 // ---- RGB -> RCT -> [x][lane], vector types: per lane 48 B = 16 px deinterleaved (two shuffles per colour),
 // RCT on 16 x i16, then a 16 x 16 transpose (4 butterfly rounds) -> 16 rows of [lane]. Tail (w % 16 px): scalar.
 typedef uint8_t U8 __attribute__((vector_size(16)));
@@ -104,6 +108,14 @@ static inline void deint(const uint8_t* s, V& Y, V& Uo, V& Vo) {
     U8 b = SV(SV(a0, a1, 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 0, 0, 0, 0, 0, 0), a2, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 19, 22, 25, 28, 31);
     V R = __builtin_convertvector(r, V), G = __builtin_convertvector(g, V), B = __builtin_convertvector(b, V);
     Y = (R + G + G + B) >> 2; Uo = B - G; Vo = R - G;
+}
+static inline void reint(uint8_t* d, V Y, V Uo, V Vo) {                     // inverse RCT, 16 px -> 48 B RGB
+    V Gv = Y - ((Uo + Vo) >> 2), Rv = Vo + Gv, Bv = Uo + Gv;
+    U8 r = __builtin_convertvector(Rv, U8), g = __builtin_convertvector(Gv, U8), b = __builtin_convertvector(Bv, U8);
+    U8 o0 = SV(SV(r, g, 0, 16, 0, 1, 17, 0, 2, 18, 0, 3, 19, 0, 4, 20, 0, 5), b, 0, 1, 16, 3, 4, 17, 6, 7, 18, 9, 10, 19, 12, 13, 20, 15);
+    U8 o1 = SV(SV(r, g, 21, 0, 6, 22, 0, 7, 23, 0, 8, 24, 0, 9, 25, 0, 10, 26), b, 0, 21, 2, 3, 22, 5, 6, 23, 8, 9, 24, 11, 12, 25, 14, 15);
+    U8 o2 = SV(SV(r, g, 0, 11, 27, 0, 12, 28, 0, 13, 29, 0, 14, 30, 0, 15, 31, 0), b, 26, 1, 2, 27, 4, 5, 28, 7, 8, 29, 10, 11, 30, 13, 14, 31);
+    memcpy(d, &o0, 16); memcpy(d + 16, &o1, 16); memcpy(d + 32, &o2, 16);
 }
 static inline void tr16(V* m) {                                               // in-place 16 x 16 transpose
     for (int i = 0; i < 16; i++) if (!(i & 8)) { V a = m[i], b = m[i + 8];
@@ -120,7 +132,12 @@ static void rct_rows(const uint8_t* const* src, int nl, int w, int16_t* PY, int1
     V my[NLB], mu[NLB], mv[NLB];
     const int wv = w & ~15;
     for (int x0 = 0; x0 < wv; x0 += 16) {
+#if BLK_PALIC_RGB                                                               // PALIC-1 rgb.hpp: V, U, Y planar
+        for (int i = 0; i < nl; i++) { alignas(32) int16_t tv[16], tu[16], ty[16];
+            conv::convert_to_plannar_line_8to16_48(src[i] + 3 * x0, tv, tu, ty); my[i] = ld(ty); mu[i] = ld(tu); mv[i] = ld(tv); }
+#else
         for (int i = 0; i < nl; i++) deint(src[i] + 3 * x0, my[i], mu[i], mv[i]);
+#endif
         for (int i = nl; i < NLB; i++) my[i] = mu[i] = mv[i] = splat(0);
         tr16(my); tr16(mu); tr16(mv);
         for (int j = 0; j < 16; j++) { const size_t o = (size_t)(x0 + j) * NLB; st(PY + o, my[j]); st(PU + o, mu[j]); st(PV + o, mv[j]); }
@@ -181,9 +198,17 @@ static void dec_blk(const uint8_t* buf, size_t len, std::vector<uint8_t>& rgb, i
                 row_kernel<7, false>(R, 2, y, nl, nullptr, rp + 8);
                 const int cur = y & 1;
                 const int16_t* PY = R.P[0][cur].data() + NLB; const int16_t* PU = R.P[1][cur].data() + NLB; const int16_t* PV = R.P[2][cur].data() + NLB;
-                for (int i = 0; i < nl; i++) {                                 // inverse RCT straight into the image
-                    uint8_t* d = rgb.data() + ((size_t)(q.y[i] + y) * W + q.x[i]) * 3;
-                    for (int x = 0; x < w; x++) { size_t k = (size_t)x * NLB + i; int Y = PY[k], Uu = PU[k], Vv = PV[k], g = Y - ((Uu + Vv) >> 2);
+                uint8_t* dl[NLB]; for (int i = 0; i < nl; i++) dl[i] = rgb.data() + ((size_t)(q.y[i] + y) * W + q.x[i]) * 3;
+                const int wv = w & ~15;
+                for (int x0 = 0; x0 < wv; x0 += 16) {                          // [x][lane] -> transpose -> 48 B RGB per lane
+                    V my[NLB], mu[NLB], mv[NLB];
+                    for (int j = 0; j < 16; j++) { const size_t o = (size_t)(x0 + j) * NLB; my[j] = ld(PY + o); mu[j] = ld(PU + o); mv[j] = ld(PV + o); }
+                    tr16(my); tr16(mu); tr16(mv);
+                    for (int i = 0; i < nl; i++) reint(dl[i] + 3 * x0, my[i], mu[i], mv[i]);
+                }
+                for (int i = 0; i < nl; i++) {                                 // inverse RCT straight into the image (tail)
+                    uint8_t* d = dl[i];
+                    for (int x = wv; x < w; x++) { size_t k = (size_t)x * NLB + i; int Y = PY[k], Uu = PU[k], Vv = PV[k], g = Y - ((Uu + Vv) >> 2);
                         d[3 * x] = (uint8_t)(Vv + g); d[3 * x + 1] = (uint8_t)g; d[3 * x + 2] = (uint8_t)(Uu + g); }
                 }
             }
