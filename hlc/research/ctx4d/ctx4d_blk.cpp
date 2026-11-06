@@ -97,7 +97,8 @@ static inline void row_kernel(Rows& R, int k, int y, int nl, uint16_t** wp, cons
 #endif
 #include "../../../palic-1/rgb.hpp"                                             // conv::convert_to_plannar_line_8to16_48 (its 16to8 is broken, unused)
 // ---- RGB -> RCT -> [x][lane], vector types: per lane 48 B = 16 px deinterleaved (two shuffles per colour),
-// RCT on 16 x i16, then a 16 x 16 transpose (4 butterfly rounds) -> 16 rows of [lane]. Tail (w % 16 px): scalar.
+// RCT on 16 x i16, then a 16 x 16 transpose (4 butterfly rounds) -> 16 rows of [lane]. Tail: the last 16 px are
+// redone overlapping (as hlc); scalar only for blocks narrower than 16 px.
 typedef uint8_t U8 __attribute__((vector_size(16)));
 static inline U8 ldu8(const uint8_t* p) { U8 v; memcpy(&v, p, 16); return v; }
 #define SV __builtin_shufflevector
@@ -130,8 +131,8 @@ static inline void tr16(V* m) {                                               //
 #undef SV
 static void rct_rows(const uint8_t* const* src, int nl, int w, int16_t* PY, int16_t* PU, int16_t* PV) {
     V my[NLB], mu[NLB], mv[NLB];
-    const int wv = w & ~15;
-    for (int x0 = 0; x0 < wv; x0 += 16) {
+    const int wv = w >= 16 ? w : 0;                                           // hlc's tail trick: the last 16 px overlap
+    for (int xx = 0; xx < wv; xx += 16) { const int x0 = std::min(xx, w - 16);
 #if BLK_PALIC_RGB                                                               // PALIC-1 rgb.hpp: V, U, Y planar
         for (int i = 0; i < nl; i++) { alignas(32) int16_t tv[16], tu[16], ty[16];
             conv::convert_to_plannar_line_8to16_48(src[i] + 3 * x0, tv, tu, ty); my[i] = ld(ty); mu[i] = ld(tu); mv[i] = ld(tv); }
@@ -199,8 +200,8 @@ static void dec_blk(const uint8_t* buf, size_t len, std::vector<uint8_t>& rgb, i
                 const int cur = y & 1;
                 const int16_t* PY = R.P[0][cur].data() + NLB; const int16_t* PU = R.P[1][cur].data() + NLB; const int16_t* PV = R.P[2][cur].data() + NLB;
                 uint8_t* dl[NLB]; for (int i = 0; i < nl; i++) dl[i] = rgb.data() + ((size_t)(q.y[i] + y) * W + q.x[i]) * 3;
-                const int wv = w & ~15;
-                for (int x0 = 0; x0 < wv; x0 += 16) {                          // [x][lane] -> transpose -> 48 B RGB per lane
+                const int wv = w >= 16 ? w : 0;                                // the last 16 px overlap (hlc's tail trick)
+                for (int xx = 0; xx < wv; xx += 16) { const int x0 = std::min(xx, w - 16);   // [x][lane] -> transpose -> 48 B RGB
                     V my[NLB], mu[NLB], mv[NLB];
                     for (int j = 0; j < 16; j++) { const size_t o = (size_t)(x0 + j) * NLB; my[j] = ld(PY + o); mu[j] = ld(PU + o); mv[j] = ld(PV + o); }
                     tr16(my); tr16(mu); tr16(mv);
