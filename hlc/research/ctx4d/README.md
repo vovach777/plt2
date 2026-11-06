@@ -157,3 +157,19 @@ then the flush check; the block is a parallelogram (row k: columns x0 - k .. x0 
 the error axis is already computed. Output byte-identical to `-planes` (26 files incl. edge sizes).
 Sandbox (L2 4 MB, L3 480 MB: every plane fits in cache, memory effects invisible): no gain, fused 235 vs 242 MB/s
 (AVX2), 212 vs 211 (SSE); 48 Mpx the same. The real test is a small-cache machine (Ivy: L2 256 KB, L3 6 MB).
+
+### ctx4d_blk: experimental codec C4B1, independent compute blocks fused in L1
+
+`ctx4d_blk c in.ppm out.c4b groups.csv [-tw 128] [-th 16] [-cb N]`, `ctx4d_blk d in.c4b out.ppm groups.csv`, `bench`.
+Every block TW x TH is a separate image (borders restart); 16 blocks of one shape = 16 lanes. Encoder per row:
+RGB -> RCT -> context + symbol -> streams; decoder per row: streams -> Y U V -> inverse RCT into the image.
+Only FSE is a separate pass. Sandbox, -cb 256K, 1 thread (wave = ctx4d_codec, same groups):
+
+| | bpp photos (19) | bpp big 12 Mpx | enc photos / big MB/s | dec photos / big MB/s |
+|---|---|---|---|---|
+| wave, AVX2 | 7.8065 | 3.3636 | 245 / 218 | 270 / 250 |
+| C4B1 128x16, AVX2 | 7.9985 (+2.5%) | 3.5989 (+7.0%) | 264 / 248 | 266 / 269 |
+| wave, SSE | | | 218 / 194 | 275 / 266 |
+| C4B1 128x16, SSE | | | 249 / 245 | 291 / 301 |
+| C4B1 128x64, AVX2 | 7.8848 (+1.0%) | 3.4512 (+2.6%) | 250 / 260 | 229 / 270 |
+| C4B1 256x256, AVX2 | 7.8312 (+0.3%) | 3.4000 (+1.1%) | (few blocks per image: lanes idle on the photos) | |
