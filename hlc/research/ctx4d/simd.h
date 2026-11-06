@@ -8,7 +8,11 @@
 #else
   #define SIMDE_ENABLE_NATIVE_ALIASES
   #include "../../../avx2.h"
-  #define CTX4D_SIMD "SIMDe AVX2 emulation"
+  #if defined(__AVX__)
+    #define CTX4D_SIMD "SIMDe AVX2 emulation on AVX1 (slow: rebuild with -mno-avx)"
+  #else
+    #define CTX4D_SIMD "SIMDe AVX2 emulation on SSE"
+  #endif
 #endif
 #if defined(_MSC_VER)
   #include <malloc.h>
