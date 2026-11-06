@@ -76,3 +76,16 @@ By hand from this folder: `clang++ -O3 -march=native -std=c++17 ctx4d_dec.cpp -o
   and a masked select by the high bits - no memory access.
 * The decoder needs the stream reads vectorised to gain from width (AVX-512: `vpconflictd` gives each lane the count
   of earlier lanes in the same stream = its offset; then one gather and a per-stream pointer update).
+
+### AVX-512 vector stream read (`CTX4D_VREAD`: VBMI + VPOPCNTDQ), 12 Mpx, sandbox Xeon, g++
+
+| decoder | ns/px |
+|---|---|
+| x32, scalar stream reads | 6.82 |
+| x32, vector stream reads (rank = popcnt(group mask & earlier lanes), 2 gathers per step) | 6.17 |
+| same, unskew pass skipped (timing only, `-DNO_UNSKEW`) | 4.90 |
+| x16 AVX2, unskew skipped | 7.36 |
+
+* The step is latency bound: the vector read removes the pointer chain but puts a gather (+ group lookup)
+  on the step-to-step path. ~150 cycles per step and plane remain. Next lever: the three planes as three
+  independent chains in one step loop. The scalar unskew (wave -> raster) is ~20% of the decoder.

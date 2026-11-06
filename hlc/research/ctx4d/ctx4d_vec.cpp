@@ -113,6 +113,9 @@ static inline V glookup(const GTab& T, V cell) {
     return (V)_mm512_cvtepu8_epi16(_mm512_castsi512_si256(r));
 }
 #define CTX4D_VBMI 1
+#if defined(__AVX512VPOPCNTDQ__)
+#define CTX4D_VREAD 1
+#endif
 #endif
 static inline V iota(int mul) { alignas(64) int16_t a[CTX4D_LANES]; for (int i = 0; i < NL; i++) a[i] = (int16_t)(i * mul); return ld(a); }
 
@@ -165,14 +168,24 @@ static void encode_plane_vec(const int16_t* __restrict P, uint16_t* __restrict o
 
 // ---------------- wavefront decoder ----------------
 template <int SH>
-static void decode_plane_vec(int16_t* __restrict out, int W, int H, int k, const uint16_t** S) {
+static void decode_plane_vec(int16_t* __restrict out, int W, int H, int k, const uint16_t** S, const uint16_t* sbuf_in, const int32_t* off_in) {
     const int t8 = k ? 1 : 0;
     const V e0 = splat(EDGE[t8][0] - 1), e1 = splat(EDGE[t8][1] - 1), e2 = splat(EDGE[t8][2] - 1), v0 = splat(VT[t8][0] - 1), v1 = splat(VT[t8][1] - 1);
     const V one = splat(1), c24 = splat(24), c9 = splat(9), zero = splat(0);
     const V lane2k = iota(2), lanek = iota(1);
     const V vW = splat(W), vWm1 = splat(W - 1), m1 = splat(-1);
     const uint8_t* Gt = G[t8];
+#ifdef CTX4D_VBMI
+    GTab GT; gtab_init(GT, Gt);
+#endif
     const int T = W + 2 * (LN - 1), PAD = 2 * LN + 8;
+#if defined(CTX4D_VREAD)
+    const void* sbuf = sbuf_in; alignas(64) int32_t off[16] = {0}; memcpy(off, off_in, 8 * sizeof(int32_t));
+    alignas(64) uint32_t pre[32]; for (int i = 0; i < 32; i++) pre[i] = i ? (uint32_t)((1ull << i) - 1) : 0u;
+    const __m512i PRE0 = _mm512_load_si512(pre), PRE1 = _mm512_load_si512(pre + 16);
+#else
+    (void)sbuf_in; (void)off_in;
+#endif
     std::vector<int16_t> topP(W + 2 * PAD, 0), topZ(W + 2 * PAD, 0), wave((size_t)LN * T), wavez((size_t)LN * T);
     int16_t* tp = topP.data() + PAD; int16_t* tz = topZ.data() + PAD;
     for (int y0 = 0; y0 < H; y0 += LN) {
@@ -190,10 +203,28 @@ static void decode_plane_vec(int16_t* __restrict out, int W, int H, int k, const
             V sec = qb + c24 - ((qa << 3) - qa);
             V lev = -((V)(vmax(vmax(zl, zc), zr) > v0) + (V)(vmax(vmax(zl, zc), zr) > v1));
             V cell = ((sec << 4) + (sec << 2) + sec + qd + qd + qd + lev + c9) & valid;
+#if defined(CTX4D_VREAD)
+            // vector stream read: lane rank inside its stream = popcnt(mask of its group & lanes before it),
+            // address = stream start + rank, one gather per 16 lanes, each stream pointer moves once per step
+            V grp = glookup(GT, cell);
+            __mmask32 kv = _mm512_cmpneq_epi16_mask((__m512i)valid, _mm512_setzero_si512());
+            alignas(64) uint32_t km[16];
+            for (int g = 0; g < 8; g++) km[g] = _mm512_mask_cmpeq_epi16_mask(kv, (__m512i)grp, _mm512_set1_epi16((short)g));
+            __m512i KM = _mm512_load_si512(km), OFF = _mm512_loadu_si512(off);
+            __m512i g0 = _mm512_cvtepu16_epi32(_mm512_castsi512_si256((__m512i)grp)), g1 = _mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64((__m512i)grp, 1));
+            __m512i r0 = _mm512_popcnt_epi32(_mm512_and_si512(_mm512_permutexvar_epi32(g0, KM), PRE0));
+            __m512i r1 = _mm512_popcnt_epi32(_mm512_and_si512(_mm512_permutexvar_epi32(g1, KM), PRE1));
+            __m512i a0 = _mm512_add_epi32(_mm512_permutexvar_epi32(g0, OFF), r0), a1 = _mm512_add_epi32(_mm512_permutexvar_epi32(g1, OFF), r1);
+            __m512i s0 = _mm512_mask_i32gather_epi32(_mm512_setzero_si512(), (__mmask16)kv, a0, sbuf, 2);
+            __m512i s1 = _mm512_mask_i32gather_epi32(_mm512_setzero_si512(), (__mmask16)(kv >> 16), a1, sbuf, 2);
+            V z = (V)_mm512_inserti64x4(_mm512_castsi256_si512(_mm512_cvtepi32_epi16(s0)), _mm512_cvtepi32_epi16(s1), 1);
+            for (int g = 0; g < 8; g++) off[g] += __builtin_popcount(km[g]);
+#else
             alignas(64) int16_t ca[CTX4D_LANES], va16[CTX4D_LANES], za[CTX4D_LANES];
             st(ca, cell); st(va16, valid);
             for (int i = 0; i < NL; i++) za[i] = va16[i] ? (int16_t)*S[t8 * 8 + Gt[ca[i]]]++ : 0;
             V z = ld(za);
+#endif
             V f = vmin(vmax(ga + gb, vmin(ga, gb)), vmax(ga, gb));
             V sgb = (V)(gb < 0) - (V)(gb > 0), s = (ga + ga + sgb) | one;
             V e = (V)((VU)z >> 1) ^ -(z & one);
@@ -204,7 +235,11 @@ static void decode_plane_vec(int16_t* __restrict out, int W, int H, int k, const
             P1 = val; Z1 = z;
         }
         int rows = std::min(LN, H - y0);
+#ifdef NO_UNSKEW
+        for (int kk = 0; kk < 0; kk++) {                                   // timing only: skip the unskew pass
+#else
         for (int kk = 0; kk < rows; kk++) {
+#endif
             int16_t* row = out + (size_t)(y0 + kk) * W; const int16_t* src = &wave[2 * kk * LN + kk];
             for (int x = 0; x < W; x++) row[x] = src[(size_t)x * LN];
         }
@@ -226,6 +261,11 @@ int main(int argc, char** argv) {
     for (int k = 0; k < 3; k++) { P[k].resize(N); D[k].assign(N, -999); }
     for (size_t i = 0; i < N; i++) { int R = rgb[3 * i], Gc = rgb[3 * i + 1], B = rgb[3 * i + 2]; P[0][i] = (R + 2 * Gc + B) >> 2; P[1][i] = B - Gc; P[2][i] = R - Gc; }
     for (int k = 0; k < 3; k++) { encode_plane_ref(P[k].data(), ref.data() + k * N, W, H, k); scatter_wave(ref.data() + k * N, W, H, stv[k]); }
+    // the 8 streams of each plane's type concatenated (for the vector read), start offsets, 2 elements padding
+    std::vector<uint16_t> comb[3]; int32_t coff[3][8];
+    for (int k = 0; k < 3; k++) { int t8 = k ? 1 : 0;
+        for (int g = 0; g < 8; g++) { coff[k][g] = (int32_t)comb[k].size(); comb[k].insert(comb[k].end(), stv[k][t8 * 8 + g].begin(), stv[k][t8 * 8 + g].end()); }
+        comb[k].resize(comb[k].size() + 2, 0); }
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     double be = 1e30, bd = 1e30;
@@ -234,14 +274,17 @@ int main(int argc, char** argv) {
         for (int k = 0; k < 3; k++) { if (k) encode_plane_vec<7>(P[k].data(), vec.data() + k * N, W, H, k); else encode_plane_vec<8>(P[k].data(), vec.data(), W, H, k); }
         auto t1 = now();
         for (int k = 0; k < 3; k++) { const uint16_t* S[16]; for (int s = 0; s < 16; s++) S[s] = stv[k][s].data();
-                                      if (k) decode_plane_vec<7>(D[k].data(), W, H, k, S); else decode_plane_vec<8>(D[k].data(), W, H, k, S); }
+                                      const uint16_t* cb = comb[k].data(); const int32_t* of = coff[k];
+                                      if (k) decode_plane_vec<7>(D[k].data(), W, H, k, S, cb, of); else decode_plane_vec<8>(D[k].data(), W, H, k, S, cb, of); }
         auto t2 = now(); be = std::min(be, ms(t0, t1)); bd = std::min(bd, ms(t1, t2));
     }
     size_t bad_e = 0, bad_d = 0;
     for (size_t i = 0; i < N * 3; i++) bad_e += ref[i] != vec[i];
     for (int k = 0; k < 3; k++) for (size_t i = 0; i < N; i++) bad_d += D[k][i] != P[k][i];
     printf("[vector types x%d, %s] %dx%d: encoder %.2f ns/px (%s), decoder %.2f ns/px (%s)\n", NL,
-#if defined(CTX4D_VBMI)
+#if defined(CTX4D_VREAD)
+           "AVX-512 + VBMI group lookup + vector stream read",
+#elif defined(CTX4D_VBMI)
            "AVX-512 + VBMI group lookup",
 #elif defined(__AVX512BW__)
            "AVX-512",
