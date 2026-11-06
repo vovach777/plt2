@@ -89,3 +89,16 @@ By hand from this folder: `clang++ -O3 -march=native -std=c++17 ctx4d_dec.cpp -o
 * The step is latency bound: the vector read removes the pointer chain but puts a gather (+ group lookup)
   on the step-to-step path. ~150 cycles per step and plane remain. Next lever: the three planes as three
   independent chains in one step loop. The scalar unskew (wave -> raster) is ~20% of the decoder.
+
+### Three planes as three chains in one step loop (`decode_interleaved` vs `decode_serial`), 12 Mpx, ns/px
+
+| build | serial | interleaved |
+|---|---|---|
+| g++ -march=sapphirerapids (x32, VBMI, vector read) | 6.53 | 5.55 |
+| clang -march=sapphirerapids | 6.43 | 5.75 |
+| clang -march=haswell (x16) | 7.52 | 6.98 |
+| g++ -march=haswell | 9.11 | 7.19 |
+| clang -march=ivybridge -mno-avx (SSE) | 6.82 | 6.90 |
+
+Interleaving gives 10-20 % on AVX2/AVX-512 and nothing on SSE (the 256-bit ops are already two independent
+128-bit halves there): the step is now mostly throughput bound (instruction count), not latency bound.
