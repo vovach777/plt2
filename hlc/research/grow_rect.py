@@ -10,23 +10,23 @@ def grow(H,thr,rel,cap):
     for sy in range(ty):
         for sx in range(tx):
             if rid[sy,sx]>=0: continue
-            x0,x1,y0,y1=sx,sx+1,sy,sy+1; s=H[sy,sx]; n=1; r=len(out); rid[sy,sx]=r
+            x0,x1,y0,y1=sx,sx+1,sy,sy+1; s=H[sy,sx]; n=1; r=len(out); rid[sy,sx]=r; step=0
             while True:
-                m=s/n; t=thr*m if rel else thr; best=None
+                m=s/n; t=(thr*m if rel else thr)+(DELTA if step==1 else 0); best=None
                 for d,(a,b,c,e) in enumerate(((x1,x1+1,y0,y1),(x0,x1,y1,y1+1),(x0-1,x0,y0,y1),(x0,x1,y0-1,y0))):
                     if a<0 or c<0 or b>tx or e>ty: continue
                     blk=rid[c:e,a:b]
                     if (blk>=0).any(): continue
                     if cap and n+blk.size>cap: continue
                     dm=abs(H[c:e,a:b]-m).max() if MAXD else abs(H[c:e,a:b].mean()-m)
-                    if (dm<=t or n==1) and (best is None or dm<best[0]): best=(dm,d,a,b,c,e)
+                    if (dm<=t or step==0) and (best is None or dm<best[0]): best=(dm,d,a,b,c,e)
                 if best is None: break
-                _,d,a,b,c,e=best; rid[c:e,a:b]=r; s+=H[c:e,a:b].sum(); n+=(b-a)*(e-c)
+                step+=1; _,d,a,b,c,e=best; rid[c:e,a:b]=r; s+=H[c:e,a:b].sum(); n+=(b-a)*(e-c)
                 x0,x1,y0,y1=min(x0,a),max(x1,b),min(y0,c),max(y1,e)
             out.append((x0,y0,x1,y1,s/n))
     return rid,out
 COLS=[tuple(int(255*v) for v in colorsys.hsv_to_rgb(0.66*(1-k/(K-1)),0.85,0.95)) for k in range(K)]
-MAXD=1; cfgs=[(t,0,0) for t in (0.3,0.5,0.8,1.0)]+[(0.5,0,14)]
+MAXD=1; DELTA=0.25; cfgs=[(0.5,0,0)]
 print(f'{"threshold":22s} rects  tiles/rect  bits vs 1 table   (ref: tiles -5.88%, opt rects 2480 -5.88%, right/up dh0.3 1940 -5.85%)')
 for thr,rel,cap in cfgs:
     nreg=nt=b=b1=0; per={}
@@ -45,5 +45,5 @@ for thr,rel,cap in cfgs:
                 d.rectangle([x0*96+1,y0*96+1,min(x1*96,2*Ww)-2,min(y1*96,2*Hh)-2],outline=(255,255,255),width=3)
                 d.text((x0*96+8,y0*96+6),f'{m:.1f}',fill=(0,0,0)); d.text((x0*96+7,y0*96+5),f'{m:.1f}',fill=(255,255,255))
             d.rectangle([0,0,420,26],fill=(255,255,255)); d.text((8,8),f'{name}: {len(R)} rects, thr {thr}{"*H" if rel else ""}',fill=(0,0,0))
-            im.save(f'{S}/vis/c8/{name}_growf_{tag}.png')
+            im.save(f'{S}/vis/c8/{name}_growd_{tag}.png')
     print(f'{(str(thr)+("*H" if rel else " abs")+(" cap14" if cap else "")):22s} {nreg:5d}  {nt/nreg:6.1f}     {100*(b/b1-1):+.2f}%    p05 {per["p05"]} p15 {per["p15"]} p12 {per["p12"]}')
