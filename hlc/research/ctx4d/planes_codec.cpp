@@ -10,8 +10,10 @@
 // build: clang++ -O3 -march=native -std=c++17 -I. -I../../../third_party/fse -I../../.. planes_codec.cpp <fse objs>
 #define CTX4D_CODEC_NO_MAIN
 #include "ctx4d_codec.cpp"
-#include <smmintrin.h>
 #include <chrono>
+#if defined(PLN_SSE)
+#include <smmintrin.h>
+#endif
 
 namespace pln {
 static double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -22,55 +24,116 @@ static inline int pred(const uint8_t* r, int x, int y, int S) {     // r = row y
     if (x == 0) return r[-S];
     return med(r[x - 1], r[x - S], r[x - S - 1]);
 }
+static double g_t[6];   // profile: enc residual, blocks, FSE | dec FSE, unpack, MED
 struct Cfg { int ts = 288, mode = 1, off = 1; };
+
+// ---- residuals: plain loops, clang auto-vectorizes them (borders peeled off, no branch in the loop body)
+static inline uint16_t zz8(int e) { e = int8_t(e); return uint16_t(uint8_t((e << 1) ^ (e >> 7))); }
+static void resid_row0(const uint8_t* __restrict r, uint16_t* __restrict z, int w) {
+    z[0] = zz8(r[0]);
+    for (int x = 1; x < w; ++x) z[x] = zz8(r[x] - r[x - 1]);
+}
+static void resid_row(const uint8_t* __restrict r, const uint8_t* __restrict up, uint16_t* __restrict z, int w) {
+    z[0] = zz8(r[0] - up[0]);
+    for (int x = 1; x < w; ++x) {
+        const int a = r[x - 1], b = up[x], c = up[x - 1], mn = a < b ? a : b, mx = a < b ? b : a;
+        int p = a + b - c; p = p < mn ? mn : p; p = p > mx ? mx : p;
+        z[x] = zz8(r[x] - p);
+    }
+}
+// ---- 16-symbol blocks: clang vector types (ext_vector_type); planes = bit masks via bool vectors (pmovmskb)
+#if defined(__clang__)
+typedef uint16_t v16u __attribute__((ext_vector_type(16)));
+typedef bool v16b __attribute__((ext_vector_type(16)));
+static inline v16u ld16(const uint16_t* p) { v16u v; memcpy(&v, p, 32); return v; }
+static inline void st16(uint16_t* p, v16u v) { memcpy(p, &v, 32); }
+static inline uint16_t mask16(v16u v) { return __builtin_bit_cast(uint16_t, __builtin_convertvector(v != 0, v16b)); }
+#endif
+static inline int block_planes(const uint16_t* s, int off, uint16_t*& pw, uint16_t* hi) {   // -> L
+#if defined(PLN_SSE)                                                             // reference: SSE4.1 intrinsics
+    const __m128i a0 = _mm_loadu_si128((const __m128i*)s), a1 = _mm_loadu_si128((const __m128i*)(s + 8));
+    __m128i t = _mm_add_epi16(a0, a1); t = _mm_add_epi16(t, _mm_srli_si128(t, 8)); t = _mm_add_epi16(t, _mm_srli_si128(t, 4)); t = _mm_add_epi16(t, _mm_srli_si128(t, 2));
+    const int L = std::min(7, std::max(0, int(bwz(uint32_t(_mm_extract_epi16(t, 0)) >> 4)) - off));
+    for (int k = 0; k < L; ++k) { const __m128i q = _mm_cvtsi32_si128(15 - k);
+        *pw++ = uint16_t(_mm_movemask_epi8(_mm_packs_epi16(_mm_sll_epi16(a0, q), _mm_sll_epi16(a1, q)))); }
+    const __m128i q = _mm_cvtsi32_si128(L);
+    _mm_storeu_si128((__m128i*)hi, _mm_srl_epi16(a0, q)); _mm_storeu_si128((__m128i*)(hi + 8), _mm_srl_epi16(a1, q));
+#elif defined(__clang__)
+    const v16u a = ld16(s);
+    const int L = std::min(7, std::max(0, int(bwz(uint32_t(__builtin_reduce_add(a)) >> 4)) - off));   // 16 x 255 < 65536
+    for (int k = 0; k < L; ++k) *pw++ = mask16(a & uint16_t(1u << k));
+    st16(hi, a >> uint16_t(L));
+#else
+    uint32_t sum = 0; for (int j = 0; j < 16; ++j) sum += s[j];
+    const int L = std::min(7, std::max(0, int(bwz(sum >> 4)) - off));
+    for (int k = 0; k < L; ++k) { uint16_t m = 0; for (int j = 0; j < 16; ++j) m |= uint16_t(((s[j] >> k) & 1u) << j); *pw++ = m; }
+    for (int j = 0; j < 16; ++j) hi[j] = uint16_t(s[j] >> L);
+#endif
+    return L;
+}
+static inline void block_unpack(const uint16_t* h, int L, const uint8_t*& pp, uint16_t* z) {
+#if defined(__clang__)
+    const v16u w = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768};
+    v16u v = ld16(h) << uint16_t(L);
+    for (int k = 0; k < L; ++k) { uint16_t m; memcpy(&m, pp, 2); pp += 2; v |= (v16u)((v16u(m) & w) != 0) & uint16_t(1u << k); }
+    st16(z, v);
+#else
+    for (int j = 0; j < 16; ++j) z[j] = uint16_t(h[j] << L);
+    for (int k = 0; k < L; ++k) { uint16_t m; memcpy(&m, pp, 2); pp += 2; for (int j = 0; j < 16; ++j) z[j] |= uint16_t(((m >> j) & 1u) << k); }
+#endif
+}
 
 static void tile_enc(const uint8_t* img, int S, int tw, int th, const Cfg& c, Out& o, std::vector<uint8_t>& tmp) {
     const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
-    static thread_local std::vector<uint16_t> z, hi[8], Lb, pl; z.assign(nb * 16, 0);
-    for (int y = 0; y < th; ++y) { const uint8_t* r = img + size_t(y) * S;
-        for (int x = 0; x < tw; ++x) { int e = int8_t(r[x] - pred(r, x, y, S)); z[size_t(y) * tw + x] = uint16_t(e >= 0 ? 2 * e : -2 * e - 1); } }
-    if (c.mode == 0) { put_stream(o, z.data(), n, 256, tmp); return; }
+    static thread_local std::vector<uint16_t> z, hi[8], Lb, pl; z.resize(nb * 16); std::fill(z.begin() + n, z.end(), uint16_t(0));
+    double t0 = now_s(); resid_row0(img, z.data(), tw);
+    for (int y = 1; y < th; ++y) resid_row(img + size_t(y) * S, img + size_t(y - 1) * S, z.data() + size_t(y) * tw, tw);
+    double t1 = now_s(); g_t[0] += t1 - t0;
+    if (c.mode == 0) { put_stream(o, z.data(), n, 256, tmp); g_t[2] += now_s() - t1; return; }
     Lb.resize(nb); pl.resize(nb * 8); uint16_t* pw = pl.data(); for (auto& h : hi) h.resize(nb * 16); size_t hn[8] = {0};
     for (size_t i = 0; i < nb; ++i) {
-        const uint16_t* s = &z[i * 16];
-        const __m128i a0 = _mm_loadu_si128((const __m128i*)s), a1 = _mm_loadu_si128((const __m128i*)(s + 8));
-        __m128i t = _mm_add_epi16(a0, a1); t = _mm_add_epi16(t, _mm_srli_si128(t, 8)); t = _mm_add_epi16(t, _mm_srli_si128(t, 4)); t = _mm_add_epi16(t, _mm_srli_si128(t, 2));
-        const uint32_t sum = uint32_t(_mm_extract_epi16(t, 0));               // 16 x 255 < 65536
-        int L = std::min(7, std::max(0, int(bwz(sum >> 4)) - c.off)); Lb[i] = uint16_t(L);
-        for (int k = 0; k < L; ++k) { const __m128i q = _mm_cvtsi32_si128(15 - k);
-            *pw++ = uint16_t(_mm_movemask_epi8(_mm_packs_epi16(_mm_sll_epi16(a0, q), _mm_sll_epi16(a1, q)))); }
-        const __m128i q = _mm_cvtsi32_si128(L); uint16_t* h = &hi[L][hn[L]]; hn[L] += 16;
-        _mm_storeu_si128((__m128i*)h, _mm_srl_epi16(a0, q)); _mm_storeu_si128((__m128i*)(h + 8), _mm_srl_epi16(a1, q));
+        alignas(32) uint16_t hb[16]; const int L = block_planes(&z[i * 16], c.off, pw, hb); Lb[i] = uint16_t(L);
+        memcpy(&hi[L][hn[L]], hb, 32); hn[L] += 16;
     }
+    double t2 = now_s(); g_t[1] += t2 - t1;
     put_stream(o, Lb.data(), nb, 8, tmp);
     for (int L = 0; L < 8; ++L) put_stream(o, hi[L].data(), hn[L], 256u >> L, tmp);
-    o.raw(pl.data(), size_t(pw - pl.data()) * 2);
+    o.raw(pl.data(), size_t(pw - pl.data()) * 2); g_t[2] += now_s() - t2;
+}
+// ---- decoder: unpack (vector), inverse zigzag per row (auto-vectorized), MED chain scalar (cmov, borders peeled)
+static void unzz_row(const uint16_t* __restrict z, int8_t* __restrict e, int w) { for (int x = 0; x < w; ++x) e[x] = int8_t(int(z[x] >> 1) ^ -int(z[x] & 1)); }
+static void recon_row0(uint8_t* __restrict r, const int8_t* __restrict e, int w) { int v = 0; for (int x = 0; x < w; ++x) { v = uint8_t(v + e[x]); r[x] = uint8_t(v); } }
+static void recon_row(uint8_t* __restrict r, const uint8_t* __restrict up, const int8_t* __restrict e, int w) {
+    int a = uint8_t(up[0] + e[0]); r[0] = uint8_t(a);
+    for (int x = 1; x < w; ++x) {
+        const int b = up[x], c = up[x - 1], mn = a < b ? a : b, mx = a < b ? b : a;
+        int p = a + b - c; p = p < mn ? mn : p; p = p > mx ? mx : p;
+        a = uint8_t(p + e[x]); r[x] = uint8_t(a);
+    }
 }
 static void tile_dec(In& in, uint8_t* img, int S, int tw, int th, const Cfg& c) {
     const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
-    static thread_local std::vector<uint16_t> z; z.resize(nb * 16);
+    static thread_local std::vector<uint16_t> z; static thread_local std::vector<int8_t> e; z.resize(nb * 16); e.resize(size_t(tw));
+    double t0 = now_s(), t1 = t0;
     if (c.mode == 0) { static thread_local UBuf<uint16_t> b; if (get_stream(in, b) != n) throw std::runtime_error("tile size"); memcpy(z.data(), b.data(), n * 2); }
     else {
         static thread_local UBuf<uint16_t> lb, hb[8]; if (get_stream(in, lb) != nb) throw std::runtime_error("L size");
         size_t hn[8], np = 0; for (int L = 0; L < 8; ++L) hn[L] = get_stream(in, hb[L]);
         for (size_t i = 0; i < nb; ++i) { if (lb.data()[i] > 7) throw std::runtime_error("L value"); np += lb.data()[i]; }
-        const uint8_t* pp = in.take(np * 2); size_t hp[8] = {0};
-        const __m128i bit0 = _mm_setr_epi16(1, 2, 4, 8, 16, 32, 64, 128), bit1 = _mm_slli_epi16(bit0, 8);
+        const uint8_t* pp = in.take(np * 2); size_t hp[8] = {0}; t1 = now_s(); g_t[3] += t1 - t0;
         for (size_t i = 0; i < nb; ++i) {
             const int L = lb.data()[i]; if (hp[L] + 16 > hn[L]) throw std::runtime_error("high stream");
-            const uint16_t* h = hb[L].data() + hp[L]; hp[L] += 16; const __m128i q = _mm_cvtsi32_si128(L);
-            __m128i v0 = _mm_sll_epi16(_mm_loadu_si128((const __m128i*)h), q), v1 = _mm_sll_epi16(_mm_loadu_si128((const __m128i*)(h + 8)), q);
-            for (int k = 0; k < L; ++k) {                                 // plane k: lane j gets bit j of the mask, as bit k
-                uint16_t m; memcpy(&m, pp, 2); pp += 2; const __m128i mv = _mm_set1_epi16(short(m)), one = _mm_set1_epi16(short(1 << k));
-                v0 = _mm_or_si128(v0, _mm_and_si128(_mm_cmpeq_epi16(_mm_and_si128(mv, bit0), bit0), one));
-                v1 = _mm_or_si128(v1, _mm_and_si128(_mm_cmpeq_epi16(_mm_and_si128(mv, bit1), bit1), one));
-            }
-            _mm_storeu_si128((__m128i*)&z[i * 16], v0); _mm_storeu_si128((__m128i*)&z[i * 16 + 8], v1);
+            block_unpack(hb[L].data() + hp[L], L, pp, &z[i * 16]); hp[L] += 16;
         }
         for (int L = 0; L < 8; ++L) if (hp[L] != hn[L]) throw std::runtime_error("high stream size");
     }
-    for (int y = 0; y < th; ++y) { uint8_t* r = img + size_t(y) * S;
-        for (int x = 0; x < tw; ++x) { uint32_t v = z[size_t(y) * tw + x]; int e = int(v >> 1) ^ -int(v & 1); r[x] = uint8_t(pred(r, x, y, S) + e); } }
+    double t2 = now_s(); g_t[4] += t2 - t1;
+    for (int y = 0; y < th; ++y) {
+        const uint16_t* zr = z.data() + size_t(y) * tw;
+        unzz_row(zr, e.data(), tw);                                                       // inverse zigzag, vectorized
+        if (y == 0) recon_row0(img, e.data(), tw); else recon_row(img + size_t(y) * S, img + size_t(y - 1) * S, e.data(), tw);
+    }
+    g_t[5] += now_s() - t2;
 }
 struct Grid { int nx, ny, ts, W, H; int tx(int i) const { return (i % nx) * ts; } int ty(int i) const { return (i / nx) * ts; }
     int tw(int i) const { return std::min(ts, W - tx(i)); } int th(int i) const { return std::min(ts, H - ty(i)); } };
@@ -125,6 +188,8 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < reps; ++k) { double a = now_s(); o = compress(px.data(), W, H, c); double b = now_s(); decompress(o, r, w2, h2); double e = now_s(); be = std::min(be, b - a); bd = std::min(bd, e - b); }
                 bool g = r == px; ok &= g; double n = double(W) * H; tpx += n; tb += o.size(); te += be; td += bd;
                 printf("%-16s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s  %s\n", std::filesystem::path(fn).filename().string().c_str(), W, H, o.size(), 8 * o.size() / n, n / be / 1e6, n / bd / 1e6, g ? "ok" : "FAIL"); }
+            for (double& t : g_t) t /= reps;
+            printf("ns/px  enc: residual %.2f  blocks %.2f  FSE %.2f | dec: FSE %.2f  unpack %.2f  MED %.2f\n", g_t[0] * 1e9 / tpx, g_t[1] * 1e9 / tpx, g_t[2] * 1e9 / tpx, g_t[3] * 1e9 / tpx, g_t[4] * 1e9 / tpx, g_t[5] * 1e9 / tpx);
             printf("TOTAL %zu files %.4f bpp  enc %.1f dec %.1f MB/s  (mode %d tile %d off %d)  %s\n", pos.size(), 8 * tb / tpx, tpx / te / 1e6, tpx / td / 1e6, c.mode, c.ts, c.off, ok ? "all ok" : "FAIL");
             return ok ? 0 : 3;
         }
