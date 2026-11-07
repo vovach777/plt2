@@ -111,6 +111,63 @@ static void recon_row(uint8_t* __restrict r, const uint8_t* __restrict up, const
         a = uint8_t(p + e[x]); r[x] = uint8_t(a);
     }
 }
+#if defined(__clang__)
+// ---- decoder MED as a wave over bands of 16 rows: lane k = row y0 + k, step t, lane k at x = t - k (skew 1 px per
+// row: MED needs a, b, c only). a = own lane, previous step; b = lane k-1, previous step; c = lane k-1, two steps
+// back; lane 0 takes b, c from the row above the band. Borders as PALIC-1: tile row 0: b = c = a (pred = left,
+// 0 at x = 0); x = 0: a = c = b (pred = up).
+// Skew in and out with 16 x 16 transposes: residual rows go to padded int16 rows (inverse zigzag, auto-vectorized);
+// steps t0..t0+15 = transpose of the 16 rows loaded at x = t0 - k; the 16 results transposed back are 16 runs of
+// row k at x = t0 - k .. t0 - k + 15 (out-of-tile x lands in the padding). Then int16 rows -> uint8 image rows.
+typedef int16_t v16s __attribute__((ext_vector_type(16)));
+static inline v16s ld16s(const int16_t* p) { v16s v; memcpy(&v, p, 32); return v; }
+#define SV __builtin_shufflevector
+static inline void tr16s(v16s* m) {                                            // in-place 16 x 16 transpose
+    for (int i = 0; i < 16; i++) if (!(i & 8)) { v16s a = m[i], b = m[i + 8];
+        m[i] = SV(a, b, 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23); m[i + 8] = SV(a, b, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31); }
+    for (int i = 0; i < 16; i++) if (!(i & 4)) { v16s a = m[i], b = m[i + 4];
+        m[i] = SV(a, b, 0, 1, 2, 3, 16, 17, 18, 19, 8, 9, 10, 11, 24, 25, 26, 27); m[i + 4] = SV(a, b, 4, 5, 6, 7, 20, 21, 22, 23, 12, 13, 14, 15, 28, 29, 30, 31); }
+    for (int i = 0; i < 16; i++) if (!(i & 2)) { v16s a = m[i], b = m[i + 2];
+        m[i] = SV(a, b, 0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29); m[i + 2] = SV(a, b, 2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31); }
+    for (int i = 0; i < 16; i += 2) { v16s a = m[i], b = m[i + 1];
+        m[i] = SV(a, b, 0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30); m[i + 1] = SV(a, b, 1, 17, 3, 19, 5, 21, 7, 23, 9, 25, 11, 27, 13, 29, 15, 31); }
+}
+static void unzz16(const uint16_t* __restrict z, int16_t* __restrict e, int w) { for (int x = 0; x < w; ++x) e[x] = int16_t(int(z[x] >> 1) ^ -int(z[x] & 1)); }
+static void row8(const int16_t* __restrict o, uint8_t* __restrict r, int w) { for (int x = 0; x < w; ++x) r[x] = uint8_t(o[x]); }
+static void recon_wave(uint8_t* img, int S, int tw, int th, const uint16_t* z) {
+    static thread_local std::vector<int16_t> Eb, Ob, T; const int RS = tw + 64;            // padded row: [-32, tw + 32)
+    Eb.assign(size_t(RS) * 16, 0); Ob.resize(size_t(RS) * 16); T.assign(size_t(tw) + 2, 0);
+    const v16s K = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}, lane0 = K == 0;
+    for (int y0 = 0; y0 < th; y0 += 16) {
+        const int R = std::min(16, th - y0), steps = tw + R - 1;
+        for (int k = 0; k < R; ++k) unzz16(z + size_t(y0 + k) * tw, Eb.data() + size_t(k) * RS + 32, tw);
+        for (int k = R; k < 16; ++k) std::fill(Eb.data() + size_t(k) * RS, Eb.data() + size_t(k + 1) * RS, int16_t(0));
+        int16_t* Tp = T.data() + 1;                                                // T[-1] = 0, T[tw] = 0
+        if (y0) for (int x = 0; x < tw; ++x) Tp[x] = img[size_t(y0 - 1) * S + x];
+        const bool first = y0 == 0;
+        v16s P1 = 0, P2 = 0;
+        for (int t0 = 0; t0 < steps; t0 += 16) {
+            v16s m[16];
+            for (int k = 0; k < 16; ++k) m[k] = ld16s(Eb.data() + size_t(k) * RS + 32 + t0 - k);
+            tr16s(m);                                                              // m[j] = residuals of step t0 + j
+            for (int j = 0; j < 16; ++j) {
+                const int t = t0 + j, tb = std::min(t, tw), tc = std::min(t - 1, tw);
+                v16s a = P1;
+                v16s b = SV(P1, (v16s)(int16_t)Tp[tb], 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+                v16s c = SV(P2, (v16s)(int16_t)Tp[tc], 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+                if (first) { b = lane0 ? a : b; c = lane0 ? a : c; }                // tile row 0: pred = left
+                const v16s x0 = K == (int16_t)t; a = x0 ? b : a; c = x0 ? b : c;   // x = 0: pred = up
+                const v16s mn = a < b ? a : b, mx = a < b ? b : a; v16s p = a + b - c; p = p < mn ? mn : p; p = p > mx ? mx : p;
+                const v16s v = (p + m[j]) & 255; P2 = P1; P1 = v; m[j] = v;
+            }
+            tr16s(m);                                                              // m[k] = row k at x = t0 - k ..
+            for (int k = 0; k < 16; ++k) memcpy(Ob.data() + size_t(k) * RS + 32 + t0 - k, &m[k], 32);
+        }
+        for (int k = 0; k < R; ++k) row8(Ob.data() + size_t(k) * RS + 32, img + size_t(y0 + k) * S, tw);
+    }
+}
+#undef SV
+#endif
 static void tile_dec(In& in, uint8_t* img, int S, int tw, int th, const Cfg& c) {
     const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
     static thread_local std::vector<uint16_t> z; static thread_local std::vector<int8_t> e; z.resize(nb * 16); e.resize(size_t(tw));
@@ -128,11 +185,15 @@ static void tile_dec(In& in, uint8_t* img, int S, int tw, int th, const Cfg& c) 
         for (int L = 0; L < 8; ++L) if (hp[L] != hn[L]) throw std::runtime_error("high stream size");
     }
     double t2 = now_s(); g_t[4] += t2 - t1;
+#if defined(__clang__) && !defined(PLN_ROWS)
+    recon_wave(img, S, tw, th, z.data());
+#else
     for (int y = 0; y < th; ++y) {
         const uint16_t* zr = z.data() + size_t(y) * tw;
         unzz_row(zr, e.data(), tw);                                                       // inverse zigzag, vectorized
         if (y == 0) recon_row0(img, e.data(), tw); else recon_row(img + size_t(y) * S, img + size_t(y - 1) * S, e.data(), tw);
     }
+#endif
     g_t[5] += now_s() - t2;
 }
 struct Grid { int nx, ny, ts, W, H; int tx(int i) const { return (i % nx) * ts; } int ty(int i) const { return (i / nx) * ts; }
