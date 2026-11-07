@@ -5,7 +5,8 @@
 // (8 streams = 8 contexts "noise of the block").
 //   -m 0: plain FSE4 over z.
 //   -m 1: L_b from the current block, sent as an FSE4 stream (alphabet 8).
-//   -m 2 (default): NO L stream — causal L_b from the 16 symbols directly above (z - tw; row 0 or a tile narrower
+//   Format and the "blocks across rows" rule with a worked 500 x 500 example: PLN1.md.
+//   -m 2 (default, by Argon): NO L stream — causal L_b from the 16 symbols directly above (z - tw; row 0 or a tile narrower
 //         than 16: the previous block; block 0: L = 2). Here off is part of the format (the decoder repeats the rule).
 //   -m 3: as 2, but every row of the tile is padded with z = 0 to a multiple of 16: blocks never straddle rows, the
 //         block above is always the same 16 columns, its L is kept from when it was coded. The padding is not coded
