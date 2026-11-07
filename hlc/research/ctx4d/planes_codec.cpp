@@ -111,7 +111,14 @@ static void tile_enc(const uint8_t* img, int S, int tw, int th, const Cfg& c, Ou
     zb.need(nb * 16 + 16); uint16_t* z = zb.data(); std::fill(z + n, z + nb * 16 + 16, uint16_t(0));
     double t0 = now_s(); resid_row0(img, z, tw);
     for (int y = 1; y < th; ++y) resid_row(img + size_t(y) * S, img + size_t(y - 1) * S, z + size_t(y) * zs, tw);
-    if (zs != tw) for (int y = 0; y < th; ++y) std::fill(z + size_t(y) * zs + tw, z + size_t(y + 1) * zs, uint16_t(0));
+    if (zs != tw) for (int y = 0; y < th; ++y) {
+#if defined(PLN_PADCOPY)                                                          // padding = cyclic copy of the row's tail block
+        uint16_t* zr = z + size_t(y) * zs; const int base = zs - 16, r = tw - base;
+        for (int x = tw; x < zs; ++x) zr[x] = zr[base + (x - base) % r];
+#else
+        std::fill(z + size_t(y) * zs + tw, z + size_t(y + 1) * zs, uint16_t(0));
+#endif
+    }
     double t1 = now_s(); g_t[0] += t1 - t0;
     if (c.mode == 0) { put_stream(o, z, n, 256, tmp); g_t[2] += now_s() - t1; return; }
     plb.need(nb * 8); uint16_t* pw = plb.data(); size_t hn[8] = {0};
@@ -238,8 +245,13 @@ static void tile_dec(In& in, uint8_t* img, int S, int tw, int th, const Cfg& c) 
             const size_t r = c.mode == 3 && i % bpr == bpr - 1 ? rl : 16;
             if (hp[L] + r > hn[L] || pp + 2 * L > in.e) throw std::runtime_error("high stream");
             uint16_t* h = hb[L].data() + hp[L];
-            if (r < 16) { alignas(32) uint16_t t[16] = {0}; memcpy(t, h, r * 2); block_unpack(t, L, pp, z + i * 16);
-                for (size_t j = r; j < 16; ++j) z[i * 16 + j] = 0; }                       // planes may carry garbage there: re-zero
+            if (r < 16) { alignas(32) uint16_t t[16] = {0}; memcpy(t, h, r * 2);
+#if defined(PLN_PADCOPY)
+                for (size_t j = r; j < 16; ++j) t[j] = t[j % r];                             // same copy as the encoder (planes carry its bits)
+                block_unpack(t, L, pp, z + i * 16); }
+#else
+                block_unpack(t, L, pp, z + i * 16); for (size_t j = r; j < 16; ++j) z[i * 16 + j] = 0; }
+#endif
             else block_unpack(h, L, pp, z + i * 16);
             hp[L] += r;
             if (c.mode == 3) Lo[i] = uint16_t(block_L(z + i * 16, c.off));

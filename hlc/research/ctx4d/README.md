@@ -225,5 +225,6 @@ PLN1 is smaller on all 24 files. Small files: process start dominates the MB/s. 
 | mode 3, padding coded as zeros in the high streams | 4.5535 (+0.59%) | 4.6223 (+1.05%) |
 | mode 3, padding not coded (only real symbols of a row's last block) | 4.5339 (+0.16%) | 4.5808 (+0.15%) |
 | same, L of a partial block = mean over the real symbols | 4.5427 | 4.6000 |
+| padding = cyclic copy of the row's tail block (`-DPLN_PADCOPY`, not coded) | 4.5426 | 4.6000 |
 
 Speed the same within noise. Kept as -m 3; mode 2 stays the default.
