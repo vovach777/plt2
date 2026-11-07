@@ -215,4 +215,4 @@ so off is part of the format here. Same 17 gray photos, process + file I/O, stat
 | PLN1 -m 2 -off 1 | 4.5799 (-3.32%) | 123 | 122 |
 
 PLN1 is smaller on all 24 files. Small files: process start dominates the MB/s. HALIC 0.7.2 does not decode 5 of the
-24 back (kodim01-04, 16; e.g. kodim01: 58868 pixels differ, rows 2..199 from x = 307), FAST 5 (01, 03, 16, 23 + ...).
+24 back (kodim01-04, 16; e.g. kodim01: 58868 pixels differ, rows 2..199 from x = 307), FAST 4 (kodim01, 03, 16, 23).
