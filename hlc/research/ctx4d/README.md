@@ -173,3 +173,21 @@ Only FSE is a separate pass. Sandbox, -cb 256K, 1 thread (wave = ctx4d_codec, sa
 | C4B1 128x16, SSE | | | 249 / 245 | 291 / 301 |
 | C4B1 128x64, AVX2 | 7.8848 (+1.0%) | 3.4512 (+2.6%) | 250 / 260 | 229 / 270 |
 | C4B1 256x256, AVX2 | 7.8312 (+0.3%) | 3.4000 (+1.1%) | (few blocks per image: lanes idle on the photos) | |
+
+### planes_codec: gray codec PLN1 (context-free, PALIC-1 MED + noise L per 16-block)
+
+Independent tiles 288 x 288 (as HALIC). Per tile: MED -> zigzag z; per 16-symbol block L = clamp(bw(mean z) - off, 0, 7):
+the L low bits raw as bit planes (movemask), the high part z >> L in one FSE4 stream per L value (8 contexts "noise
+of the block"), L itself through FSE4. Encoder: residual rows auto-vectorized by clang, blocks in ext_vector_type.
+Decoder: FSE + unpack, then MED as a wave over 16-row bands (skew 1 px per row, vector types), skew in and out by
+16 x 16 transposes. 17 gray photos (16 + cat, 15.8 Mpx), 1 thread, static builds, process start + file I/O included:
+
+| | bpp | enc MB/s | dec MB/s |
+|---|---|---|---|
+| HALIC 0.7.2 | 4.6495 | 205 | 125 |
+| HALIC 0.7.2 FAST | 4.7115 (+1.3%) | 228 | 123 |
+| PLN1, -off 2 | **4.5614 (-1.9%)** | **228** | **227** |
+| PLN1, -off 1 (default) | 4.5684 (-1.7%) | 217 | 218 |
+
+In-process (AVX2 / SSE): enc 443 / 370, dec 452 / 403 MB/s. Profile ns/px AVX2: enc residual 0.37, blocks 0.53, FSE 1.42;
+dec FSE 1.29, unpack 0.33, MED wave 0.63. HALIC 0.7.2 decodes g_p07 (1288 x 966) wrongly (57 K pixels from row 600).

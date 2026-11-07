@@ -85,20 +85,22 @@ static inline void block_unpack(const uint16_t* h, int L, const uint8_t*& pp, ui
 
 static void tile_enc(const uint8_t* img, int S, int tw, int th, const Cfg& c, Out& o, std::vector<uint8_t>& tmp) {
     const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
-    static thread_local std::vector<uint16_t> z, hi[8], Lb, pl; z.resize(nb * 16); std::fill(z.begin() + n, z.end(), uint16_t(0));
-    double t0 = now_s(); resid_row0(img, z.data(), tw);
-    for (int y = 1; y < th; ++y) resid_row(img + size_t(y) * S, img + size_t(y - 1) * S, z.data() + size_t(y) * tw, tw);
+    static thread_local UBuf<uint16_t> zb, hb[8], lbb, plb;                       // grow-only, never zero-filled
+    zb.need(nb * 16); uint16_t* z = zb.data(); std::fill(z + n, z + nb * 16, uint16_t(0));
+    double t0 = now_s(); resid_row0(img, z, tw);
+    for (int y = 1; y < th; ++y) resid_row(img + size_t(y) * S, img + size_t(y - 1) * S, z + size_t(y) * tw, tw);
     double t1 = now_s(); g_t[0] += t1 - t0;
-    if (c.mode == 0) { put_stream(o, z.data(), n, 256, tmp); g_t[2] += now_s() - t1; return; }
-    Lb.resize(nb); pl.resize(nb * 8); uint16_t* pw = pl.data(); for (auto& h : hi) h.resize(nb * 16); size_t hn[8] = {0};
+    if (c.mode == 0) { put_stream(o, z, n, 256, tmp); g_t[2] += now_s() - t1; return; }
+    lbb.need(nb); plb.need(nb * 8); uint16_t *Lb = lbb.data(), *pw = plb.data(); size_t hn[8] = {0};
+    for (auto& h : hb) h.need(nb * 16);
     for (size_t i = 0; i < nb; ++i) {
-        alignas(32) uint16_t hb[16]; const int L = block_planes(&z[i * 16], c.off, pw, hb); Lb[i] = uint16_t(L);
-        memcpy(&hi[L][hn[L]], hb, 32); hn[L] += 16;
+        alignas(32) uint16_t hk[16]; const int L = block_planes(z + i * 16, c.off, pw, hk); Lb[i] = uint16_t(L);
+        memcpy(hb[L].data() + hn[L], hk, 32); hn[L] += 16;
     }
     double t2 = now_s(); g_t[1] += t2 - t1;
-    put_stream(o, Lb.data(), nb, 8, tmp);
-    for (int L = 0; L < 8; ++L) put_stream(o, hi[L].data(), hn[L], 256u >> L, tmp);
-    o.raw(pl.data(), size_t(pw - pl.data()) * 2); g_t[2] += now_s() - t2;
+    put_stream(o, Lb, nb, 8, tmp);
+    for (int L = 0; L < 8; ++L) put_stream(o, hb[L].data(), hn[L], 256u >> L, tmp);
+    o.raw(plb.data(), size_t(pw - plb.data()) * 2); g_t[2] += now_s() - t2;
 }
 // ---- decoder: unpack (vector), inverse zigzag per row (auto-vectorized), MED chain scalar (cmov, borders peeled)
 static void unzz_row(const uint16_t* __restrict z, int8_t* __restrict e, int w) { for (int x = 0; x < w; ++x) e[x] = int8_t(int(z[x] >> 1) ^ -int(z[x] & 1)); }
@@ -170,9 +172,9 @@ static void recon_wave(uint8_t* img, int S, int tw, int th, const uint16_t* z) {
 #endif
 static void tile_dec(In& in, uint8_t* img, int S, int tw, int th, const Cfg& c) {
     const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
-    static thread_local std::vector<uint16_t> z; static thread_local std::vector<int8_t> e; z.resize(nb * 16); e.resize(size_t(tw));
+    static thread_local UBuf<uint16_t> zb; static thread_local std::vector<int8_t> e; zb.need(nb * 16); uint16_t* z = zb.data(); if (e.size() < size_t(tw)) e.resize(size_t(tw));
     double t0 = now_s(), t1 = t0;
-    if (c.mode == 0) { static thread_local UBuf<uint16_t> b; if (get_stream(in, b) != n) throw std::runtime_error("tile size"); memcpy(z.data(), b.data(), n * 2); }
+    if (c.mode == 0) { static thread_local UBuf<uint16_t> b; if (get_stream(in, b) != n) throw std::runtime_error("tile size"); memcpy(z, b.data(), n * 2); }
     else {
         static thread_local UBuf<uint16_t> lb, hb[8]; if (get_stream(in, lb) != nb) throw std::runtime_error("L size");
         size_t hn[8], np = 0; for (int L = 0; L < 8; ++L) hn[L] = get_stream(in, hb[L]);
@@ -180,16 +182,16 @@ static void tile_dec(In& in, uint8_t* img, int S, int tw, int th, const Cfg& c) 
         const uint8_t* pp = in.take(np * 2); size_t hp[8] = {0}; t1 = now_s(); g_t[3] += t1 - t0;
         for (size_t i = 0; i < nb; ++i) {
             const int L = lb.data()[i]; if (hp[L] + 16 > hn[L]) throw std::runtime_error("high stream");
-            block_unpack(hb[L].data() + hp[L], L, pp, &z[i * 16]); hp[L] += 16;
+            block_unpack(hb[L].data() + hp[L], L, pp, z + i * 16); hp[L] += 16;
         }
         for (int L = 0; L < 8; ++L) if (hp[L] != hn[L]) throw std::runtime_error("high stream size");
     }
     double t2 = now_s(); g_t[4] += t2 - t1;
 #if defined(__clang__) && !defined(PLN_ROWS)
-    recon_wave(img, S, tw, th, z.data());
+    recon_wave(img, S, tw, th, z);
 #else
     for (int y = 0; y < th; ++y) {
-        const uint16_t* zr = z.data() + size_t(y) * tw;
+        const uint16_t* zr = z + size_t(y) * tw;
         unzz_row(zr, e.data(), tw);                                                       // inverse zigzag, vectorized
         if (y == 0) recon_row0(img, e.data(), tw); else recon_row(img + size_t(y) * S, img + size_t(y - 1) * S, e.data(), tw);
     }
@@ -201,12 +203,15 @@ struct Grid { int nx, ny, ts, W, H; int tx(int i) const { return (i % nx) * ts; 
 static Grid grid(int W, int H, int ts) { return Grid{(W + ts - 1) / ts, (H + ts - 1) / ts, ts, W, H}; }
 
 std::vector<uint8_t> compress(const uint8_t* img, int W, int H, const Cfg& c) {
-    Grid g = grid(W, H, c.ts); const int nt = g.nx * g.ny; std::vector<std::vector<uint8_t>> t(nt); std::vector<uint8_t> tmp;
-    for (int i = 0; i < nt; ++i) { Out o; tile_enc(img + size_t(g.ty(i)) * W + g.tx(i), W, g.tw(i), g.th(i), c, o, tmp); t[i].swap(o.b); }
-    Out o; o.raw("PLN1", 4); o.var(W); o.var(H); o.var(c.ts); o.var(c.mode); o.var(c.off);
-    for (auto& b : t) { uint32_t l = uint32_t(b.size()); o.raw(&l, 4); }
-    for (auto& b : t) o.raw(b.data(), b.size());
-    return o.b;
+    Grid g = grid(W, H, c.ts); const int nt = g.nx * g.ny; static thread_local std::vector<uint8_t> tmp;
+    Out o; o.b.reserve(size_t(W) * H + size_t(nt) * 4 + 4096);                 // tiles go straight into the output
+    o.raw("PLN1", 4); o.var(W); o.var(H); o.var(c.ts); o.var(c.mode); o.var(c.off);
+    const size_t lens = o.b.size(); o.b.resize(lens + size_t(nt) * 4);
+    for (int i = 0; i < nt; ++i) {
+        const size_t b = o.b.size(); tile_enc(img + size_t(g.ty(i)) * W + g.tx(i), W, g.tw(i), g.th(i), c, o, tmp);
+        const uint32_t l = uint32_t(o.b.size() - b); memcpy(&o.b[lens + size_t(i) * 4], &l, 4);
+    }
+    return std::move(o.b);
 }
 void decompress(const std::vector<uint8_t>& d, std::vector<uint8_t>& img, int& W, int& H) {
     In in{d.data(), d.data() + d.size()}; if (d.size() < 4 || memcmp(in.take(4), "PLN1", 4)) throw std::runtime_error("not PLN1");
@@ -214,7 +219,7 @@ void decompress(const std::vector<uint8_t>& d, std::vector<uint8_t>& img, int& W
     if (W <= 0 || H <= 0 || c.ts < 1 || c.mode > 1) throw std::runtime_error("bad header");
     Grid g = grid(W, H, c.ts); const int nt = g.nx * g.ny; std::vector<uint32_t> len(nt);
     for (auto& l : len) memcpy(&l, in.take(4), 4);
-    img.assign(size_t(W) * H, 0);
+    img.resize(size_t(W) * H);                                                  // every pixel is written
     for (int i = 0; i < nt; ++i) { In ti{in.take(len[i]), nullptr}; ti.e = ti.p + len[i];
         tile_dec(ti, img.data() + size_t(g.ty(i)) * W + g.tx(i), W, g.tw(i), g.th(i), c); if (ti.p != ti.e) throw std::runtime_error("tile trailing bytes"); }
 }

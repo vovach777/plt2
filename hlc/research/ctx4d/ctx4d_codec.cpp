@@ -91,13 +91,15 @@ template <class T> struct UBuf {                                             // 
 static void put_stream(Out& o, const uint16_t* s, size_t n, unsigned A, std::vector<uint8_t>& tmp) {
     o.var(n); if (!n) return;
     double h0 = msnow();
-    static unsigned cnt[512], c4[4][512]; memset(c4, 0, sizeof c4); unsigned mx = 0; size_t i = 0;   // 4 sub-histograms
+    static unsigned cnt[512], c4[4][512]; for (auto& r : c4) memset(r, 0, A * sizeof(unsigned));   // 4 sub-histograms, used range only
+    unsigned mx = 0; size_t i = 0;
     for (; i + 4 <= n; i += 4) { c4[0][s[i]]++; c4[1][s[i + 1]]++; c4[2][s[i + 2]]++; c4[3][s[i + 3]]++; }
     for (; i < n; ++i) c4[0][s[i]]++;
     for (unsigned v = 0; v < A; ++v) { cnt[v] = c4[0][v] + c4[1][v] + c4[2][v] + c4[3][v]; if (cnt[v]) mx = v; }
     if (g_tm) g_tm->hist += msnow() - h0;
     if (cnt[s[0]] == n) { o.u8(1); o.var(s[0]); return; }
-    tmp.resize(n * 2 + 4096); size_t c = fse4_enc(tmp.data(), tmp.size(), s, n, mx, cnt);
+    if (tmp.size() < n * 2 + 4096) tmp.resize(n * 2 + 4096);                   // grow only: resize down/up re-zeroes
+    size_t c = fse4_enc(tmp.data(), n * 2 + 4096, s, n, mx, cnt);
     if (!c || c >= n * 2) { o.u8(0); o.raw(s, n * 2); return; }
     o.u8(6); o.var(c); o.raw(tmp.data(), c);
 }
