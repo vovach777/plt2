@@ -12,9 +12,10 @@ H = lambda n: os.path.join(hdir, n)
 codecs = {
     'HALIC': ([H('HALIC_ENCODE_0.7.2_ST_x64_avx2_Linux_Static')], [H('HALIC_DECODE_0.7.2_ST_x64_avx2_Linux_Static')]),
     'HALIC FAST': ([H('HALIC_ENCODE_FAST_0.7.2_ST_x64_avx2_Linux_Static')], [H('HALIC_DECODE_FAST_0.7.2_ST_x64_avx2_Linux_Static')]),
-    'PLN m1 off1': ([pln, 'c'], [pln, 'd'], ['-m', '1', '-off', '1']),
     'PLN m1 off2': ([pln, 'c'], [pln, 'd'], ['-m', '1', '-off', '2']),
-    'PLN m0 (FSE z)': ([pln, 'c'], [pln, 'd'], ['-m', '0']),
+    'PLN m2 off1': ([pln, 'c'], [pln, 'd'], ['-m', '2', '-off', '1']),
+    'PLN m2 off2': ([pln, 'c'], [pln, 'd'], ['-m', '2', '-off', '2']),
+    'PLN m2 off3': ([pln, 'c'], [pln, 'd'], ['-m', '2', '-off', '3']),
 }
 tmp = tempfile.mkdtemp(); c, o = os.path.join(tmp, 'c.bin'), os.path.join(tmp, 'o.pgm')
 def body(p): b = open(p, 'rb').read(); t = b.split(maxsplit=3); return t[1], t[2], t[3][1:] if t[3][:1].isspace() else t[3]

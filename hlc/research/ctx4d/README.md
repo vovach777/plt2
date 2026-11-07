@@ -191,3 +191,15 @@ Decoder: FSE + unpack, then MED as a wave over 16-row bands (skew 1 px per row, 
 
 In-process (AVX2 / SSE): enc 443 / 370, dec 452 / 403 MB/s. Profile ns/px AVX2: enc residual 0.37, blocks 0.53, FSE 1.42;
 dec FSE 1.29, unpack 0.33, MED wave 0.63. HALIC 0.7.2 decodes g_p07 (1288 x 966) wrongly (57 K pixels from row 600).
+
+#### PLN1 mode 2 (Argon): no L stream, L_b causal from the 16 symbols directly above (default, -m 2 -off 2)
+
+Decoder repeats the rule from already decoded z (row 0 / tiles narrower than 16: the previous block; block 0: L = 2),
+so off is part of the format here. Same 17 gray photos, process + file I/O, static builds:
+
+| | bpp | enc MB/s | dec MB/s |
+|---|---|---|---|
+| HALIC 0.7.2 | 4.6495 | 201 | 123 |
+| PLN1 -m 1 -off 2 (L stream) | 4.5614 (-1.89%) | 214 | 212 |
+| **PLN1 -m 2 -off 2** | **4.5268 (-2.64%)** | **220** | **211** |
+| PLN1 -m 2 -off 1 | 4.5258 (-2.66%) | 215 | 208 |
