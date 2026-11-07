@@ -203,3 +203,16 @@ so off is part of the format here. Same 17 gray photos, process + file I/O, stat
 | PLN1 -m 1 -off 2 (L stream) | 4.5614 (-1.89%) | 214 | 212 |
 | **PLN1 -m 2 -off 2** | **4.5268 (-2.64%)** | **220** | **211** |
 | PLN1 -m 2 -off 1 | 4.5258 (-2.66%) | 215 | 208 |
+
+#### Kodak gray (24 x 500 x 500, `../data/kodak_gray_all.zip`), process + file I/O, 5 runs
+
+| | bpp | enc MB/s | dec MB/s |
+|---|---|---|---|
+| HALIC 0.7.2 | 4.7371 | 102 | 74 |
+| HALIC 0.7.2 FAST | 4.7703 (+0.70%) | 108 | 74 |
+| PLN1 -m 1 -off 2 | 4.6172 (-2.53%) | 121 | 124 |
+| **PLN1 -m 2 -off 2** | **4.5741 (-3.44%)** | **123** | **121** |
+| PLN1 -m 2 -off 1 | 4.5799 (-3.32%) | 123 | 122 |
+
+PLN1 is smaller on all 24 files. Small files: process start dominates the MB/s. HALIC 0.7.2 does not decode 5 of the
+24 back (kodim01-04, 16; e.g. kodim01: 58868 pixels differ, rows 2..199 from x = 307), FAST 5 (01, 03, 16, 23 + ...).
