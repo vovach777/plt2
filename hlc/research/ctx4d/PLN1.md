@@ -89,7 +89,9 @@ In-process: enc ~450, dec ~415 MB/s (AVX2). HALIC 0.7.2 fails to decode 6 of the
 
 | codec | gray 17 | Kodak 24 |
 |---|---|---|
-| **FFV1 standard (context 0, range_tab, 1 slice)** | **4.3268** | **4.4279** |
+| **llcomp rc `-x 4`, map K = 128 trained on both sets** | **4.2774** | **4.3602** |
+| llcomp rc `-x 4`, map trained on the *other* set (held-out) | 4.2967 | 4.3706 |
+| FFV1 standard (context 0, range_tab, 1 slice) | 4.3268 | 4.4279 |
 | llcomp rc `-x 1` (4-D context) | 4.3443 | 4.4470 |
 | llcomp rc `-x 0` (tiny) | 4.3584 | 4.4599 |
 | FFV1 large (context 1, range_tab, 1 slice) | 4.3807 | 4.6031 |
@@ -101,3 +103,7 @@ In-process: enc ~450, dec ~415 MB/s (AVX2). HALIC 0.7.2 fails to decode 6 of the
 FFV1 tiles = slices; every slice resets the adaptive contexts: 4 slices +0.8% / +2.0%, more slices worse
 (`../ffv1_sweep.py`). range_def is 1% worse than range_tab. The large context model loses on these small images
 (more contexts to learn per pixel).
+
+`-x 4` (llcomp rc branch): FFV1-large-like cells (q11(L-TL), q11(TL-T), q11(T-TR), q5(LL-L), q5(TT-T), 16638 mirrored)
+clustered to K static contexts by `llcomp_large_cluster.py`. Held-out K sweep (train one set, test the other):
+K = 64: Kodak 4.3631, gray 4.3003; 128: 4.3706 / 4.2967; 256: 4.3924 / 4.3004. x Enb (`-x 5`) is worse (dilution).
