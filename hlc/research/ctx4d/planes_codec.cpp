@@ -205,10 +205,17 @@ static Grid grid(int W, int H, int ts) { return Grid{(W + ts - 1) / ts, (H + ts 
 std::vector<uint8_t> compress(const uint8_t* img, int W, int H, const Cfg& c) {
     Grid g = grid(W, H, c.ts); const int nt = g.nx * g.ny; static thread_local std::vector<uint8_t> tmp;
     Out o; o.b.reserve(size_t(W) * H + size_t(nt) * 4 + 4096);                 // tiles go straight into the output
-    o.raw("PLN1", 4); o.var(W); o.var(H); o.var(c.ts); o.var(c.mode); o.var(c.off);
+    o.raw("PLN1", 4); o.var(W); o.var(H); o.var(c.ts); o.var(c.mode); o.var(c.off < 0 ? 15 : c.off);          // off is informational (15 = per tile)
     const size_t lens = o.b.size(); o.b.resize(lens + size_t(nt) * 4);
     for (int i = 0; i < nt; ++i) {
-        const size_t b = o.b.size(); tile_enc(img + size_t(g.ty(i)) * W + g.tx(i), W, g.tw(i), g.th(i), c, o, tmp);
+        const size_t b = o.b.size(); const uint8_t* ti = img + size_t(g.ty(i)) * W + g.tx(i);
+        if (c.off >= 0 || c.mode == 0) tile_enc(ti, W, g.tw(i), g.th(i), c, o, tmp);
+        else {                                                                  // -off -1: best off 0..4 per tile (encoder only)
+            static thread_local Out best, cur; best.b.clear(); Cfg cc = c;
+            for (int off = 0; off <= 4; ++off) { cc.off = off; cur.b.clear(); tile_enc(ti, W, g.tw(i), g.th(i), cc, cur, tmp);
+                if (best.b.empty() || cur.b.size() < best.b.size()) std::swap(best.b, cur.b); }
+            o.raw(best.b.data(), best.b.size());
+        }
         const uint32_t l = uint32_t(o.b.size() - b); memcpy(&o.b[lens + size_t(i) * 4], &l, 4);
     }
     return std::move(o.b);
@@ -241,7 +248,7 @@ int main(int argc, char** argv) {
             for (auto& e : std::filesystem::directory_iterator(a)) if (e.path().extension() == ".pgm") v.push_back(e.path().string());
             std::sort(v.begin(), v.end()); pos.insert(pos.end(), v.begin(), v.end()); }
         else pos.push_back(a); }
-    if (c.ts < 16 || c.mode < 0 || c.mode > 1 || c.off < 0) { fprintf(stderr, "bad options\n"); return 1; }
+    if (c.ts < 16 || c.mode < 0 || c.mode > 1 || c.off < -1) { fprintf(stderr, "bad options\n"); return 1; }
     try {
         if (cmd == "c" && pos.size() == 2) { std::vector<uint8_t> px; int W, H; if (!read_pgm(pos[0].c_str(), px, W, H)) { fprintf(stderr, "need 8-bit P5\n"); return 1; }
             auto o = compress(px.data(), W, H, c); FILE* f = fopen(pos[1].c_str(), "wb"); if (!f) return 1; fwrite(o.data(), 1, o.size(), f); fclose(f); return 0; }
