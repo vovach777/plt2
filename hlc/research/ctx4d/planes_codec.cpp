@@ -135,16 +135,21 @@ static void tile_enc(const uint8_t* img, int S, int tw, int th, const Cfg& c, Ou
         o.raw(plb.data(), size_t(pw - plb.data()) * 2); g_t[2] += now_s() - t2;
     } else {
         const size_t bpr = size_t(zs) / 16; lbb.need(nb); uint16_t* Lo = lbb.data();  // mode 3: own L of each block
+        static thread_local std::vector<uint8_t> rawt; rawt.clear();
         for (size_t i = 0; i < nb; ++i) {
             alignas(32) uint16_t hk[16]; int L = 0;
             if (c.mode == 2) L = causal_L(z, i, tw, c.off);
             const int r = c.mode == 3 && i % bpr == bpr - 1 ? tw - int(bpr - 1) * 16 : 16;   // mode 3: padding is not coded
             if (c.mode == 3) { L = i >= bpr ? Lo[i - bpr] : (i ? Lo[i - 1] : 2); Lo[i] = uint16_t(block_L(z + i * 16, c.off)); }   // padding counts as 0 (better than the real mean)
+#if defined(PLN_RAWTAIL)                                                          // mode 3: the row's last partial block stored raw
+            if (r < 16) { for (int j = 0; j < r; ++j) rawt.push_back(uint8_t(z[i * 16 + j])); continue; }
+#endif
             block_split(z + i * 16, L, pw, hk);
             memcpy(hb[L].data() + hn[L], hk, 32); hn[L] += size_t(r);
         }
         double t2 = now_s(); g_t[1] += t2 - t1;
         for (int L = 0; L < 8; ++L) put_stream(o, hb[L].data(), hn[L], 256u >> L, tmp);
+        o.raw(rawt.data(), rawt.size());
         o.raw(plb.data(), size_t(pw - plb.data()) * 2); g_t[2] += now_s() - t2;
     }
 }
@@ -239,10 +244,16 @@ static void tile_dec(In& in, uint8_t* img, int S, int tw, int th, const Cfg& c) 
             if (c.mode == 2 && (hn[L] & 15)) throw std::runtime_error("high stream align"); }
         const size_t bpr = size_t(zs) / 16, rl = size_t(tw) - (bpr - 1) * 16;             // mode 3: real symbols of a row's last block
         const uint8_t* pp = in.p; size_t hp[8] = {0}; t1 = now_s(); g_t[3] += t1 - t0;
+#if defined(PLN_RAWTAIL)
+        const uint8_t* rt = pp; if (c.mode == 3 && rl < 16) pp = in.take(rl * size_t(th)) + rl * size_t(th);
+#endif
         static thread_local UBuf<uint16_t> lo; lo.need(nb); uint16_t* Lo = lo.data();
         for (size_t i = 0; i < nb; ++i) {
             const int L = c.mode == 2 ? causal_L(z, i, tw, c.off) : (i >= bpr ? Lo[i - bpr] : (i ? Lo[i - 1] : 2));
             const size_t r = c.mode == 3 && i % bpr == bpr - 1 ? rl : 16;
+#if defined(PLN_RAWTAIL)
+            if (r < 16) { for (size_t j = 0; j < 16; ++j) z[i * 16 + j] = j < r ? *rt++ : 0; Lo[i] = uint16_t(block_L(z + i * 16, c.off)); continue; }
+#endif
             if (hp[L] + r > hn[L] || pp + 2 * L > in.e) throw std::runtime_error("high stream");
             uint16_t* h = hb[L].data() + hp[L];
             if (r < 16) { alignas(32) uint16_t t[16] = {0}; memcpy(t, h, r * 2);
