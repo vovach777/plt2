@@ -84,3 +84,20 @@ Every alignment pays more on the tile edge than the imprecision of a crossing bl
 
 In-process: enc ~450, dec ~415 MB/s (AVX2). HALIC 0.7.2 fails to decode 6 of these 41 files back
 (g_p07; kodim01–04, 16).
+
+## Compression ranking on the gray sets (bpp; all round-trip checked except HALIC, which fails on 6 files)
+
+| codec | gray 17 | Kodak 24 |
+|---|---|---|
+| **FFV1 standard (context 0, range_tab, 1 slice)** | **4.3268** | **4.4279** |
+| llcomp rc `-x 1` (4-D context) | 4.3443 | 4.4470 |
+| llcomp rc `-x 0` (tiny) | 4.3584 | 4.4599 |
+| FFV1 large (context 1, range_tab, 1 slice) | 4.3807 | 4.6031 |
+| llcomp standard | 4.4135 | 4.5091 |
+| llcomp rc `-x 3` (8 groups) | 4.4150 | 4.4625 |
+| PLN1 `-m 2 -off 2` | 4.5268 | 4.5741 |
+| HALIC 0.7.2 | 4.6495 | 4.7371 |
+
+FFV1 tiles = slices; every slice resets the adaptive contexts: 4 slices +0.8% / +2.0%, more slices worse
+(`../ffv1_sweep.py`). range_def is 1% worse than range_tab. The large context model loses on these small images
+(more contexts to learn per pixel).
