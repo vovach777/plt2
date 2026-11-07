@@ -216,3 +216,14 @@ so off is part of the format here. Same 17 gray photos, process + file I/O, stat
 
 PLN1 is smaller on all 24 files. Small files: process start dominates the MB/s. HALIC 0.7.2 does not decode 5 of the
 24 back (kodim01-04, 16; e.g. kodim01: 58868 pixels differ, rows 2..199 from x = 307), FAST 4 (kodim01, 03, 16, 23).
+
+#### PLN1 mode 3 (experiment): rows padded to 16 with z = 0, blocks never straddle rows
+
+| | gray 17 | Kodak 24 |
+|---|---|---|
+| mode 2 (default) | 4.5268 | 4.5741 |
+| mode 3, padding coded as zeros in the high streams | 4.5535 (+0.59%) | 4.6223 (+1.05%) |
+| mode 3, padding not coded (only real symbols of a row's last block) | 4.5339 (+0.16%) | 4.5808 (+0.15%) |
+| same, L of a partial block = mean over the real symbols | 4.5427 | 4.6000 |
+
+Speed the same within noise. Kept as -m 3; mode 2 stays the default.
