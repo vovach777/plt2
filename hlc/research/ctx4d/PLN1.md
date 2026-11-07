@@ -89,7 +89,10 @@ In-process: enc ~450, dec ~415 MB/s (AVX2). HALIC 0.7.2 fails to decode 6 of the
 
 | codec | gray 17 | Kodak 24 |
 |---|---|---|
-| **llcomp rc `-x 4`, map K = 128 trained on both sets** | **4.2774** | **4.3602** |
+| **llcomp rc `-x 6` (preset CDFs), K = 256 trained on both sets** | **4.2615** | **4.3281** |
+| llcomp rc `-x 6`, trained on the *other* set (held-out) | 4.2833 | 4.3418 |
+| FFV1 two-pass (fitted initial states; needs level 3: 4 slices), best context | 4.2858 (large) | 4.3534 (standard) |
+| llcomp rc `-x 4`, map K = 128 trained on both sets | 4.2774 | 4.3602 |
 | llcomp rc `-x 4`, map trained on the *other* set (held-out) | 4.2967 | 4.3706 |
 | FFV1 standard (context 0, range_tab, 1 slice) | 4.3268 | 4.4279 |
 | llcomp rc `-x 1` (4-D context) | 4.3443 | 4.4470 |
@@ -107,3 +110,7 @@ FFV1 tiles = slices; every slice resets the adaptive contexts: 4 slices +0.8% / 
 `-x 4` (llcomp rc branch): FFV1-large-like cells (q11(L-TL), q11(TL-T), q11(T-TR), q5(LL-L), q5(TT-T), 16638 mirrored)
 clustered to K static contexts by `llcomp_large_cluster.py`. Held-out K sweep (train one set, test the other):
 K = 64: Kodak 4.3631, gray 4.3003; 128: 4.3706 / 4.2967; 256: 4.3924 / 4.3004. x Enb (`-x 5`) is worse (dilution).
+
+`-x 6`: the 256 clusters start from preset CDFs (corpus letter distributions) with a slower start of the adaptation
+(count 64). Held-out, preset count sweep 0 / 16 / 32 / 64 / 128: Kodak 4.3700 / 4.3523 / 4.3454 / 4.3418 / 4.3413,
+gray 4.2892 / 4.2849 / 4.2836 / 4.2833 / 4.2838. With presets K = 256 is no longer worse than 128.
