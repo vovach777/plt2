@@ -114,3 +114,18 @@ K = 64: Kodak 4.3631, gray 4.3003; 128: 4.3706 / 4.2967; 256: 4.3924 / 4.3004. x
 `-x 6`: the 256 clusters start from preset CDFs (corpus letter distributions) with a slower start of the adaptation
 (count 64). Held-out, preset count sweep 0 / 16 / 32 / 64 / 128: Kodak 4.3700 / 4.3523 / 4.3454 / 4.3418 / 4.3413,
 gray 4.2892 / 4.2849 / 4.2836 / 4.2833 / 4.2838. With presets K = 256 is no longer worse than 128.
+
+## Kodak colour (24 x 500 x 500 P6), bpp, all round trips ok (`../color_rank.py`)
+
+| codec | bpp |
+|---|---|
+| **llcomp rc `-x 6`, map/presets without Kodak (held-out)** | **9.1675** |
+| llcomp rc `-x 6`, shipped map (its Y part saw Kodak gray) | 9.1589 |
+| FFV1 standard, range_tab, 1 slice (nut container, ~0.016 bpp of it) | 9.2727 |
+| llcomp rc `-x 1` (4-D) | 9.3428 |
+| llcomp rc `-x 0` (tiny) | 9.4558 |
+| FFV1 large, 1 slice | 9.5079 |
+| llcomp standard, Y and U/V contexts split | 9.5413 |
+| llcomp standard (one context set for all channels) | 9.6756 |
+| HALIC 0.7.2 | 10.3490 |
+| HALIC 0.7.2 FAST | 10.5793 |
