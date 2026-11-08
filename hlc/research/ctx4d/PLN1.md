@@ -141,3 +141,7 @@ gray 4.2892 / 4.2849 / 4.2836 / 4.2833 / 4.2838. With presets K = 256 is no long
 
 \* nut container (~500 bytes per file). The Kodak-trained map fits phone photos but not big: there FFV1 large
 (and even rc tiny) adapts better; more clusters / a faster preset start are the candidates.
+
+Sign rule A/B in rc large cells (Kodak-trained 256/256, same test sets): tiny sign (c-a, else c-b) instead of the
+FFV1 index sign: -x 6 -> 4.2804 / 7.4767 / 3.0817 vs 4.2836 / 7.4710 / 3.0712 (gray 17 / 19 colour / big):
+no gain once 16 k cells are clustered by data; the FFV1 rule stays.
