@@ -129,3 +129,15 @@ gray 4.2892 / 4.2849 / 4.2836 / 4.2833 / 4.2838. With presets K = 256 is no long
 | llcomp standard (one context set for all channels) | 9.6756 |
 | HALIC 0.7.2 | 10.3490 |
 | HALIC 0.7.2 FAST | 10.5793 |
+
+## llcomp rc `-x 6` trained on Kodak colour only (Y and U/V, 256 / 256), tested on our sets
+
+| set | rc `-x 6` | rc `-x 4` (no presets) | FFV1 standard | FFV1 large | rc tiny | HALIC 0.7.2 |
+|---|---|---|---|---|---|---|
+| gray 17 | **4.2836** | 4.3008 | 4.3293* | 4.3832* | 4.3584 | 4.6495 |
+| 19 colour photos | **7.4710** | | 7.5536 | 7.5675 | | |
+| big 4033 x 3001 | 3.0712 | | 3.0131 | **2.8581** | 2.9785 | |
+| colour 20 (19 + big) | 5.6643 | 5.6842 | 5.6908* | **5.6354*** | 5.7257 | 6.5427 |
+
+\* nut container (~500 bytes per file). The Kodak-trained map fits phone photos but not big: there FFV1 large
+(and even rc tiny) adapts better; more clusters / a faster preset start are the candidates.
