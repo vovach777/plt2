@@ -151,15 +151,20 @@ no gain once 16 k cells are clustered by data; the FFV1 rule stays.
 Y is PLN1 mode 2 (8-bit wrap, causal L, `-off 2`, tile 288). U and V are the reversible RCT
 (`U = R-G`, `V = B-G`, `Y = G+(U+V+2)>>2`, then `V -= U>>2`). A chroma sample is `-255..255`, so the
 MED residual `-510..510` folds modulo 512 into `-256..255` before the zigzag; the symbol stays in `0..511`
-and the FSE bound is `512>>L` (no per-stream max scan). In-process, 5 runs, every file round-trips.
-PLN2 is 294 MB/s encode and 137 MB/s decode.
+and the FSE bound is `512>>L` (no per-stream max scan). Every file round-trips. One process per image,
+wall clock on this machine (not the i7 times from the public table, and not the in-process 294 / 137 MB/s):
 
-| | bytes | bpp |
-|---|---:|---:|
-| ctx4d (earlier run, same files) | 11 220 144 | 9.5114 |
-| **PLN2 `-m 2 -off 2`** | **11 640 622** | **9.8679** |
-| HALIC 0.7.2 (earlier run, same files) | 11 913 726 | 10.0994 |
+| | bytes | bpp | enc s | dec s | enc MB/s | dec MB/s |
+|---|---:|---:|---:|---:|---:|---:|
+| llcomp `-x 11` | 10 598 730 | 8.985 | 1.643 | 1.697 | 17 | 17 |
+| NBLI `-g` | 10 681 546 | 9.055 | 2.661 | 2.419 | 11 | 12 |
+| fNBLI | 10 822 082 | 9.174 | 0.435 | 0.281 | 65 | 101 |
+| llcomp `-x 0` | 10 864 795 | 9.210 | 0.840 | 0.925 | 34 | 31 |
+| FFV1 level 1, rice, context 0 | 11 166 333 | 9.466 | 1.579 | 1.585 | 18 | 18 |
+| ctx4d | 11 220 144 | 9.511 | 0.325 | 0.329 | 87 | 86 |
+| **PLN2 `-m 2 -off 2`** | **11 640 622** | **9.868** | **0.335** | **0.348** | **85** | **81** |
+| HALIC 0.7.2 | 11 913 726 | 10.099 | 0.198 | 0.335 | 143 | 85 |
 
 On this set the 9-bit fold does not change the size: no residual leaves `-256..255`. A synthetic frame
 whose neighbours jump by ±510 does round-trip, which is the case the fold is for. Gray PLN1 is unchanged
-(Kodak gray 4.5741). These MB/s are in-process; the gray tables above include process start and file I/O.
+(Kodak gray 4.5741).
