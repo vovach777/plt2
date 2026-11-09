@@ -33,7 +33,7 @@ static inline int pred(const uint8_t* r, int x, int y, int S) {     // r = row y
     return med(r[x - 1], r[x - S], r[x - S - 1]);
 }
 static double g_t[6];   // profile: enc residual, blocks, FSE | dec FSE, unpack, MED
-struct Cfg { int ts = 288, mode = 2, off = 2; };
+struct Cfg { int ts = 288, mode = 2, off = 2, offc = -1, cl = 2; };   // cl: chroma L, 2 = predicted, 1 = stored
 
 // ---- residuals: plain loops, clang auto-vectorizes them (borders peeled off, no branch in the loop body)
 static inline uint16_t zz8(int e) { e = int8_t(e); return uint16_t(uint8_t((e << 1) ^ (e >> 7))); }
@@ -57,7 +57,7 @@ static inline v16u ld16(const uint16_t* p) { v16u v; memcpy(&v, p, 32); return v
 static inline void st16(uint16_t* p, v16u v) { memcpy(p, &v, 32); }
 static inline uint16_t mask16(v16u v) { return __builtin_bit_cast(uint16_t, __builtin_convertvector(v != 0, v16b)); }
 #endif
-static inline int block_L(const uint16_t* s, int off) {
+static inline __attribute__((always_inline)) int block_L(const uint16_t* s, int off) {
 #if defined(PLN_SSE)
     const __m128i a0 = _mm_loadu_si128((const __m128i*)s), a1 = _mm_loadu_si128((const __m128i*)(s + 8));
     __m128i t = _mm_add_epi16(a0, a1); t = _mm_add_epi16(t, _mm_srli_si128(t, 8)); t = _mm_add_epi16(t, _mm_srli_si128(t, 4)); t = _mm_add_epi16(t, _mm_srli_si128(t, 2));
@@ -68,6 +68,14 @@ static inline int block_L(const uint16_t* s, int off) {
     uint32_t sum = 0; for (int j = 0; j < 16; ++j) sum += s[j];
     return std::min(7, std::max(0, int(bwz(sum >> 4)) - off));
 #endif
+}
+template<int Off>
+static inline int block_Lt(const uint16_t* s) { return block_L(s, Off); }   // Off is a constant, the subtract folds
+template<int Off>
+static inline int causal_Lt(const uint16_t* z, size_t i, int tw) {
+    const size_t px = i * 16;
+    if (tw >= 16 && px >= size_t(tw)) return block_Lt<Off>(z + px - tw);
+    return i ? block_Lt<Off>(z + px - 16) : 2;
 }
 static inline void block_split(const uint16_t* s, int L, uint16_t*& pw, uint16_t* hi) {
 #if defined(PLN_SSE)
@@ -137,6 +145,14 @@ static void tile_enc(const uint8_t* img, int S, int tw, int th, const Cfg& c, Ou
     } else {
         const size_t bpr = size_t(zs) / 16; lbb.need(nb); uint16_t* Lo = lbb.data();  // mode 3: own L of each block
         static thread_local std::vector<uint8_t> rawt; rawt.clear();
+        if (c.mode == 2 && c.off == 2) {
+            for (size_t i = 0; i < nb; ++i) {
+                alignas(32) uint16_t hk[16];
+                const int L = causal_Lt<2>(z, i, tw);
+                block_split(z + i * 16, L, pw, hk);
+                memcpy(hb[L].data() + hn[L], hk, 32); hn[L] += 16;
+            }
+        } else
         for (size_t i = 0; i < nb; ++i) {
             alignas(32) uint16_t hk[16]; int L = 0;
             if (c.mode == 2) L = causal_L(z, i, tw, c.off);
@@ -249,6 +265,13 @@ static void tile_dec(In& in, uint8_t* img, int S, int tw, int th, const Cfg& c) 
         const uint8_t* rt = pp; if (c.mode == 3 && rl < 16) pp = in.take(rl * size_t(th)) + rl * size_t(th);
 #endif
         static thread_local UBuf<uint16_t> lo; lo.need(nb); uint16_t* Lo = lo.data();
+        if (c.mode == 2 && c.off == 2) {
+            for (size_t i = 0; i < nb; ++i) {
+                const int L = causal_Lt<2>(z, i, tw);
+                if (hp[L] + 16 > hn[L] || pp + 2 * L > in.e) throw std::runtime_error("high stream");
+                block_unpack(hb[L].data() + hp[L], L, pp, z + i * 16); hp[L] += 16;
+            }
+        } else
         for (size_t i = 0; i < nb; ++i) {
             const int L = c.mode == 2 ? causal_L(z, i, tw, c.off) : (i >= bpr ? Lo[i - bpr] : (i ? Lo[i - 1] : 2));
             const size_t r = c.mode == 3 && i % bpr == bpr - 1 ? rl : 16;
@@ -320,35 +343,215 @@ static bool read_pgm(const char* fn, std::vector<uint8_t>& px, int& W, int& H) {
     if (fscanf(f, "P5 %d %d %d", &W, &H, &mx) != 3 || mx != 255) { fclose(f); return false; }
     fgetc(f); px.resize(size_t(W) * H); bool ok = fread(px.data(), 1, px.size(), f) == px.size(); fclose(f); return ok;
 }
+
+// Color, mode 2 only. An RGB tile (tw*3 bytes by th) is split at once into three tw x th planes and each is
+// coded by the gray mode-2 path, in order Y, U, V. No interleave: the decoder skew stays per plane.
+//   U = R-G, V = B-G, Y = G + (U+V+2)>>2, then V -= U>>2.
+// Y stays in 0..255 and uses the 8-bit codec. U and V are -255..255 (511 values), so the residual
+// -510..510 folds modulo 512 into -256..255 and its zigzag stays in 0..511.
+static inline int wrap9(int d) { return int(unsigned(d + 256) & 511u) - 256; }
+static inline int fold9(int s) { if (s > 255) return s - 512; if (s < -255) return s + 512; return s; }
+static inline uint16_t zz16(int e) { return uint16_t((e << 1) ^ (e >> 31)); }
+static void resid16_row0(const int16_t* __restrict r, uint16_t* __restrict z, int w) {
+    z[0] = zz16(r[0]);
+    for (int x = 1; x < w; ++x) z[x] = zz16(wrap9(r[x] - r[x - 1]));
+}
+static void resid16_row(const int16_t* __restrict r, const int16_t* __restrict up, uint16_t* __restrict z, int w) {
+    z[0] = zz16(wrap9(r[0] - up[0]));
+    for (int x = 1; x < w; ++x) z[x] = zz16(wrap9(r[x] - med(r[x - 1], up[x], up[x - 1])));
+}
+static long long cL_n, cL_eq, cL_own[8], cL_pred[8], cL_d[15];
+static void note_L(int pred, int own) {
+    cL_n++; if (pred == own) cL_eq++;
+    if (unsigned(own) < 8) cL_own[own]++; if (unsigned(pred) < 8) cL_pred[pred]++;
+    int d = pred - own; if (d < -7) d = -7; if (d > 7) d = 7; cL_d[d + 7]++;
+}
+static void tile_enc16(const int16_t* img, int tw, int th, const Cfg& c, Out& o, std::vector<uint8_t>& tmp) {
+    const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
+    static thread_local UBuf<uint16_t> zb, hb[8], plb, lbb;
+    zb.need(nb * 16 + 16); uint16_t* z = zb.data(); std::fill(z, z + nb * 16 + 16, uint16_t(0));
+    resid16_row0(img, z, tw);
+    for (int y = 1; y < th; ++y) resid16_row(img + size_t(y) * tw, img + size_t(y - 1) * tw, z + size_t(y) * tw, tw);
+    plb.need(nb * 8); uint16_t* pw = plb.data(); size_t hn[8] = {0};
+    for (auto& h : hb) h.need(nb * 16);
+    if (c.mode == 1) {
+        lbb.need(nb); uint16_t* Lb = lbb.data();
+        for (size_t i = 0; i < nb; ++i) {
+            alignas(32) uint16_t hk[16];
+            const int pred = causal_L(z, i, tw, c.off), own = block_L(z + i * 16, c.off); note_L(pred, own);
+            block_split(z + i * 16, own, pw, hk); Lb[i] = uint16_t(own);
+            memcpy(hb[own].data() + hn[own], hk, 32); hn[own] += 16;
+        }
+        put_stream(o, Lb, nb, 8, tmp);
+    } else if (c.off == 2) {
+        for (size_t i = 0; i < nb; ++i) {
+            alignas(32) uint16_t hk[16];
+            const int pred = causal_Lt<2>(z, i, tw); note_L(pred, block_Lt<2>(z + i * 16));
+            block_split(z + i * 16, pred, pw, hk);
+            memcpy(hb[pred].data() + hn[pred], hk, 32); hn[pred] += 16;
+        }
+    } else {
+        for (size_t i = 0; i < nb; ++i) {
+            alignas(32) uint16_t hk[16];
+            const int pred = causal_L(z, i, tw, c.off); note_L(pred, block_L(z + i * 16, c.off));
+            block_split(z + i * 16, pred, pw, hk);
+            memcpy(hb[pred].data() + hn[pred], hk, 32); hn[pred] += 16;
+        }
+    }
+    for (int L = 0; L < 8; ++L) put_stream(o, hb[L].data(), hn[L], 512u >> L, tmp);
+    o.raw(plb.data(), size_t(pw - plb.data()) * 2);
+}
+static void recon16_row0(int16_t* r, const int16_t* e, int w) { int v = 0; for (int x = 0; x < w; ++x) { v = fold9(v + e[x]); r[x] = int16_t(v); } }
+static void recon16_row(int16_t* r, const int16_t* up, const int16_t* e, int w) {
+    int a = fold9(up[0] + e[0]); r[0] = int16_t(a);
+    for (int x = 1; x < w; ++x) { a = fold9(med(a, up[x], up[x - 1]) + e[x]); r[x] = int16_t(a); }
+}
+static void tile_dec16(In& in, int16_t* img, int tw, int th, const Cfg& c) {
+    const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
+    static thread_local UBuf<uint16_t> zb, hb[8]; static thread_local std::vector<int16_t> e;
+    zb.need(nb * 16 + 16); uint16_t* z = zb.data(); std::fill(z, z + nb * 16, uint16_t(0)); if (e.size() < size_t(tw)) e.resize(tw);
+    size_t hn[8];
+    const uint8_t* pp; size_t hp[8] = {0};
+    static thread_local UBuf<uint16_t> lb;
+    if (c.mode == 1) {
+        if (get_stream(in, lb) != nb) throw std::runtime_error("L size");
+        for (int L = 0; L < 8; ++L) hn[L] = get_stream(in, hb[L]);
+        size_t np = 0; for (size_t i = 0; i < nb; ++i) { if (lb.data()[i] > 7) throw std::runtime_error("L value"); np += lb.data()[i]; }
+        pp = in.take(np * 2);
+        for (size_t i = 0; i < nb; ++i) {
+            const int L = lb.data()[i]; if (hp[L] + 16 > hn[L]) throw std::runtime_error("high stream");
+            block_unpack(hb[L].data() + hp[L], L, pp, z + i * 16); hp[L] += 16;
+        }
+    } else if (c.off == 2) {
+        for (int L = 0; L < 8; ++L) { hn[L] = get_stream(in, hb[L]); if (hn[L] & 15) throw std::runtime_error("high stream align"); }
+        pp = in.p;
+        for (size_t i = 0; i < nb; ++i) {
+            const int L = causal_Lt<2>(z, i, tw);
+            if (hp[L] + 16 > hn[L] || pp + 2 * L > in.e) throw std::runtime_error("high stream");
+            block_unpack(hb[L].data() + hp[L], L, pp, z + i * 16); hp[L] += 16;
+        }
+        in.p = pp;
+    } else {
+        for (int L = 0; L < 8; ++L) { hn[L] = get_stream(in, hb[L]); if (hn[L] & 15) throw std::runtime_error("high stream align"); }
+        pp = in.p;
+        for (size_t i = 0; i < nb; ++i) {
+            const int L = causal_L(z, i, tw, c.off);
+            if (hp[L] + 16 > hn[L] || pp + 2 * L > in.e) throw std::runtime_error("high stream");
+            block_unpack(hb[L].data() + hp[L], L, pp, z + i * 16); hp[L] += 16;
+        }
+        in.p = pp;
+    }
+    for (int L = 0; L < 8; ++L) if (hp[L] != hn[L]) throw std::runtime_error("high stream size");
+    for (int y = 0; y < th; ++y) {
+        const uint16_t* zr = z + size_t(y) * tw;
+        for (int x = 0; x < tw; ++x) e[x] = int16_t(int(zr[x] >> 1) ^ -int(zr[x] & 1));
+        if (y == 0) recon16_row0(img + size_t(y) * tw, e.data(), tw);
+        else recon16_row(img + size_t(y) * tw, img + size_t(y - 1) * tw, e.data(), tw);
+    }
+}
+static void rgb_split(const uint8_t* rgb, int W, int tw, int th, std::vector<uint8_t>& Y, std::vector<int16_t>& U, std::vector<int16_t>& V) {
+    Y.resize(size_t(tw) * th); U.resize(Y.size()); V.resize(Y.size());
+    for (int y = 0; y < th; ++y) {
+        const uint8_t* p = rgb + size_t(y) * W * 3;
+        for (int x = 0; x < tw; ++x) {
+            int r = p[3 * x], g = p[3 * x + 1], b = p[3 * x + 2];
+            int u = r - g, v = b - g, yy = g + ((u + v + 2) >> 2); v -= u >> 2;
+            if (unsigned(yy) > 255) throw std::runtime_error("Y out of range");
+            Y[size_t(y) * tw + x] = uint8_t(yy); U[size_t(y) * tw + x] = int16_t(u); V[size_t(y) * tw + x] = int16_t(v);
+        }
+    }
+}
+static void rgb_join(uint8_t* rgb, int W, int tw, int th, const uint8_t* Y, const int16_t* U, const int16_t* V) {
+    for (int y = 0; y < th; ++y) for (int x = 0; x < tw; ++x) {
+        int yy = Y[size_t(y) * tw + x], u = U[size_t(y) * tw + x], v = V[size_t(y) * tw + x];
+        v += u >> 2; yy -= (u + v + 2) >> 2;
+        uint8_t* p = rgb + (size_t(y) * W + x) * 3;
+        p[0] = uint8_t(u + yy); p[1] = uint8_t(yy); p[2] = uint8_t(v + yy);
+    }
+}
+std::vector<uint8_t> compress_rgb(const uint8_t* rgb, int W, int H, const Cfg& c) {
+    Cfg m = c; m.mode = 2; if (m.off < 0) m.off = 2;
+    Cfg uv = m; if (c.offc >= 0) uv.off = c.offc; uv.mode = c.cl == 1 ? 1 : 2;
+    Grid g = grid(W, H, m.ts); const int nt = g.nx * g.ny; static thread_local std::vector<uint8_t> tmp, Y; static thread_local std::vector<int16_t> U, V;
+    Out o; o.b.reserve(size_t(W) * H * 3);
+    o.raw("PLN2", 4); o.var(W); o.var(H); o.var(m.ts); o.var(2); o.var(m.off); o.var(uv.off); o.var(uv.mode);
+    const size_t lens = o.b.size(); o.b.resize(lens + size_t(nt) * 4);
+    for (int i = 0; i < nt; ++i) {
+        const size_t b = o.b.size();
+        rgb_split(rgb + (size_t(g.ty(i)) * W + g.tx(i)) * 3, W, g.tw(i), g.th(i), Y, U, V);
+        tile_enc(Y.data(), g.tw(i), g.tw(i), g.th(i), m, o, tmp);
+        tile_enc16(U.data(), g.tw(i), g.th(i), uv, o, tmp);
+        tile_enc16(V.data(), g.tw(i), g.th(i), uv, o, tmp);
+        const uint32_t l = uint32_t(o.b.size() - b); memcpy(&o.b[lens + size_t(i) * 4], &l, 4);
+    }
+    return std::move(o.b);
+}
+void decompress_rgb(const std::vector<uint8_t>& d, std::vector<uint8_t>& rgb, int& W, int& H) {
+    In in{d.data(), d.data() + d.size()}; if (d.size() < 4 || memcmp(in.take(4), "PLN2", 4)) throw std::runtime_error("not PLN2");
+    Cfg c; W = int(in.var()); H = int(in.var()); c.ts = int(in.var()); c.mode = int(in.var()); c.off = int(in.var()); c.offc = int(in.var()); c.cl = int(in.var());
+    if (W <= 0 || H <= 0 || c.ts < 1 || c.mode != 2 || (c.cl != 1 && c.cl != 2)) throw std::runtime_error("bad header");
+    Cfg uv = c; uv.off = c.offc; uv.mode = c.cl;
+    Grid g = grid(W, H, c.ts); const int nt = g.nx * g.ny; std::vector<uint32_t> len(nt);
+    for (auto& l : len) memcpy(&l, in.take(4), 4);
+    rgb.assign(size_t(W) * H * 3, 0);
+    static thread_local std::vector<uint8_t> Y; static thread_local std::vector<int16_t> U, V;
+    for (int i = 0; i < nt; ++i) {
+        In ti{in.take(len[i]), nullptr}; ti.e = ti.p + len[i];
+        const int tw = g.tw(i), th = g.th(i);
+        Y.assign(size_t(tw) * th, 0); U.assign(Y.size(), 0); V.assign(Y.size(), 0);
+        tile_dec(ti, Y.data(), tw, tw, th, c);
+        tile_dec16(ti, U.data(), tw, th, uv);
+        tile_dec16(ti, V.data(), tw, th, uv);
+        if (ti.p != ti.e) throw std::runtime_error("tile trailing bytes");
+        rgb_join(rgb.data() + (size_t(g.ty(i)) * W + g.tx(i)) * 3, W, tw, th, Y.data(), U.data(), V.data());
+    }
+}
 }  // namespace pln
 
 int main(int argc, char** argv) {
     using namespace pln;
-    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm out.pln [-m 0|1|2] [-ts N] [-off K] | d in.pln out.pgm | bench a.pgm|dir ... [-r N] [-m] [-ts] [-off]\n", argv[0]); return 1; }
+    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.pln [-m 0|1|2] [-ts N] [-off K] | d in.pln out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N] [-m] [-ts] [-off]\n", argv[0]); return 1; }
     std::string cmd = argv[1]; Cfg c; int reps = 3; std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i) { std::string a = argv[i];
         if (a == "-m" && i + 1 < argc) c.mode = atoi(argv[++i]); else if (a == "-ts" && i + 1 < argc) c.ts = atoi(argv[++i]);
-        else if (a == "-off" && i + 1 < argc) c.off = atoi(argv[++i]); else if (a == "-r" && i + 1 < argc) reps = atoi(argv[++i]);
+        else if (a == "-off" && i + 1 < argc) c.off = atoi(argv[++i]); else if (a == "-offc" && i + 1 < argc) c.offc = atoi(argv[++i]);
+        else if (a == "-cl" && i + 1 < argc) c.cl = atoi(argv[++i]);
+        else if (a == "-r" && i + 1 < argc) reps = atoi(argv[++i]);
         else if (cmd == "bench" && std::filesystem::is_directory(a)) { std::vector<std::string> v;
-            for (auto& e : std::filesystem::directory_iterator(a)) if (e.path().extension() == ".pgm") v.push_back(e.path().string());
+            for (auto& e : std::filesystem::directory_iterator(a)) { auto x = e.path().extension();
+                if (x == ".pgm" || x == ".ppm" || x == ".pnm") v.push_back(e.path().string()); }
             std::sort(v.begin(), v.end()); pos.insert(pos.end(), v.begin(), v.end()); }
         else pos.push_back(a); }
-    if (c.ts < 16 || c.mode < 0 || c.mode > 3 || c.off < -1 || (c.off < 0 && c.mode != 1) || c.off > 14) { fprintf(stderr, "bad options\n"); return 1; }
+    if (c.ts < 16 || c.mode < 0 || c.mode > 3 || c.off < -1 || (c.off < 0 && c.mode != 1) || c.off > 14 || c.offc > 14 || (c.cl != 1 && c.cl != 2)) { fprintf(stderr, "bad options\n"); return 1; }
     try {
-        if (cmd == "c" && pos.size() == 2) { std::vector<uint8_t> px; int W, H; if (!read_pgm(pos[0].c_str(), px, W, H)) { fprintf(stderr, "need 8-bit P5\n"); return 1; }
-            auto o = compress(px.data(), W, H, c); FILE* f = fopen(pos[1].c_str(), "wb"); if (!f) return 1; fwrite(o.data(), 1, o.size(), f); fclose(f); return 0; }
-        if (cmd == "d" && pos.size() == 2) { auto d = read_file(pos[0].c_str()); std::vector<uint8_t> img; int W, H; decompress(d, img, W, H);
-            FILE* f = fopen(pos[1].c_str(), "wb"); if (!f) return 1; fprintf(f, "P5\n%d %d\n255\n", W, H); fwrite(img.data(), 1, img.size(), f); fclose(f); return 0; }
+        if (cmd == "c" && pos.size() == 2) {
+            std::vector<uint8_t> px; int W, H; std::vector<uint8_t> o;
+            if (::read_ppm(pos[0].c_str(), px, W, H)) o = compress_rgb(px.data(), W, H, c);
+            else if (read_pgm(pos[0].c_str(), px, W, H)) o = compress(px.data(), W, H, c);
+            else { fprintf(stderr, "need 8-bit P5 or P6\n"); return 1; }
+            FILE* f = fopen(pos[1].c_str(), "wb"); if (!f) return 1; fwrite(o.data(), 1, o.size(), f); fclose(f); return 0; }
+        if (cmd == "d" && pos.size() == 2) { auto d = read_file(pos[0].c_str()); std::vector<uint8_t> img; int W, H;
+            bool rgb = d.size() >= 4 && memcmp(d.data(), "PLN2", 4) == 0;
+            if (rgb) decompress_rgb(d, img, W, H); else decompress(d, img, W, H);
+            FILE* f = fopen(pos[1].c_str(), "wb"); if (!f) return 1;
+            fprintf(f, rgb ? "P6\n%d %d\n255\n" : "P5\n%d %d\n255\n", W, H); fwrite(img.data(), 1, img.size(), f); fclose(f); return 0; }
         if (cmd == "bench") {
-            double te = 0, td = 0, tpx = 0, tb = 0; bool ok = true;
-            for (auto& fn : pos) { std::vector<uint8_t> px; int W, H; if (!read_pgm(fn.c_str(), px, W, H)) { printf("%s: skip\n", fn.c_str()); continue; }
+            double te = 0, td = 0, tpx = 0, tpix = 0, tb = 0; bool ok = true;
+            for (auto& fn : pos) { std::vector<uint8_t> px; int W, H; bool rgb = ::read_ppm(fn.c_str(), px, W, H);
+                if (!rgb && !read_pgm(fn.c_str(), px, W, H)) { printf("%s: skip\n", fn.c_str()); continue; }
                 double be = 1e9, bd = 1e9; std::vector<uint8_t> o, r; int w2, h2;
-                for (int k = 0; k < reps; ++k) { double a = now_s(); o = compress(px.data(), W, H, c); double b = now_s(); decompress(o, r, w2, h2); double e = now_s(); be = std::min(be, b - a); bd = std::min(bd, e - b); }
-                bool g = r == px; ok &= g; double n = double(W) * H; tpx += n; tb += o.size(); te += be; td += bd;
-                printf("%-16s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s  %s\n", std::filesystem::path(fn).filename().string().c_str(), W, H, o.size(), 8 * o.size() / n, n / be / 1e6, n / bd / 1e6, g ? "ok" : "FAIL"); }
-            for (double& t : g_t) t /= reps;
-            printf("ns/px  enc: residual %.2f  blocks %.2f  FSE %.2f | dec: FSE %.2f  unpack %.2f  MED %.2f\n", g_t[0] * 1e9 / tpx, g_t[1] * 1e9 / tpx, g_t[2] * 1e9 / tpx, g_t[3] * 1e9 / tpx, g_t[4] * 1e9 / tpx, g_t[5] * 1e9 / tpx);
-            printf("TOTAL %zu files %.4f bpp  enc %.1f dec %.1f MB/s  (mode %d tile %d off %d)  %s\n", pos.size(), 8 * tb / tpx, tpx / te / 1e6, tpx / td / 1e6, c.mode, c.ts, c.off, ok ? "all ok" : "FAIL");
+                for (int k = 0; k < reps; ++k) { double a = now_s(); o = rgb ? compress_rgb(px.data(), W, H, c) : compress(px.data(), W, H, c); double b = now_s();
+                    if (rgb) decompress_rgb(o, r, w2, h2); else decompress(o, r, w2, h2); double e = now_s(); be = std::min(be, b - a); bd = std::min(bd, e - b); }
+                bool g = r == px; ok &= g; double n = double(W) * H * (rgb ? 3 : 1); tpx += n; tpix += double(W) * H; tb += o.size(); te += be; td += bd;
+                printf("%-16s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s  %s\n", std::filesystem::path(fn).filename().string().c_str(), W, H, o.size(), 8.0 * o.size() / (double(W) * H), n / be / 1e6, n / bd / 1e6, g ? "ok" : "FAIL"); }
+            printf("TOTAL %zu files %.4f bpp  enc %.1f dec %.1f MB/s  (mode %d tile %d off %d)  %s\n", pos.size(), 8 * tb / tpix, tpx / te / 1e6, tpx / td / 1e6, c.mode, c.ts, c.off, ok ? "all ok" : "FAIL");
+            if (cL_n) {
+                printf("chroma L  match %.1f%% of %lld   pred-own:", 100.0 * cL_eq / cL_n, cL_n);
+                for (int d = -7; d <= 7; d++) if (cL_d[d + 7]) printf(" %+d:%lld", d, cL_d[d + 7]);
+                printf("\n  own L"); for (int i = 0; i < 8; i++) printf(" %d:%lld", i, cL_own[i]);
+                printf("\n  pred "); for (int i = 0; i < 8; i++) printf(" %d:%lld", i, cL_pred[i]);
+                printf("\n");
+            }
             return ok ? 0 : 3;
         }
     } catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 2; }
