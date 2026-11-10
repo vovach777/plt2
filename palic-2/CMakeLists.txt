@@ -1,0 +1,31 @@
+# palic-2: PLN2 colour codec, mode 2 only (causal L, off=2). Built from the plt2 root.
+cmake_minimum_required(VERSION 3.16)
+project(palic2 CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+set(FSE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/fse)
+add_executable(palic-2 palic2.cpp
+  ${FSE_DIR}/entropy_common.c ${FSE_DIR}/fse_compress.c ${FSE_DIR}/fse_decompress.c
+  ${FSE_DIR}/hist.c ${FSE_DIR}/fseU16.c)
+target_include_directories(palic-2 PRIVATE ${FSE_DIR})
+target_compile_definitions(palic-2 PRIVATE FSEU16_MAX_SYMBOL_VALUE=1023 PLN_SSE)
+
+set(P2_ARCH "" CACHE STRING "target ISA (from the plt2 root PLT_ARCH is used)")
+if(NOT P2_ARCH AND PLT_ARCH)
+  set(P2_ARCH ${PLT_ARCH})
+endif()
+if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+    target_compile_options(palic-2 PRIVATE /O3 $<IF:$<BOOL:${P2_ARCH}>,/arch:${P2_ARCH},/QxHost>)
+  elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    target_compile_options(palic-2 PRIVATE /O2 -march=$<IF:$<BOOL:${P2_ARCH}>,${P2_ARCH},native> -Wno-psabi)
+  else()
+    target_compile_options(palic-2 PRIVATE /O2 /arch:$<IF:$<BOOL:${P2_ARCH}>,${P2_ARCH},AVX>)
+  endif()
+else()
+  target_compile_options(palic-2 PRIVATE -O3 -march=$<IF:$<BOOL:${P2_ARCH}>,${P2_ARCH},native> -Wno-psabi)
+endif()

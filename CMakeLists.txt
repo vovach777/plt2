@@ -60,6 +60,14 @@ if(PLT_BUILD_HLC AND PLT_BUILD_PCTX)
                         RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR} RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR})
 endif()
 
+# palic-2 (PLN2 colour, mode 2 only) from palic-2/
+option(PLT_BUILD_PALIC2 "build palic-2 (PLN2, mode 2 only)" ON)
+if(PLT_BUILD_PALIC2)
+  add_subdirectory(palic-2)
+  set_target_properties(palic-2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+                        RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR} RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR})
+endif()
+
 # ctx4d research kernels (HLC5 4-D context: AVX2 encoder kernel + wavefront decoder, SIMDe fallback) from hlc/research/ctx4d
 option(PLT_BUILD_CTX4D "build the ctx4d research kernels (ctx4d_enc, ctx4d_dec)" ON)
 if(PLT_BUILD_CTX4D)
