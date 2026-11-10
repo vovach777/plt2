@@ -118,7 +118,8 @@ namespace palic2 {
 static double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 static inline uint32_t bwz(uint32_t v) { return v ? 32 - __builtin_clz(v) : 0; }
 static inline int med(int a, int b, int c) { int mn = std::min(a, b), mx = std::max(a, b), p = a + b - c; return p < mn ? mn : (p > mx ? mx : p); }
-struct Cfg { int ts = 288, off = 2; };
+struct Cfg { int off = 2; };
+static constexpr int TILE = 288;
 
 static inline uint16_t zz8(int e) { e = int8_t(e); return uint16_t(uint8_t((e << 1) ^ (e >> 7))); }
 static void resid_row0(const uint8_t* __restrict r, uint16_t* __restrict z, int w) {
@@ -238,12 +239,34 @@ static void tile_dec(In& in, uint8_t* img, int S, int tw, int th, const Cfg& c) 
 }
 struct Grid { int nx, ny, ts, W, H; int tx(int i) const { return (i % nx) * ts; } int ty(int i) const { return (i / nx) * ts; }
     int tw(int i) const { return std::min(ts, W - tx(i)); } int th(int i) const { return std::min(ts, H - ty(i)); } };
-static Grid grid(int W, int H, int ts) { return Grid{(W + ts - 1) / ts, (H + ts - 1) / ts, ts, W, H}; }
+static Grid grid(int W, int H) { return Grid{(W + TILE - 1) / TILE, (H + TILE - 1) / TILE, TILE, W, H}; }
+
+static void put_text_header(Out& o, const char* magic, int W, int H) {
+    char buf[64];
+    int n = std::snprintf(buf, sizeof buf, "%s\n%d %d\n", magic, W, H);
+    if (n < 0 || n >= int(sizeof buf)) throw std::runtime_error("header");
+    o.raw(buf, size_t(n));
+}
+// "PLN1\n" / "PLN2\n" then "W H\n". Returns the byte offset of the tile-length list.
+static size_t read_text_header(const std::vector<uint8_t>& d, bool& rgb, int& W, int& H) {
+    auto nl = std::find(d.begin(), d.end(), '\n');
+    if (nl == d.end()) throw std::runtime_error("bad header");
+    std::string magic(d.begin(), nl);
+    if (magic != "PLN1" && magic != "PLN2") throw std::runtime_error("not PLN1/PLN2");
+    rgb = magic == "PLN2";
+    auto nl2 = std::find(nl + 1, d.end(), '\n');
+    if (nl2 == d.end()) throw std::runtime_error("bad header");
+    std::string dims(nl + 1, nl2);
+    int w = 0, h = 0;
+    if (std::sscanf(dims.c_str(), "%d %d", &w, &h) != 2 || w <= 0 || h <= 0) throw std::runtime_error("bad header");
+    W = w; H = h;
+    return size_t(nl2 - d.begin()) + 1;
+}
 
 std::vector<uint8_t> compress(const uint8_t* img, int W, int H, const Cfg& c) {
-    Grid g = grid(W, H, c.ts); const int nt = g.nx * g.ny; static thread_local std::vector<uint8_t> tmp;
+    Grid g = grid(W, H); const int nt = g.nx * g.ny; static thread_local std::vector<uint8_t> tmp;
     Out o; o.b.reserve(size_t(W) * H + size_t(nt) * 4 + 4096);
-    o.raw("PLN1", 4); o.var(W); o.var(H); o.var(c.ts); o.var(2); o.var(c.off);
+    put_text_header(o, "PLN1", W, H);
     const size_t lens = o.b.size(); o.b.resize(lens + size_t(nt) * 4);
     for (int i = 0; i < nt; ++i) {
         const size_t b = o.b.size(); const uint8_t* ti = img + size_t(g.ty(i)) * W + g.tx(i);
@@ -253,13 +276,16 @@ std::vector<uint8_t> compress(const uint8_t* img, int W, int H, const Cfg& c) {
     return std::move(o.b);
 }
 void decompress(const std::vector<uint8_t>& d, std::vector<uint8_t>& img, int& W, int& H) {
-    In in{d.data(), d.data() + d.size()}; if (d.size() < 4 || memcmp(in.take(4), "PLN1", 4)) throw std::runtime_error("not PLN1");
-    Cfg c; W = int(in.var()); H = int(in.var()); c.ts = int(in.var()); int mode = int(in.var()); c.off = int(in.var());
-    if (W <= 0 || H <= 0 || c.ts < 1 || mode != 2) throw std::runtime_error("bad header");
-    Grid g = grid(W, H, c.ts); const int nt = g.nx * g.ny; std::vector<uint32_t> len(nt);
-    for (auto& l : len) memcpy(&l, in.take(4), 4);
+    bool rgb = false; size_t pos = read_text_header(d, rgb, W, H);
+    if (rgb) throw std::runtime_error("not PLN1");
+    Cfg c;
+    Grid g = grid(W, H); const int nt = g.nx * g.ny; std::vector<uint32_t> len(nt);
+    if (d.size() < pos + size_t(nt) * 4) throw std::runtime_error("truncated");
+    for (auto& l : len) { memcpy(&l, d.data() + pos, 4); pos += 4; }
     img.resize(size_t(W) * H);
-    for (int i = 0; i < nt; ++i) { In ti{in.take(len[i]), nullptr}; ti.e = ti.p + len[i];
+    for (int i = 0; i < nt; ++i) {
+        if (d.size() < pos + len[i]) throw std::runtime_error("truncated");
+        In ti{d.data() + pos, d.data() + pos + len[i]}; pos += len[i];
         tile_dec(ti, img.data() + size_t(g.ty(i)) * W + g.tx(i), W, g.tw(i), g.th(i), c); if (ti.p != ti.e) throw std::runtime_error("tile trailing bytes"); }
 }
 
@@ -357,37 +383,49 @@ static void rgb_join(uint8_t* rgb, int W, int tw, int th, const uint8_t* Y, cons
     }
 }
 std::vector<uint8_t> compress_rgb(const uint8_t* rgb, int W, int H, const Cfg& c) {
-    Grid g = grid(W, H, c.ts); const int nt = g.nx * g.ny; static thread_local std::vector<uint8_t> tmp, Y; static thread_local std::vector<int16_t> U, V;
+    Grid g = grid(W, H); const int nt = g.nx * g.ny; static thread_local std::vector<uint8_t> tmp, Y; static thread_local std::vector<int16_t> U, V;
     Out o; o.b.reserve(size_t(W) * H * 3);
-    o.raw("PLN2", 4); o.var(W); o.var(H); o.var(c.ts); o.var(2); o.var(c.off); o.var(c.off); o.var(2);
-    const size_t lens = o.b.size(); o.b.resize(lens + size_t(nt) * 4);
+    put_text_header(o, "PLN2", W, H);
+    const size_t lens = o.b.size(); o.b.resize(lens + size_t(nt) * 8);
     for (int i = 0; i < nt; ++i) {
         const size_t b = o.b.size();
         rgb_split(rgb + (size_t(g.ty(i)) * W + g.tx(i)) * 3, W, g.tw(i), g.th(i), Y, U, V);
         tile_enc(Y.data(), g.tw(i), g.tw(i), g.th(i), c, o, tmp);
+        const uint32_t ny = uint32_t(o.b.size() - b);
         tile_enc16(U.data(), g.tw(i), g.th(i), c, o, tmp);
+        const uint32_t nu = uint32_t(o.b.size() - b - ny);
         tile_enc16(V.data(), g.tw(i), g.th(i), c, o, tmp);
-        const uint32_t l = uint32_t(o.b.size() - b); memcpy(&o.b[lens + size_t(i) * 4], &l, 4);
+        const uint32_t nv = uint32_t(o.b.size() - b - ny - nu);
+        if (ny >= (1u << 18) || nu >= (1u << 18) || nv >= (1u << 18)) throw std::runtime_error("plane does not fit in 18 bits");
+        const uint64_t ent = uint64_t(ny) | uint64_t(nu) << 18 | uint64_t(nv) << 36;
+        memcpy(&o.b[lens + size_t(i) * 8], &ent, 8);
     }
     return std::move(o.b);
 }
 void decompress_rgb(const std::vector<uint8_t>& d, std::vector<uint8_t>& rgb, int& W, int& H) {
-    In in{d.data(), d.data() + d.size()}; if (d.size() < 4 || memcmp(in.take(4), "PLN2", 4)) throw std::runtime_error("not PLN2");
-    Cfg c; W = int(in.var()); H = int(in.var()); c.ts = int(in.var()); int mode = int(in.var()); c.off = int(in.var()); int offc = int(in.var()); int cl = int(in.var());
-    if (W <= 0 || H <= 0 || c.ts < 1 || mode != 2 || cl != 2) throw std::runtime_error("bad header");
-    Cfg uv = c; uv.off = offc;
-    Grid g = grid(W, H, c.ts); const int nt = g.nx * g.ny; std::vector<uint32_t> len(nt);
-    for (auto& l : len) memcpy(&l, in.take(4), 4);
+    bool rgb_file = false; size_t pos = read_text_header(d, rgb_file, W, H);
+    if (!rgb_file) throw std::runtime_error("not PLN2");
+    Cfg c, uv;
+    Grid g = grid(W, H); const int nt = g.nx * g.ny;
+    if (d.size() < pos + size_t(nt) * 8) throw std::runtime_error("truncated");
+    std::vector<uint64_t> ent(nt);
+    for (auto& e : ent) { memcpy(&e, d.data() + pos, 8); pos += 8; }
     rgb.resize(size_t(W) * H * 3);
     static thread_local std::vector<uint8_t> Y; static thread_local std::vector<int16_t> U, V;
     for (int i = 0; i < nt; ++i) {
-        In ti{in.take(len[i]), nullptr}; ti.e = ti.p + len[i];
+        if (ent[i] >> 54) throw std::runtime_error("index reserved bits");
+        const uint32_t ny = uint32_t(ent[i] & 0x3ffff), nu = uint32_t(ent[i] >> 18 & 0x3ffff), nv = uint32_t(ent[i] >> 36 & 0x3ffff);
+        if (d.size() < pos + ny + nu + nv) throw std::runtime_error("truncated");
         const int tw = g.tw(i), th = g.th(i);
         Y.resize(size_t(tw) * th); U.resize(Y.size()); V.resize(Y.size());
-        tile_dec(ti, Y.data(), tw, tw, th, c);
-        tile_dec16(ti, U.data(), tw, th, uv);
-        tile_dec16(ti, V.data(), tw, th, uv);
-        if (ti.p != ti.e) throw std::runtime_error("tile trailing bytes");
+        auto plane = [&](uint32_t n, auto dec) {
+            In ti{d.data() + pos, d.data() + pos + n}; pos += n;
+            dec(ti);
+            if (ti.p != ti.e) throw std::runtime_error("plane trailing bytes");
+        };
+        plane(ny, [&](In& ti) { tile_dec(ti, Y.data(), tw, tw, th, c); });
+        plane(nu, [&](In& ti) { tile_dec16(ti, U.data(), tw, th, uv); });
+        plane(nv, [&](In& ti) { tile_dec16(ti, V.data(), tw, th, uv); });
         rgb_join(rgb.data() + (size_t(g.ty(i)) * W + g.tx(i)) * 3, W, tw, th, Y.data(), U.data(), V.data());
     }
 }
@@ -413,18 +451,15 @@ static std::vector<uint8_t> read_bin(const std::string& fn) {
 
 int main(int argc, char** argv) {
     using namespace palic2;
-    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.pln [-ts N] [-off K] | d in.pln out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N] [-ts] [-off]\n", argv[0]); return 1; }
+    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.pln | d in.pln out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N]\n", argv[0]); return 1; }
     std::string cmd = argv[1]; Cfg c; int reps = 3; std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i) { std::string a = argv[i];
-        if (a == "-ts" && i + 1 < argc) c.ts = atoi(argv[++i]);
-        else if (a == "-off" && i + 1 < argc) c.off = atoi(argv[++i]);
-        else if (a == "-r" && i + 1 < argc) reps = atoi(argv[++i]);
+        if (a == "-r" && i + 1 < argc) reps = atoi(argv[++i]);
         else if (cmd == "bench" && std::filesystem::is_directory(a)) { std::vector<std::string> v;
             for (auto& e : std::filesystem::directory_iterator(a)) { auto x = e.path().extension();
                 if (x == ".pgm" || x == ".ppm" || x == ".pnm") v.push_back(e.path().string()); }
             std::sort(v.begin(), v.end()); pos.insert(pos.end(), v.begin(), v.end()); }
         else pos.push_back(a); }
-    if (c.ts < 16 || c.off < 0 || c.off > 14) { fprintf(stderr, "bad options\n"); return 1; }
     try {
         if (cmd == "c" && pos.size() == 2) {
             int W, H; bool rgb; auto px = read_netpbm(pos[0], W, H, rgb);
@@ -444,7 +479,7 @@ int main(int argc, char** argv) {
                     if (rgb) decompress_rgb(o, r, w2, h2); else decompress(o, r, w2, h2); double e = now_s(); be = std::min(be, b - a); bd = std::min(bd, e - b); }
                 bool g = r == px; ok &= g; double n = double(W) * H * (rgb ? 3 : 1); tpx += n; tpix += double(W) * H; tb += o.size(); te += be; td += bd;
                 printf("%-16s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s  %s\n", std::filesystem::path(fn).filename().string().c_str(), W, H, o.size(), 8.0 * o.size() / (double(W) * H), n / be / 1e6, n / bd / 1e6, g ? "ok" : "FAIL"); }
-            printf("TOTAL %zu files %.4f bpp  enc %.1f dec %.1f MB/s  (tile %d off %d)  %s\n", pos.size(), 8 * tb / tpix, tpx / te / 1e6, tpx / td / 1e6, c.ts, c.off, ok ? "all ok" : "FAIL");
+            printf("TOTAL %zu files %.4f bpp  enc %.1f dec %.1f MB/s  (tile %d)  %s\n", pos.size(), 8 * tb / tpix, tpx / te / 1e6, tpx / td / 1e6, TILE, ok ? "all ok" : "FAIL");
             return ok ? 0 : 3; }
     } catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 2; }
     fprintf(stderr, "bad arguments\n"); return 1;

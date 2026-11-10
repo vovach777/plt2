@@ -12,6 +12,7 @@ Argon (mode 2: L from the symbols above, no L stream), Claude (codec, vectorisat
 4. Each block has a noise level `L = clamp(bw(mean of 16 z) − off, 0, 7)`, computed causally (below).
 5. The `L` low bits of the 16 symbols go raw as `L` bit planes (16-bit masks, movemask);
    the high part `z >> L` goes to the FSE4 stream number `L` (8 streams = 8 contexts "noise of the block").
+   Open, no design yet: a bypass for a block that did not compress.
 6. Decoder: FSE → unpack blocks (vector) → MED as a wave over 16-row bands (skew 1 px per row, vector types).
 
 ## Mode 2: L comes from the symbols directly above (Argon)
@@ -25,7 +26,7 @@ L(0) = 2
 ```
 
 The window `p − tw .. p − tw + 15` ends before `p` (as long as `tw >= 16`), so the decoder already has it.
-`off` is part of the format here (written in the header).
+`off` is 2 and the tile side is 288. Neither is written. Tile geometry is `(W + 287) / 288` by `(H + 287) / 288`, row-major, last tile keeps the remainder.
 
 ## Blocks across rows — the example 500 × 500
 
