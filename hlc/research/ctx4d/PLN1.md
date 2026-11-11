@@ -269,7 +269,7 @@ PLF pairs a stream with itself (neighbours of one block, same plane, same bin). 
 PLF, Kodak / gray 17 / 19 colour: 1 (default) 10.2042 / 4.6049 / 8.3389, 4: 10.2391 / 4.6079 / 8.3543,
 8: 10.2467 / 4.6108 / 8.3664: the nearest partner is best.
 
-### PLR: one chroma plane S = zU + zV (Vladimir's idea, `-DPLR_UVSUM`)
+### PLR2 format: one chroma plane S = zU + zV (Vladimir's idea; the default of PLR2, PLF2 keeps U and V planes)
 
 The zigzag residuals of U and V at the same pixel are added, `S = zU + zV` (0..1022), and S is one plane through the
 usual coder (causal L on S with the same off 1, L bit planes, RLGR on `S >> L`). After every block the raw writer
