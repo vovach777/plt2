@@ -17,6 +17,12 @@
 #include <stdexcept>
 
 namespace rlgrf {
+#if defined(RLGR_STATS)                             // research counters (../hlc/research/plr_onestream_estimate.py)
+inline uint64_t g_payload = 0, g_waste_full = 0, g_nfull = 0, g_waste_flush = 0, g_nruns = 0;
+#define RLGR_ST(x) x
+#else
+#define RLGR_ST(x)
+#endif
 constexpr uint32_t MAX_K = 240, UP_K = 5, DOWN_K = 9, UP_K_DIRECT_RL = 2, DOWN_K_DIRECT_RL = 3, DOWN_K_RICE = 2;   // llrice
 
 struct PageBuf {                                    // encoder: grows on demand; decoder: the pages of the file
@@ -29,7 +35,7 @@ struct Writer {
     explicit Writer(PageBuf* p) : pb(p) {}
     inline void reserve(int n) { while (cap < n) { q[(head + cnt) & 3] = pb->take(); ++cnt; cap += 64; } }
     inline void put(int n, uint32_t v) {            // 1 <= n <= 32, v < 2^n; the bits must be reserved
-        cap -= n;
+        RLGR_ST(g_payload += uint64_t(n);) cap -= n;
         if (used + n < 64) { acc = (acc << n) | v; used += n; return; }
         const int rem = used + n - 64;              // used >= 32 here, so 64 - used <= 32
         const uint64_t w = (acc << (n - rem)) | (uint64_t(v) >> rem);
@@ -40,7 +46,7 @@ struct Writer {
 #if !defined(RLGR_RESERVE64)
         reserve(n);                                 // lazy: a page is taken when its first bit is written
 #endif
-        cap -= n;
+        RLGR_ST(g_payload += uint64_t(n);) cap -= n;
         if (used + n < 64) { acc = (acc << n) | v; used += n; return; }
         const int rem = used + n - 64;
         const uint64_t hi = used ? acc << (64 - used) : 0;
@@ -117,9 +123,10 @@ struct Encoder {                                    // RLGR::Encoder of llrice, 
     __attribute__((always_inline)) inline void put(uint32_t v) {
         uint32_t k_ = k >> 3; const uint32_t kr_ = kr >> 3;
         if (k_ > 0) {
-            if (!inrun) { s.reserve(1 + int(k_)); inrun = true; }
+            if (!inrun) { s.reserve(1 + int(k_)); inrun = true; RLGR_ST(++g_nruns;) }
             if (v == 0) {
                 if (++rl == (1u << k_)) {
+                    RLGR_ST(g_waste_full += k_; ++g_nfull;)
                     s.put(1, 0); rl = 0; k += UP_K; if (k > MAX_K) k = MAX_K; k_ = k >> 3; s.reserve(1 + int(k_));
                 }
             } else {
@@ -139,7 +146,7 @@ struct Encoder {                                    // RLGR::Encoder of llrice, 
             if (v == 0) { k += UP_K_DIRECT_RL; if (k > MAX_K) k = MAX_K; } else k -= k > DOWN_K_DIRECT_RL ? DOWN_K_DIRECT_RL : k;
         }
     }
-    void flush() { if (rl > 0) { s.put(1, 1); s.put(int(k >> 3), rl); rl = 0; } s.flush(); }
+    void flush() { if (rl > 0) { s.put(1, 1); s.put(int(k >> 3), rl); rl = 0; } RLGR_ST(else if (inrun) g_waste_flush += 1 + (k >> 3);) s.flush(); }
 };
 
 struct Decoder {                                    // RLGR::Decoder of llrice

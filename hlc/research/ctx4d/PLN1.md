@@ -332,3 +332,19 @@ clang = gcc files:
 | **PLF, lazy** | **10.1902** 114 / 96 | **4.5991** 117 / 96 | **8.3258** 132 / 111 |
 
 −0.10..−0.16% size everywhere, decode +1..5%, encode −0..5%.
+
+### Variant (b) estimate: one bit stream per tile + run-header holes (`../plr_onestream_estimate.py`, `-DRLGR_STATS`)
+
+Idea: every code is written at one global bit head the moment it is known; only the run header is a hole of
+`1 + k` bits laid at the start of the run and filled at its end; one bit reader for the whole tile in the decoder.
+Cost: a full window uses 1 bit of its hole, the other k bits are lost (now they stay in the stream's `cap` and are
+used by its next codes). Counted on the real streams:
+
+| | non-payload bits now | k bits of full windows | (b) vs now |
+|---|---|---|---|
+| PLR Kodak | 0.07% | 0.37% (312 677 full windows) | +0.31% |
+| PLR gray 17 | 0.09% | 0.74% | +0.65% |
+| PLR 19 colour | 0.08% | 1.57% | +1.49% |
+| PLF Kodak / gray / colour | 0.09 / 0.10 / 0.10% | 0.09 / 0.08 / 1.10% | +0.01 / −0.01 / +1.01% |
+
+The lazy page scheme already wastes < 0.1%; the holes of (b) waste 3–15 times more. (b) is not taken as it is.
