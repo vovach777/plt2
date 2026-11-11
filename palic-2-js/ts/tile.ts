@@ -60,19 +60,19 @@ function compressTile(rgb: number[], width: number, height: number): number {
 }
 
 let demo: number[] = [];
+let digest = 0;
 
-function main(): number {
+function main(): void {
   let i = 0;
   while (i < 12) {
     demo[i] = (i * 17) & 255;
     i = i + 1;
   }
   let n = compressTile(demo, 2, 2);
-  let sum = n;
+  digest = n;
   i = 0;
   while (i < n) {
-    sum = sum + out[i];
+    digest = digest + out[i];
     i = i + 1;
   }
-  return sum;
 }
