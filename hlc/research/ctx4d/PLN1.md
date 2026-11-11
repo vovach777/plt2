@@ -285,3 +285,6 @@ Best of 3, all round trips ok:
 | PLF fast, S plane | 10.2385 | 114 / 95 | 8.3085 | 133 / 111 |
 
 off for the S plane: off 0 / 1 / 2: Kodak 10.2623 / 10.1541 / 10.1741, colour 8.3264 / 8.2299 / 8.2318.
+Fractional off for S (L = bw(mean · c) − 1, c = 4/8 .. 16/8, i.e. off 2 .. 0): c = 5/8, 6/8, 7/8, 1, 10/8, 12/8:
+Kodak 10.1695 / 10.1633 / 10.1574 / **10.1541** / 10.1634 / 10.1908, colour 8.2298 / 8.2275 / **8.2272** / 8.2299 /
+8.2440 / 8.2678. Off 1 stays: the best fraction is within 0.03%.
