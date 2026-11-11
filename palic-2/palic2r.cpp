@@ -221,22 +221,31 @@ static inline void block_split(const uint16_t* s, int L, uint16_t*& pw, uint16_t
     for (int j = 0; j < 16; ++j) hi[j] = uint16_t(s[j] >> L);
 #endif
 }
+// Vector path: clang ext_vector_type, or GCC >= 12 vector_size (+ __builtin_shufflevector). The two dialects differ
+// only in how a scalar is broadcast: VSPL(T, x).
 #if defined(__clang__)
+#define PLR_VEC 1
 typedef uint16_t v16u __attribute__((ext_vector_type(16)));
 typedef int16_t v16s __attribute__((ext_vector_type(16)));
+#define VSPL(T, x) ((T)(x))
+#elif defined(__GNUC__) && __GNUC__ >= 12
+#define PLR_VEC 1
+typedef uint16_t v16u __attribute__((vector_size(32)));
+typedef int16_t v16s __attribute__((vector_size(32)));
+#define VSPL(T, x) (T{} + (x))
 #endif
 static inline void block_unpack(const uint16_t* h, int L, const uint8_t*& pp, uint16_t* z) {
-#if defined(__clang__)                                                  // vector: weights & mask != 0 -> bit k
+#if defined(PLR_VEC)                                                    // vector: weights & mask != 0 -> bit k
     const v16u w = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768};
     v16u v; memcpy(&v, h, 32); v = v << uint16_t(L);
-    for (int k = 0; k < L; ++k) { uint16_t m; memcpy(&m, pp, 2); pp += 2; v |= (v16u)((v16u(m) & w) != 0) & uint16_t(1u << k); }
+    for (int k = 0; k < L; ++k) { uint16_t m; memcpy(&m, pp, 2); pp += 2; v |= (v16u)((VSPL(v16u, m) & w) != 0) & uint16_t(1u << k); }
     memcpy(z, &v, 32);
 #else
     for (int j = 0; j < 16; ++j) z[j] = uint16_t(h[j] << L);
     for (int k = 0; k < L; ++k) { uint16_t m; memcpy(&m, pp, 2); pp += 2; for (int j = 0; j < 16; ++j) z[j] |= uint16_t(((m >> j) & 1u) << k); }
 #endif
 }
-#if defined(__clang__)
+#if defined(PLR_VEC)
 // ---- decoder MED as a wave over bands of 16 rows (from PLN1 planes_codec.cpp): lane k = row y0 + k, step t,
 // lane k at x = t - k (skew 1 px per row: MED needs a, b, c only). a = own lane, previous step; b = lane k-1,
 // previous step; c = lane k-1, two steps back; lane 0 takes b, c from the row above the band. Borders: tile row 0:
@@ -265,7 +274,7 @@ template <bool NINE, class T> static void recon_wave(T* img, int S, int tw, int 
         int16_t* Tp = Tb.data() + 1;                                                  // Tp[-1] = 0, Tp[tw] = 0
         if (y0) for (int x = 0; x < tw; ++x) Tp[x] = int16_t(img[size_t(y0 - 1) * S + x]);
         const bool first = y0 == 0;
-        v16s P1 = 0, P2 = 0;
+        v16s P1 = {}, P2 = {};
         for (int t0 = 0; t0 < steps; t0 += 16) {
             v16s m[16];
             for (int k = 0; k < 16; ++k) memcpy(&m[k], Eb.data() + size_t(k) * RS + 32 + t0 - k, 32);
@@ -273,8 +282,8 @@ template <bool NINE, class T> static void recon_wave(T* img, int S, int tw, int 
             for (int j = 0; j < 16; ++j) {
                 const int t = t0 + j, tb = std::min(t, tw), tc = std::min(t - 1, tw);
                 v16s a = P1;
-                v16s b = SV(P1, (v16s)(int16_t)Tp[tb], 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
-                v16s c = SV(P2, (v16s)(int16_t)Tp[tc], 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+                v16s b = SV(P1, VSPL(v16s, (int16_t)Tp[tb]), 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+                v16s c = SV(P2, VSPL(v16s, (int16_t)Tp[tc]), 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
                 if (first) { b = lane0 ? a : b; c = lane0 ? a : c; }                   // tile row 0: pred = left
                 const v16s x0 = K == (int16_t)t; a = x0 ? b : a; c = x0 ? b : c;      // x = 0: pred = up
                 const v16s mn = a < b ? a : b, mx = a < b ? b : a; v16s p = a + b - c; p = p < mn ? mn : p; p = p > mx ? mx : p;
@@ -386,7 +395,7 @@ static void tile_dec(In& in, uint8_t* img, int S, int tw, int th, const Cfg& c) 
         }
     }
 
-#if defined(__clang__) && !defined(PLN_ROWS)
+#if defined(PLR_VEC) && !defined(PLN_ROWS)
     recon_wave<false>(img, S, tw, th, z);
 #else
     for (int y = 0; y < th; ++y) {
@@ -600,7 +609,7 @@ static void tile_dec16(In& in, int16_t* img, int tw, int th, const Cfg& c) {
         }
     }
 
-#if defined(__clang__) && !defined(PLN_ROWS)
+#if defined(PLR_VEC) && !defined(PLN_ROWS)
     recon_wave<true>(img, tw, tw, th, z);
 #else
     for (int y = 0; y < th; ++y) {
@@ -655,7 +664,7 @@ static void tile_dec_uv(int16_t* U, int16_t* V, int tw, int th, const Cfg& c) {
         for (int j = 0; j < 16; ++j) { const size_t p = i * 16 + j; const uint32_t s2 = S[p];
             const uint32_t x = s2 ? tb_get(g_src->raw, s2) : 0; a[p] = uint16_t(x); b[p] = uint16_t(s2 - x); }
     }
-#if defined(__clang__) && !defined(PLN_ROWS)
+#if defined(PLR_VEC) && !defined(PLN_ROWS)
     recon_wave<true>(U, tw, tw, th, a); recon_wave<true>(V, tw, tw, th, b);
 #else
     static thread_local std::vector<int16_t> e; if (e.size() < size_t(tw)) e.resize(tw);

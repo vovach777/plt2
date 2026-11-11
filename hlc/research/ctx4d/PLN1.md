@@ -382,3 +382,12 @@ decoder is one sequential reader. Round trips ok (edge sizes, noise / spike / st
 Encoder +5..11%, decoder +1..7%; size −0.07..0% except PLR on the colour photos (+0.16%: full windows whose hole
 was passed by the raw bits of the blocks). `-DPLR_LAYOUT=0` builds the page format; with `-DRLGR_RESERVE64` it is
 byte-identical with `-DPLR_LLRICE`.
+
+### GCC vector path (palic2.cpp, palic2r.cpp)
+
+The wave decoder and the vector block unpack were clang-only (`ext_vector_type`); GCC fell back to the row decoder.
+They now also build with GCC >= 12 `vector_size` types and `__builtin_shufflevector`; the only dialect difference
+is the scalar broadcast (`VSPL(T, x)`: clang `(T)x`, GCC `T{} + x`). Same files from both compilers, all round trips
+ok. Decode MB/s, best of 5, GCC row path → GCC vector (clang): PLN2 Kodak 170 → 412 (416), gray 165 → 418 (430);
+PLR Kodak 65 → 84 (84), gray 60 → 77 (78), 19 colour 76 → 99 (99). `planes_codec.cpp` (PLN1, experiment) still
+uses clang bool vectors and stays clang-only.
