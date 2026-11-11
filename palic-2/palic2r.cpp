@@ -18,6 +18,8 @@
 // so the zigzag stays in 0..511 and the FSE bound is 512>>L.
 // P5/P6 I/O through palic-1/netpbm.hpp (comments in the header are accepted).
 #include <cstdint>
+#include <utility>
+#include <type_traits>
 #include <vector>
 #include <string>
 #include <stdexcept>
@@ -272,7 +274,9 @@ typedef int16_t v16s __attribute__((ext_vector_type(16)));
 #define PLR_VEC 1
 typedef uint16_t v16u __attribute__((vector_size(32)));
 typedef int16_t v16s __attribute__((vector_size(32)));
-template <class T, class E> static inline T vspl_(E x) { T r; for (int i = 0; i < 16; ++i) r[i] = x; return r; }   // broadcast
+template <class T, class E> static inline T vspl_(E x) {                               // broadcast
+    using El = typename std::remove_cv<typename std::remove_reference<decltype(std::declval<T&>()[0])>::type>::type;
+    const El e = El(x); return T{e, e, e, e, e, e, e, e, e, e, e, e, e, e, e, e}; }
 #define VSPL(T, x) (vspl_<T>(x))
 #endif
 static inline void block_unpack(const uint16_t* h, int L, const uint8_t*& pp, uint16_t* z) {
