@@ -1,27 +1,6 @@
 'use strict';
 
-// Rice on PLN-TXT. k is floor(log2) of the mean of the last three symbols.
-// Not a CLI output.
-
-const { parseTxt, renderParsed } = require('./pln-text');
-
-function pushVarint(out, value) {
-  let n = value;
-  while (n >= 128) { out.push((n & 127) | 128); n = Math.floor(n / 128); }
-  out.push(n);
-}
-
-function readVarint(bytes, cursor) {
-  let value = 0, shift = 0;
-  while (cursor.i < bytes.length) {
-    const byte = bytes[cursor.i++];
-    value += (byte & 127) * (2 ** shift);
-    if ((byte & 128) === 0) return value;
-    shift += 7;
-    if (shift > 28) throw new RangeError('varint overflow');
-  }
-  throw new RangeError('truncated varint');
-}
+// Rice of one typed array. k is floor(log2) of the mean of the last three symbols.
 
 function riceK(hist) {
   const n = hist.length;
@@ -35,6 +14,9 @@ function riceK(hist) {
 }
 
 function encode(values) {
+  if (!(values instanceof Uint8Array) && !(values instanceof Uint16Array)) {
+    throw new TypeError('expected Uint8Array or Uint16Array');
+  }
   const bytes = [];
   let acc = 0, nbits = 0;
   function writeBits(value, bits) {
@@ -45,7 +27,8 @@ function encode(values) {
     }
   }
   const hist = [];
-  for (const sym of values) {
+  for (let s = 0; s < values.length; s++) {
+    const sym = values[s];
     const k = riceK(hist);
     let q = sym >>> k;
     while (q >= 24) { writeBits(0xffffff, 24); q -= 24; }
@@ -56,16 +39,13 @@ function encode(values) {
     if (hist.length > 3) hist.shift();
   }
   if (nbits) bytes.push((acc << (8 - nbits)) & 255);
-  const out = [];
-  pushVarint(out, values.length);
-  for (const byte of bytes) out.push(byte);
-  return Uint8Array.from(out);
+  return Uint8Array.from(bytes);
 }
 
-function decode(bytes) {
-  const cursor = { i: 0 };
-  const count = readVarint(bytes, cursor);
-  let acc = 0, nbits = 0, pos = cursor.i;
+function decode(bytes, length, bits) {
+  const Type = bits === 16 ? Uint16Array : Uint8Array;
+  const values = new Type(length);
+  let acc = 0, nbits = 0, pos = 0;
   function readBit() {
     if (nbits === 0) {
       if (pos >= bytes.length) throw new RangeError('rice truncated');
@@ -75,63 +55,19 @@ function decode(bytes) {
     nbits--;
     return (acc >> nbits) & 1;
   }
-  const values = [];
   const hist = [];
-  for (let s = 0; s < count; s++) {
+  for (let s = 0; s < length; s++) {
     const k = riceK(hist);
     let q = 0;
     while (readBit() === 1) q++;
     let r = 0;
     for (let b = 0; b < k; b++) r = (r << 1) | readBit();
     const sym = (q << k) | r;
-    values.push(sym);
+    values[s] = sym;
     hist.push(sym);
     if (hist.length > 3) hist.shift();
   }
   return values;
 }
 
-function compress(text) {
-  const doc = parseTxt(text);
-  if (!doc.coded) throw new RangeError('entropy input is PLN-TXT');
-  const out = Array.from(Buffer.from(doc.gray ? 'RC01' : 'RC02'));
-  pushVarint(out, doc.width);
-  pushVarint(out, doc.height);
-  for (const planes of doc.tiles) for (const rows of planes) for (const values of rows) {
-    const packed = encode(values);
-    pushVarint(out, packed.length);
-    for (const byte of packed) out.push(byte);
-  }
-  return Uint8Array.from(out);
-}
-
-function decompress(bytes) {
-  const magic = Buffer.from(bytes.subarray(0, 4)).toString('ascii');
-  if (magic !== 'RC01' && magic !== 'RC02') throw new RangeError(`bad magic ${magic}`);
-  const gray = magic === 'RC01';
-  const cursor = { i: 4 };
-  const width = readVarint(bytes, cursor);
-  const height = readVarint(bytes, cursor);
-  const nx = Math.ceil(width / 288);
-  const ny = Math.ceil(height / 288);
-  const planes = gray ? 1 : 3;
-  const tiles = [];
-  for (let tile = 0; tile < nx * ny; tile++) {
-    const tilePlanes = [];
-    for (let plane = 0; plane < planes; plane++) {
-      const rows = [];
-      for (let s = 0; s < 9; s++) {
-        const length = readVarint(bytes, cursor);
-        const packed = bytes.subarray(cursor.i, cursor.i + length);
-        cursor.i += length;
-        rows.push(decode(packed));
-      }
-      tilePlanes.push(rows);
-    }
-    tiles.push(tilePlanes);
-  }
-  if (cursor.i !== bytes.length) throw new RangeError('trailing bytes');
-  return renderParsed({ magic: gray ? 'PLN1-TXT' : 'PLN2-TXT', width, height, gray, coded: true, tiles });
-}
-
-module.exports = { compress, decompress };
+module.exports = { encode, decode };

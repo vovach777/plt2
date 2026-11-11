@@ -1,36 +1,12 @@
 'use strict';
 
-// llrice RLGR::Encoder. Not the JPEG-XR constants and not RLGR::Simple.
+// llrice RLGR::Encoder on one typed array. Not JPEG-XR, not RLGR::Simple.
 // k and kr are stored scaled by 8. UP_K = 5, DOWN_K = 9, direct +2/−3.
 // A Rice quotient of 32 or more is 32 ones and the raw word.
-// Input is PLN-TXT. compress() is bytes, renderText() is the same decisions
-// written so they can be read.
-
-const { parseTxt, renderParsed } = require('./pln-text');
 
 const MAX_K = 240;
-const TILE = 288;
-
-function pushVarint(out, value) {
-  let n = value;
-  while (n >= 128) { out.push((n & 127) | 128); n = Math.floor(n / 128); }
-  out.push(n);
-}
-
-function readVarint(bytes, cursor) {
-  let value = 0, shift = 0;
-  while (cursor.i < bytes.length) {
-    const byte = bytes[cursor.i++];
-    value += (byte & 127) * (2 ** shift);
-    if ((byte & 128) === 0) return value;
-    shift += 7;
-    if (shift > 28) throw new RangeError('varint overflow');
-  }
-  throw new RangeError('truncated varint');
-}
 
 function encodeValues(values) {
-  const events = [];
   const bytes = [];
   let acc = 0, nbits = 0;
   function writeBits(value, width) {
@@ -66,7 +42,6 @@ function encodeValues(values) {
         rl++;
         if (rl === (1 << k_)) {
           writeBits(0, 1);
-          events.push('W');
           rl = 0;
           k += 5;
           if (k > MAX_K) k = MAX_K;
@@ -74,14 +49,12 @@ function encodeValues(values) {
       } else {
         writeBits(1, 1);
         if (k_) writeBits(rl, k_);
-        events.push('P', String(rl), String(value));
         k = k > 9 ? k - 9 : 0;
         rl = 0;
         writeRice(value - 1, kr_);
       }
     } else {
       rl = 0;
-      events.push('D', String(value));
       writeRice(value, kr_);
       if (value === 0) { k += 2; if (k > MAX_K) k = MAX_K; }
       else k = k > 3 ? k - 3 : 0;
@@ -91,10 +64,9 @@ function encodeValues(values) {
     const k_ = k >> 3;
     writeBits(1, 1);
     if (k_) writeBits(rl, k_);
-    events.push('T', String(rl));
   }
   if (nbits) bytes.push((acc << (8 - nbits)) & 255);
-  return { events, bytes };
+  return Uint8Array.from(bytes);
 }
 
 function decodeValues(bytes, count) {
@@ -166,147 +138,22 @@ function decodeValues(bytes, count) {
   return values;
 }
 
-function valuesFromTokens(tokens) {
-  const values = [];
-  let k = 8;
-  for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i];
-    if (token === 'W') {
-      const n = 1 << (k >> 3);
-      for (let z = 0; z < n; z++) values.push(0);
-      k += 5;
-      if (k > MAX_K) k = MAX_K;
-    } else if (token === 'P') {
-      const run = Number(tokens[++i]);
-      const value = Number(tokens[++i]);
-      for (let z = 0; z < run; z++) values.push(0);
-      values.push(value);
-      k = k > 9 ? k - 9 : 0;
-    } else if (token === 'D') {
-      const value = Number(tokens[++i]);
-      values.push(value);
-      if (value === 0) { k += 2; if (k > MAX_K) k = MAX_K; }
-      else k = k > 3 ? k - 3 : 0;
-    } else if (token === 'T') {
-      const run = Number(tokens[++i]);
-      for (let z = 0; z < run; z++) values.push(0);
-    } else {
-      throw new RangeError(`bad rlgr token ${token}`);
-    }
-  }
-  return values;
+function typed(values, length, bits) {
+  const Type = bits === 16 ? Uint16Array : Uint8Array;
+  const out = new Type(length);
+  for (let i = 0; i < length; i++) out[i] = values[i];
+  return out;
 }
 
-function pack(text, take) {
-  const doc = parseTxt(text);
-  if (!doc.coded) throw new RangeError('entropy input is PLN-TXT');
-  const streams = [];
-  for (const planes of doc.tiles) for (const rows of planes) for (const values of rows) {
-    streams.push(take(values));
+function encode(values) {
+  if (!(values instanceof Uint8Array) && !(values instanceof Uint16Array)) {
+    throw new TypeError('expected Uint8Array or Uint16Array');
   }
-  return { doc, streams };
+  return Uint8Array.from(encodeValues(values));
 }
 
-function compress(text) {
-  const { doc, streams } = pack(text, values => {
-    const { bytes } = encodeValues(values);
-    const packed = [];
-    pushVarint(packed, values.length);
-    for (const byte of bytes) packed.push(byte);
-    return Uint8Array.from(packed);
-  });
-  const out = Array.from(Buffer.from(doc.gray ? 'RG01' : 'RG02'));
-  pushVarint(out, doc.width);
-  pushVarint(out, doc.height);
-  for (const packed of streams) {
-    pushVarint(out, packed.length);
-    for (const byte of packed) out.push(byte);
-  }
-  return Uint8Array.from(out);
+function decode(bytes, length, bits) {
+  return typed(length ? decodeValues(bytes, length) : [], length, bits);
 }
 
-function decompress(bytes) {
-  const magic = Buffer.from(bytes.subarray(0, 4)).toString('ascii');
-  if (magic !== 'RG01' && magic !== 'RG02') throw new RangeError(`bad magic ${magic}`);
-  const gray = magic === 'RG01';
-  const cursor = { i: 4 };
-  const width = readVarint(bytes, cursor);
-  const height = readVarint(bytes, cursor);
-  const nx = Math.ceil(width / TILE);
-  const ny = Math.ceil(height / TILE);
-  const planeCount = gray ? 1 : 3;
-  const tiles = [];
-  for (let tile = 0; tile < nx * ny; tile++) {
-    const tilePlanes = [];
-    for (let plane = 0; plane < planeCount; plane++) {
-      const rows = [];
-      for (let s = 0; s < 9; s++) {
-        const length = readVarint(bytes, cursor);
-        const packed = bytes.subarray(cursor.i, cursor.i + length);
-        cursor.i += length;
-        const inner = { i: 0 };
-        const count = readVarint(packed, inner);
-        rows.push(decodeValues(packed.subarray(inner.i), count));
-      }
-      tilePlanes.push(rows);
-    }
-    tiles.push(tilePlanes);
-  }
-  if (cursor.i !== bytes.length) throw new RangeError('trailing bytes');
-  return renderParsed({ magic: gray ? 'PLN1-TXT' : 'PLN2-TXT', width, height, gray, coded: true, tiles });
-}
-
-function renderText(text) {
-  const doc = parseTxt(text);
-  const nx = Math.ceil(doc.width / TILE);
-  const ny = Math.ceil(doc.height / TILE);
-  const groups = doc.tiles.map(planes => planes.map(rows => rows.map((values, index) => {
-    const tag = index < 8 ? `L${index}` : 'M';
-    const { events } = encodeValues(values);
-    return `${tag} ${events.length ? events.join(' ') : '-'}`;
-  })));
-  let dataLine = 3 + ny;
-  const cells = groups.map((group, tile) => {
-    const starts = [];
-    for (const plane of group) { starts.push(dataLine); dataLine += plane.length; }
-    return { starts, row: Math.floor(tile / nx) };
-  });
-  const index = [];
-  for (let row = 0; row < ny; row++) {
-    index.push(cells.filter(cell => cell.row === row).map(cell => cell.starts.join(' ')).join('\t'));
-  }
-  return ['RLGR-TXT', `${doc.width} ${doc.height}`, ...index, ...groups.flat(2)].join('\n') + '\n';
-}
-
-function parseText(text) {
-  const lines = text.trimEnd().split('\n');
-  if (lines[0] !== 'RLGR-TXT') throw new RangeError(`bad magic ${lines[0]}`);
-  const [width, height] = lines[1].split(' ').map(Number);
-  const ny = Math.ceil(height / TILE);
-  const nx = Math.ceil(width / TILE);
-  const data = lines.slice(2 + ny);
-  const gray = data.length === nx * ny * 9;
-  const planes = gray ? 1 : 3;
-  if (data.length !== nx * ny * planes * 9) throw new RangeError('rlgr text size');
-  const tiles = [];
-  let cursor = 0;
-  for (let tile = 0; tile < nx * ny; tile++) {
-    const tilePlanes = [];
-    for (let plane = 0; plane < planes; plane++) {
-      const rows = [];
-      for (let s = 0; s < 9; s++) {
-        const line = data[cursor++];
-        const body = line.slice(line.indexOf(' ') + 1);
-        rows.push(body === '-' ? [] : valuesFromTokens(body.split(' ')));
-      }
-      tilePlanes.push(rows);
-    }
-    tiles.push(tilePlanes);
-  }
-  return renderParsed({
-    magic: gray ? 'PLN1-TXT' : 'PLN2-TXT',
-    width, height, gray, coded: true, tiles
-  });
-}
-
-module.exports = { compress, decompress, renderText, parseText };
+module.exports = { encode, decode };
