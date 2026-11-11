@@ -1,4 +1,4 @@
-// palic2r: PLN2 with the FSE streams replaced by interleaved one-pass RLGR. Files "PLR1"/"PLR2".
+// palic2r: PLN2 with the FSE streams replaced by interleaved one-pass RLGR. Files "PLR1"/"PLR2", fast mode "PLF1"/"PLF2".
 // Every plane of a tile has 8 RLGR coders (one per L); they and one raw bit writer for the L bit planes share one
 // page buffer per tile (rlgr_fast.hpp: the llrice RLGR and its reservation rule on a lean page buffer), so all
 // streams are interleaved in coding order and written on the fly; the decoder reserves pages at the same points
@@ -32,22 +32,21 @@ extern "C" {
 size_t FSE_buildCTableU16(FSE_CTable* ct, const short* normalizedCounter, unsigned maxSymbolValue, unsigned tableLog);
 }
 #include "../palic-1/netpbm.hpp"
-#ifndef PLR_PAIR_LMIN
-#define PLR_PAIR_LMIN 0
-#endif
-#ifndef PLR_PAIR_LMAX
-#define PLR_PAIR_LMAX 7
+#ifndef PLR_FAST_MASK
+#define PLR_FAST_MASK 0xffu                     // fast mode: pairs in every bin (experiments: other L sets)
 #endif
 #if defined(PLR_LLRICE)
 #include "llrice/rlgr.hpp"
 using REnc = RLGR::Encoder; using RDec = RLGR::Decoder; using RRawW = BitStream::Writer; using RRawR = BitStream::Reader;
 #define RAW_PUT(w, n, v) (w)->put_bits(n, v)
 #define RAW_GET16(r) ([&] { uint16_t m_ = uint16_t((r)->peek_n(16)); (r)->skip(16); return m_; }())
+#define RAW_GET(r, n) ([&] { const int n_ = (n); uint32_t v_ = uint32_t((r)->peek_n(n_)); (r)->skip(n_); return v_; }())
 #else
 #include "rlgr_fast.hpp"
 using REnc = rlgrf::Encoder; using RDec = rlgrf::Decoder; using RRawW = rlgrf::Writer; using RRawR = rlgrf::Reader;
 #define RAW_PUT(w, n, v) (w)->put(n, v)
 #define RAW_GET16(r) uint16_t((r)->get(16))
+#define RAW_GET(r, n) (r)->get(n)
 #endif
 
 static inline uint32_t bw(uint32_t v) { return v ? 32 - __builtin_clz(v) : 0; }
@@ -146,7 +145,7 @@ static inline int med(int a, int b, int c) { int mn = std::min(a, b), mx = std::
 #ifndef PLR_OFF
 #define PLR_OFF 1
 #endif
-struct Cfg { int off = PLR_OFF; };
+struct Cfg { int off = PLR_OFF; bool fast = false; };
 static constexpr int TILE = 288;
 
 static inline uint16_t zz8(int e) { e = int8_t(e); return uint16_t(uint8_t((e << 1) ^ (e >> 7))); }
@@ -268,46 +267,43 @@ template <bool NINE, class T> static void recon_wave(T* img, int S, int tw, int 
 }
 #undef SV
 #endif
+// Fast mode (files PLF1 / PLF2): the high parts of neighbours 2j, 2j+1 of a block go as one RLGR symbol a+b
+// (llrice CODER_G_RB_SUM / Malvar's RLGR3 idea) plus `a` in truncated binary over the a+b+1 values: k = floor(log2(a+b+1))
+// bits if a < u = 2^(k+1) - (a+b+1), else k+1 bits of a+u. Half the RLGR steps. pair_mask: bit L = pairs in bin L.
+// -DPLR_RAWSPLIT: `a` in bw(a+b) bits as llrice does (experiment only, not a file format).
 struct Sink {                                   // one plane: 8 RLGR coders + the shared raw writer
-    REnc* e[8]; RRawW* raw;
+    REnc* e[8]; RRawW* raw; unsigned pair_mask = 0;
     inline void block(int L, const uint16_t* hk, const uint16_t* m) {
         REnc& c = *e[L];
-#if defined(PLR_PAIR)
-        if (L >= PLR_PAIR_LMIN && L <= PLR_PAIR_LMAX)       // llrice CODER_G_RB_SUM on neighbours: RLGR(a+b), a raw in bw(a+b) bits
+        if (pair_mask >> L & 1)
         for (int j = 0; j < 16; j += 2) { const uint32_t s2 = uint32_t(hk[j]) + hk[j + 1]; c.put(s2);
-            if (s2) { const uint32_t a = hk[j]; const int k = 31 - __builtin_clz(s2 + 1); const uint32_t u = (2u << k) - (s2 + 1);
-#if defined(PLR_TRUNC)                                  // truncated binary of a in 0..s2 (s2 + 1 values)
+            if (s2) { const uint32_t a = hk[j];
+#if !defined(PLR_RAWSPLIT)
+                const int k = 31 - __builtin_clz(s2 + 1); const uint32_t u = (2u << k) - (s2 + 1);
                 raw->reserve(k + 1); if (a < u) { if (k) RAW_PUT(raw, k, a); } else RAW_PUT(raw, k + 1, a + u);
 #else
-                const int n = 32 - __builtin_clz(s2); raw->reserve(n); RAW_PUT(raw, n, a); (void)k; (void)u;
+                const int n = 32 - __builtin_clz(s2); raw->reserve(n); RAW_PUT(raw, n, a);
 #endif
             } }
         else for (int j = 0; j < 16; ++j) c.put(hk[j]);
-#else
-        for (int j = 0; j < 16; ++j) c.put(hk[j]);
-#endif
         if (L) { raw->reserve(16 * L); for (int k = 0; k < L; ++k) RAW_PUT(raw, 16, m[k]); }
     }
 };
 struct Source {
-    RDec* d[8]; RRawR* raw;
+    RDec* d[8]; RRawR* raw; unsigned pair_mask = 0;
     inline void block(int L, uint16_t* z) {
         alignas(32) uint16_t h[16]; alignas(32) uint16_t m[8];
         RDec& c = *d[L];
-#if defined(PLR_PAIR)
-        if (L >= PLR_PAIR_LMIN && L <= PLR_PAIR_LMAX)
+        if (pair_mask >> L & 1)
         for (int j = 0; j < 16; j += 2) { const uint32_t s2 = c.get(); uint32_t a = 0;
-#if defined(PLR_TRUNC)
+#if !defined(PLR_RAWSPLIT)
             if (s2) { const int k = 31 - __builtin_clz(s2 + 1); const uint32_t u = (2u << k) - (s2 + 1); raw->reserve(k + 1);
-                a = k ? raw->get(k) : 0; if (a >= u) a = ((a << 1) | raw->get(1)) - u; }
+                a = k ? RAW_GET(raw, k) : 0; if (a >= u) a = ((a << 1) | RAW_GET(raw, 1)) - u; }
 #else
-            if (s2) { const int n = 32 - __builtin_clz(s2); raw->reserve(n); a = raw->get(n); }
+            if (s2) { const int n = 32 - __builtin_clz(s2); raw->reserve(n); a = RAW_GET(raw, n); }
 #endif
             h[j] = uint16_t(a); h[j + 1] = uint16_t(s2 - a); }
         else for (int j = 0; j < 16; ++j) h[j] = uint16_t(c.get());
-#else
-        for (int j = 0; j < 16; ++j) h[j] = uint16_t(c.get());
-#endif
         if (L) { raw->reserve(16 * L); for (int k = 0; k < L; ++k) m[k] = RAW_GET16(raw); }
         const uint8_t* pp = reinterpret_cast<const uint8_t*>(m); block_unpack(h, L, pp, z);
     }
@@ -386,12 +382,12 @@ static void put_text_header(Out& o, const char* magic, int W, int H) {
     o.raw(buf, size_t(n));
 }
 // "PLN1\n" / "PLN2\n" then "W H\n". Returns the byte offset of the tile-length list.
-static size_t read_text_header(const std::vector<uint8_t>& d, bool& rgb, int& W, int& H) {
+static size_t read_text_header(const std::vector<uint8_t>& d, bool& rgb, int& W, int& H, bool& fast) {
     auto nl = std::find(d.begin(), d.end(), '\n');
     if (nl == d.end()) throw std::runtime_error("bad header");
     std::string magic(d.begin(), nl);
-    if (magic != "PLR1" && magic != "PLR2") throw std::runtime_error("not PLR1/PLR2");
-    rgb = magic == "PLR2";
+    if (magic != "PLR1" && magic != "PLR2" && magic != "PLF1" && magic != "PLF2") throw std::runtime_error("not PLR1/2, PLF1/2");
+    rgb = magic[3] == '2'; fast = magic[2] == 'F';
     auto nl2 = std::find(nl + 1, d.end(), '\n');
     if (nl2 == d.end()) throw std::runtime_error("bad header");
     std::string dims(nl + 1, nl2);
@@ -433,20 +429,19 @@ struct TileDec {
 std::vector<uint8_t> compress(const uint8_t* img, int W, int H, const Cfg& c) {
     Grid g = grid(W, H); const int nt = g.nx * g.ny; static thread_local std::vector<uint8_t> tmp;
     Out o; o.b.reserve(size_t(W) * H + size_t(nt) * 4 + 4096);
-    put_text_header(o, "PLR1", W, H);
+    put_text_header(o, c.fast ? "PLF1" : "PLR1", W, H);
     const size_t lens = o.b.size(); o.b.resize(lens + size_t(nt) * 4);
     for (int i = 0; i < nt; ++i) {
         const size_t b = o.b.size(); const uint8_t* ti = img + size_t(g.ty(i)) * W + g.tx(i);
-        TileEnc te(1, size_t(g.tw(i)) * g.th(i)); g_sink = &te.sk[0];
+        TileEnc te(1, size_t(g.tw(i)) * g.th(i)); te.sk[0].pair_mask = c.fast ? PLR_FAST_MASK : 0; g_sink = &te.sk[0];
         tile_enc(ti, W, g.tw(i), g.th(i), c, o, tmp); te.finish(o);
         const uint32_t l = uint32_t(o.b.size() - b); memcpy(&o.b[lens + size_t(i) * 4], &l, 4);
     }
     return std::move(o.b);
 }
 void decompress(const std::vector<uint8_t>& d, std::vector<uint8_t>& img, int& W, int& H) {
-    bool rgb = false; size_t pos = read_text_header(d, rgb, W, H);
-    if (rgb) throw std::runtime_error("not PLR1");
-    Cfg c;
+    Cfg c; bool rgb = false; size_t pos = read_text_header(d, rgb, W, H, c.fast);
+    if (rgb) throw std::runtime_error("not PLR1/PLF1");
     Grid g = grid(W, H); const int nt = g.nx * g.ny; std::vector<uint32_t> len(nt);
     if (d.size() < pos + size_t(nt) * 4) throw std::runtime_error("truncated");
     for (auto& l : len) { memcpy(&l, d.data() + pos, 4); pos += 4; }
@@ -454,7 +449,7 @@ void decompress(const std::vector<uint8_t>& d, std::vector<uint8_t>& img, int& W
     for (int i = 0; i < nt; ++i) {
         if (d.size() < pos + len[i]) throw std::runtime_error("truncated");
         In ti{d.data() + pos, d.data() + pos + len[i]}; pos += len[i];
-        TileDec td(ti, 1); g_src = &td.sr[0];
+        TileDec td(ti, 1); td.sr[0].pair_mask = c.fast ? PLR_FAST_MASK : 0; g_src = &td.sr[0];
         tile_dec(ti, img.data() + size_t(g.ty(i)) * W + g.tx(i), W, g.tw(i), g.th(i), c); if (ti.p != ti.e) throw std::runtime_error("tile trailing bytes"); }
 }
 
@@ -552,12 +547,12 @@ static void rgb_join(uint8_t* rgb, int W, int tw, int th, const uint8_t* Y, cons
 std::vector<uint8_t> compress_rgb(const uint8_t* rgb, int W, int H, const Cfg& c) {
     Grid g = grid(W, H); const int nt = g.nx * g.ny; static thread_local std::vector<uint8_t> tmp, Y; static thread_local std::vector<int16_t> U, V;
     Out o; o.b.reserve(size_t(W) * H * 3);
-    put_text_header(o, "PLR2", W, H);
+    put_text_header(o, c.fast ? "PLF2" : "PLR2", W, H);
     const size_t lens = o.b.size(); o.b.resize(lens + size_t(nt) * 4);
     for (int i = 0; i < nt; ++i) {
         const size_t b = o.b.size();
         rgb_split(rgb + (size_t(g.ty(i)) * W + g.tx(i)) * 3, W, g.tw(i), g.th(i), Y, U, V);
-        TileEnc te(3, size_t(g.tw(i)) * g.th(i) * 3);
+        TileEnc te(3, size_t(g.tw(i)) * g.th(i) * 3); for (auto& k : te.sk) k.pair_mask = c.fast ? PLR_FAST_MASK : 0;
         g_sink = &te.sk[0]; tile_enc(Y.data(), g.tw(i), g.tw(i), g.th(i), c, o, tmp);
         g_sink = &te.sk[1]; tile_enc16(U.data(), g.tw(i), g.th(i), c, o, tmp);
         g_sink = &te.sk[2]; tile_enc16(V.data(), g.tw(i), g.th(i), c, o, tmp);
@@ -567,9 +562,8 @@ std::vector<uint8_t> compress_rgb(const uint8_t* rgb, int W, int H, const Cfg& c
     return std::move(o.b);
 }
 void decompress_rgb(const std::vector<uint8_t>& d, std::vector<uint8_t>& rgb, int& W, int& H) {
-    bool rgb_file = false; size_t pos = read_text_header(d, rgb_file, W, H);
-    if (!rgb_file) throw std::runtime_error("not PLR2");
-    Cfg c;
+    Cfg c; bool rgb_file = false; size_t pos = read_text_header(d, rgb_file, W, H, c.fast);
+    if (!rgb_file) throw std::runtime_error("not PLR2/PLF2");
     Grid g = grid(W, H); const int nt = g.nx * g.ny; std::vector<uint32_t> len(nt);
     if (d.size() < pos + size_t(nt) * 4) throw std::runtime_error("truncated");
     for (auto& l : len) { memcpy(&l, d.data() + pos, 4); pos += 4; }
@@ -580,7 +574,7 @@ void decompress_rgb(const std::vector<uint8_t>& d, std::vector<uint8_t>& rgb, in
         In ti{d.data() + pos, d.data() + pos + len[i]}; pos += len[i];
         const int tw = g.tw(i), th = g.th(i);
         Y.resize(size_t(tw) * th); U.resize(Y.size()); V.resize(Y.size());
-        TileDec td(ti, 3);
+        TileDec td(ti, 3); for (auto& k : td.sr) k.pair_mask = c.fast ? PLR_FAST_MASK : 0;
         g_src = &td.sr[0]; tile_dec(ti, Y.data(), tw, tw, th, c);
         g_src = &td.sr[1]; tile_dec16(ti, U.data(), tw, th, c);
         g_src = &td.sr[2]; tile_dec16(ti, V.data(), tw, th, c);
@@ -610,10 +604,11 @@ static std::vector<uint8_t> read_bin(const std::string& fn) {
 
 int main(int argc, char** argv) {
     using namespace palic2;
-    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.pln (the input itself if it does not shrink) | d in.pln|pgm|ppm out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N]\n", argv[0]); return 1; }
+    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.plr [-f] (the input itself if it does not shrink) | d in.plr|pgm|ppm out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N] [-f]  (-f: fast mode, pairs, files PLF1/PLF2)\n", argv[0]); return 1; }
     std::string cmd = argv[1]; Cfg c; int reps = 3; std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i) { std::string a = argv[i];
         if (a == "-r" && i + 1 < argc) reps = atoi(argv[++i]);
+        else if (a == "-f") c.fast = true;
         else if (cmd == "bench" && std::filesystem::is_directory(a)) { std::vector<std::string> v;
             for (auto& e : std::filesystem::directory_iterator(a)) { auto x = e.path().extension();
                 if (x == ".pgm" || x == ".ppm" || x == ".pnm") v.push_back(e.path().string()); }
@@ -633,7 +628,7 @@ int main(int argc, char** argv) {
             if (d.size() >= 2 && d[0] == 'P' && (d[1] == '5' || d[1] == '6')) {       // stored original: copy
                 FILE* f = fopen(pos[1].c_str(), "wb"); if (!f) return 1;
                 const bool ok = fwrite(d.data(), 1, d.size(), f) == d.size(); fclose(f); return ok ? 0 : 1; }
-            std::vector<uint8_t> img; int W, H; bool rgb = d.size() >= 4 && memcmp(d.data(), "PLR2", 4) == 0;
+            std::vector<uint8_t> img; int W, H; bool rgb = d.size() >= 4 && d[0] == 'P' && d[1] == 'L' && d[3] == '2';
             if (rgb) decompress_rgb(d, img, W, H); else decompress(d, img, W, H);
             write_netpbm(pos[1], img, W, H, rgb); return 0; }
         if (cmd == "bench") {

@@ -235,3 +235,17 @@ Pairs re-measured at off 1 (now the PLR default), best of 3, all round trips ok;
 
 Pairs of neighbours are a speed knob, not a size gain: only Kodak (L = 0) gets smaller; on the photos the
 neighbours are correlated and the sum is coded worse than the two symbols.
+
+### PLR fast mode: files PLF1 / PLF2 (`palic2r c in out -f`)
+
+Header magic `PLF1` (gray) / `PLF2` (colour) instead of `PLR1` / `PLR2`; everything else as PLR (off = 1).
+In every bin L the 16 high parts of a block go as 8 pairs `(a, b) = (h[2j], h[2j+1])`: RLGR codes `s = a + b` in the
+coder of bin L, then, if `s > 0`, the raw writer gets `a` in truncated binary over the `s + 1` values
+(`k = floor(log2(s + 1))`, `u = 2^(k+1) − (s + 1)`; `a < u`: `a` in k bits, else `a + u` in k + 1 bits;
+the raw writer reserves k + 1 bits first). Then the L bit planes as in PLR. The decoder reads the magic, no switch.
+Half the RLGR steps per block. Best of 3, all round trips ok, byte-identical with the llrice classes (`-DPLR_LLRICE`):
+
+| mode | full Kodak | gray 17 | 19 colour | enc / dec MB/s, Kodak |
+|---|---|---|---|---|
+| PLR (off 1) | 10.1833 | 4.5726 | 8.2567 | 100 / 77 |
+| PLF fast | 10.2042 (+0.2%) | 4.6049 (+0.7%) | 8.3389 (+1.0%) | 120 / 95 |
