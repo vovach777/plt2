@@ -169,3 +169,22 @@ wall clock on this machine (not the i7 times from the public table, and not the 
 On this set the 9-bit fold does not change the size: no residual leaves `-256..255`. A synthetic frame
 whose neighbours jump by ±510 does round-trip, which is the case the fold is for. Gray PLN1 is unchanged
 (Kodak gray 4.5741).
+
+## PLR: PLN2 with one-pass interleaved RLGR instead of FSE (`palic-2/palic2r.cpp`)
+
+Same tiles, MED, causal L, bit planes, RCT and wave decoder as PLN2; only the entropy stage changes. Every plane
+of a tile has 8 RLGR coders (one per L, llrice adaptation) plus one raw writer for the L bit planes; all of them
+share one page buffer per tile and take 64-bit pages only at their reservation points, so the decoder takes the
+same pages in the same order. No histograms, no second pass. `rlgr_fast.hpp` is a lean re-implementation of the
+llrice coder: the file is byte-identical to the llrice classes (`-DPLR_LLRICE`), the run end and the Rice code go
+out as one write (reserve(64) after the run end = reserve(65 + k) before it), the decoder reads a Rice code from
+one 64-bit window. Static clang `-march=native`, in-process, best of 3, all round trips ok:
+
+| set | PLN2 (FSE) bpp | PLR bpp | PLR enc / dec MB/s (llrice classes → rlgr_fast) |
+|---|---|---|---|
+| full Kodak 24 colour | 9.8683 | 10.2407 (+3.8%) | 75 / 68 → 97 / 74 |
+| gray 17 | 4.5268 | 4.5963 (+1.5%) | 74 / 67 → 93 / 73 |
+| 19 colour photos | | 8.2810 | 87 / 80 → 109 / 85 |
+
+PLN2 FSE on full Kodak: enc 423, dec 417 MB/s. The coder is ~75% of the PLR time and the profile is instruction
+bound (IPC ~3), so the llrice format itself (a serial adaptive state per symbol) is the ceiling, not the bit I/O.

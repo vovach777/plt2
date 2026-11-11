@@ -1,12 +1,10 @@
-// palic2r: PLN2 with the FSE streams replaced by interleaved RLGR (llrice), proof of concept. Files "PLR1"/"PLR2".
-// Every plane of a tile has 8 RLGR coders (one per L) and all of them plus one raw bit writer for the L bit planes
-// share one page pool per tile: a coder takes the next free 64-bit page when it needs room (llrice reservation
-// rule), so all streams are interleaved in coding order and written on the fly; the decoder makes the same
-// reservations in the same order. Tile = var number of pages, pages (uint64). No histograms, no second pass.
-// The rest (tiles, MED, causal L, planes, RCT) is palic2.cpp as is.
-// build: clang++ -O3 -march=native -DNDEBUG -std=c++17 -DPLN_SSE -I../third_party/fse palic2r.cpp <fse objects> -o palic2r
-// Full Kodak 768x512: 10.2407 bpp (PLN2 FSE 9.8683), enc 78 / dec 59 MB/s in-process (PLN2 417 / 218).
-// Unused bits in reserved pages: 0.18%.
+// palic2r: PLN2 with the FSE streams replaced by interleaved one-pass RLGR. Files "PLR1"/"PLR2".
+// Every plane of a tile has 8 RLGR coders (one per L); they and one raw bit writer for the L bit planes share one
+// page buffer per tile (rlgr_fast.hpp: the llrice RLGR and its reservation rule on a lean page buffer), so all
+// streams are interleaved in coding order and written on the fly; the decoder reserves pages at the same points
+// in the same order. Tile = var number of pages, pages (uint64). No histograms, no second pass. With -DPLR_LLRICE
+// the coders are llrice's own classes (llrice/, the proof of concept). The rest (tiles, MED, causal L, planes,
+// RCT, the wave decoder, stored original) is palic2.cpp as is.
 // --- original header of palic2.cpp:
 // palic-2: PLN2 colour (and P5 gray) codec, mode 2 only.
 // Independent 288x288 tiles, MED + zigzag, causal L from the block above (off=2),
@@ -34,7 +32,17 @@ extern "C" {
 size_t FSE_buildCTableU16(FSE_CTable* ct, const short* normalizedCounter, unsigned maxSymbolValue, unsigned tableLog);
 }
 #include "../palic-1/netpbm.hpp"
+#if defined(PLR_LLRICE)
 #include "llrice/rlgr.hpp"
+using REnc = RLGR::Encoder; using RDec = RLGR::Decoder; using RRawW = BitStream::Writer; using RRawR = BitStream::Reader;
+#define RAW_PUT(w, n, v) (w)->put_bits(n, v)
+#define RAW_GET16(r) ([&] { uint16_t m_ = uint16_t((r)->peek_n(16)); (r)->skip(16); return m_; }())
+#else
+#include "rlgr_fast.hpp"
+using REnc = rlgrf::Encoder; using RDec = rlgrf::Decoder; using RRawW = rlgrf::Writer; using RRawR = rlgrf::Reader;
+#define RAW_PUT(w, n, v) (w)->put(n, v)
+#define RAW_GET16(r) uint16_t((r)->get(16))
+#endif
 
 static inline uint32_t bw(uint32_t v) { return v ? 32 - __builtin_clz(v) : 0; }
 struct Out { std::vector<uint8_t> b;
@@ -180,23 +188,90 @@ static inline void block_split(const uint16_t* s, int L, uint16_t*& pw, uint16_t
     for (int j = 0; j < 16; ++j) hi[j] = uint16_t(s[j] >> L);
 #endif
 }
+#if defined(__clang__)
+typedef uint16_t v16u __attribute__((ext_vector_type(16)));
+typedef int16_t v16s __attribute__((ext_vector_type(16)));
+#endif
 static inline void block_unpack(const uint16_t* h, int L, const uint8_t*& pp, uint16_t* z) {
+#if defined(__clang__)                                                  // vector: weights & mask != 0 -> bit k
+    const v16u w = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768};
+    v16u v; memcpy(&v, h, 32); v = v << uint16_t(L);
+    for (int k = 0; k < L; ++k) { uint16_t m; memcpy(&m, pp, 2); pp += 2; v |= (v16u)((v16u(m) & w) != 0) & uint16_t(1u << k); }
+    memcpy(z, &v, 32);
+#else
     for (int j = 0; j < 16; ++j) z[j] = uint16_t(h[j] << L);
     for (int k = 0; k < L; ++k) { uint16_t m; memcpy(&m, pp, 2); pp += 2; for (int j = 0; j < 16; ++j) z[j] |= uint16_t(((m >> j) & 1u) << k); }
+#endif
 }
+#if defined(__clang__)
+// ---- decoder MED as a wave over bands of 16 rows (from PLN1 planes_codec.cpp): lane k = row y0 + k, step t,
+// lane k at x = t - k (skew 1 px per row: MED needs a, b, c only). a = own lane, previous step; b = lane k-1,
+// previous step; c = lane k-1, two steps back; lane 0 takes b, c from the row above the band. Borders: tile row 0:
+// b = c = a (pred = left, 0 at x = 0); x = 0: a = c = b (pred = up). Skew in and out by 16 x 16 transposes.
+// NINE = false: Y, uint8 samples, value = (pred + e) & 255. NINE = true: U/V, int16 samples, value = fold9(pred + e).
+#define SV __builtin_shufflevector
+static inline void tr16s(v16s* m) {
+    for (int i = 0; i < 16; i++) if (!(i & 8)) { v16s a = m[i], b = m[i + 8];
+        m[i] = SV(a, b, 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23); m[i + 8] = SV(a, b, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31); }
+    for (int i = 0; i < 16; i++) if (!(i & 4)) { v16s a = m[i], b = m[i + 4];
+        m[i] = SV(a, b, 0, 1, 2, 3, 16, 17, 18, 19, 8, 9, 10, 11, 24, 25, 26, 27); m[i + 4] = SV(a, b, 4, 5, 6, 7, 20, 21, 22, 23, 12, 13, 14, 15, 28, 29, 30, 31); }
+    for (int i = 0; i < 16; i++) if (!(i & 2)) { v16s a = m[i], b = m[i + 2];
+        m[i] = SV(a, b, 0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29); m[i + 2] = SV(a, b, 2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31); }
+    for (int i = 0; i < 16; i += 2) { v16s a = m[i], b = m[i + 1];
+        m[i] = SV(a, b, 0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30); m[i + 1] = SV(a, b, 1, 17, 3, 19, 5, 21, 7, 23, 9, 25, 11, 27, 13, 29, 15, 31); }
+}
+static void unzz16w(const uint16_t* __restrict z, int16_t* __restrict e, int w) { for (int x = 0; x < w; ++x) e[x] = int16_t(int(z[x] >> 1) ^ -int(z[x] & 1)); }
+template <bool NINE, class T> static void recon_wave(T* img, int S, int tw, int th, const uint16_t* z) {
+    static thread_local std::vector<int16_t> Eb, Ob, Tb; const int RS = tw + 64;             // padded rows [-32, tw + 32)
+    Eb.assign(size_t(RS) * 16, 0); Ob.resize(size_t(RS) * 16); Tb.assign(size_t(tw) + 2, 0);
+    const v16s K = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}, lane0 = K == 0;
+    for (int y0 = 0; y0 < th; y0 += 16) {
+        const int R = std::min(16, th - y0), steps = tw + R - 1;
+        for (int k = 0; k < R; ++k) unzz16w(z + size_t(y0 + k) * tw, Eb.data() + size_t(k) * RS + 32, tw);
+        for (int k = R; k < 16; ++k) std::fill(Eb.data() + size_t(k) * RS, Eb.data() + size_t(k + 1) * RS, int16_t(0));
+        int16_t* Tp = Tb.data() + 1;                                                  // Tp[-1] = 0, Tp[tw] = 0
+        if (y0) for (int x = 0; x < tw; ++x) Tp[x] = int16_t(img[size_t(y0 - 1) * S + x]);
+        const bool first = y0 == 0;
+        v16s P1 = 0, P2 = 0;
+        for (int t0 = 0; t0 < steps; t0 += 16) {
+            v16s m[16];
+            for (int k = 0; k < 16; ++k) memcpy(&m[k], Eb.data() + size_t(k) * RS + 32 + t0 - k, 32);
+            tr16s(m);                                                                 // m[j] = residuals of step t0 + j
+            for (int j = 0; j < 16; ++j) {
+                const int t = t0 + j, tb = std::min(t, tw), tc = std::min(t - 1, tw);
+                v16s a = P1;
+                v16s b = SV(P1, (v16s)(int16_t)Tp[tb], 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+                v16s c = SV(P2, (v16s)(int16_t)Tp[tc], 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+                if (first) { b = lane0 ? a : b; c = lane0 ? a : c; }                   // tile row 0: pred = left
+                const v16s x0 = K == (int16_t)t; a = x0 ? b : a; c = x0 ? b : c;      // x = 0: pred = up
+                const v16s mn = a < b ? a : b, mx = a < b ? b : a; v16s p = a + b - c; p = p < mn ? mn : p; p = p > mx ? mx : p;
+                v16s v = p + m[j];
+                if (NINE) { v = v > (int16_t)255 ? v - (int16_t)512 : v; v = v < (int16_t)-255 ? v + (int16_t)512 : v; }
+                else v = v & (int16_t)255;
+                P2 = P1; P1 = v; m[j] = v;
+            }
+            tr16s(m);                                                                 // m[k] = row k at x = t0 - k ..
+            for (int k = 0; k < 16; ++k) memcpy(Ob.data() + size_t(k) * RS + 32 + t0 - k, &m[k], 32);
+        }
+        for (int k = 0; k < R; ++k) { T* r = img + size_t(y0 + k) * S; const int16_t* o = Ob.data() + size_t(k) * RS + 32;
+            for (int x = 0; x < tw; ++x) r[x] = T(o[x]); }
+    }
+}
+#undef SV
+#endif
 struct Sink {                                   // one plane: 8 RLGR coders + the shared raw writer
-    RLGR::Encoder* e[8]; BitStream::Writer* raw;
+    REnc* e[8]; RRawW* raw;
     inline void block(int L, const uint16_t* hk, const uint16_t* m) {
-        for (int j = 0; j < 16; ++j) e[L]->put(hk[j]);
-        if (L) { raw->reserve(16 * L); for (int k = 0; k < L; ++k) raw->put_bits(16, m[k]); }
+        REnc& c = *e[L]; for (int j = 0; j < 16; ++j) c.put(hk[j]);
+        if (L) { raw->reserve(16 * L); for (int k = 0; k < L; ++k) RAW_PUT(raw, 16, m[k]); }
     }
 };
 struct Source {
-    RLGR::Decoder* d[8]; BitStream::Reader* raw;
+    RDec* d[8]; RRawR* raw;
     inline void block(int L, uint16_t* z) {
         alignas(32) uint16_t h[16]; alignas(32) uint16_t m[8];
-        for (int j = 0; j < 16; ++j) h[j] = uint16_t(d[L]->get());
-        if (L) { raw->reserve(16 * L); for (int k = 0; k < L; ++k) { m[k] = uint16_t(raw->peek_n(16)); raw->skip(16); } }
+        RDec& c = *d[L]; for (int j = 0; j < 16; ++j) h[j] = uint16_t(c.get());
+        if (L) { raw->reserve(16 * L); for (int k = 0; k < L; ++k) m[k] = RAW_GET16(raw); }
         const uint8_t* pp = reinterpret_cast<const uint8_t*>(m); block_unpack(h, L, pp, z);
     }
 };
@@ -253,11 +328,15 @@ static void tile_dec(In& in, uint8_t* img, int S, int tw, int th, const Cfg& c) 
         }
     }
 
+#if defined(__clang__) && !defined(PLN_ROWS)
+    recon_wave<false>(img, S, tw, th, z);
+#else
     for (int y = 0; y < th; ++y) {
         const uint16_t* zr = z + size_t(y) * tw;
         unzz_row(zr, e.data(), tw);
         if (y == 0) recon_row0(img, e.data(), tw); else recon_row(img + size_t(y) * S, img + size_t(y - 1) * S, e.data(), tw);
     }
+#endif
 }
 struct Grid { int nx, ny, ts, W, H; int tx(int i) const { return (i % nx) * ts; } int ty(int i) const { return (i / nx) * ts; }
     int tw(int i) const { return std::min(ts, W - tx(i)); } int th(int i) const { return std::min(ts, H - ty(i)); } };
@@ -285,19 +364,35 @@ static size_t read_text_header(const std::vector<uint8_t>& d, bool& rgb, int& W,
     return size_t(nl2 - d.begin()) + 1;
 }
 
-// one tile = one page pool shared by every coder of every plane
+#if defined(PLR_LLRICE)
 struct TileEnc {
-    PagePool pool; std::vector<std::unique_ptr<RLGR::Encoder>> e; BitStream::Writer raw; Sink sk[3];
+    PagePool pool; std::vector<std::unique_ptr<REnc>> e; RRawW raw; Sink sk[3];
     explicit TileEnc(int planes, size_t px) : raw(pool) { pool.reserve(px / 4 + 64);
-        for (int p = 0; p < planes; ++p) { for (int L = 0; L < 8; ++L) { e.emplace_back(new RLGR::Encoder(pool)); sk[p].e[L] = e.back().get(); } sk[p].raw = &raw; } }
+        for (int p = 0; p < planes; ++p) { for (int L = 0; L < 8; ++L) { e.emplace_back(new REnc(pool)); sk[p].e[L] = e.back().get(); } sk[p].raw = &raw; } }
     void finish(Out& o) { for (auto& x : e) x->flush(); raw.flush(); o.var(pool.size()); o.raw(pool.data(), pool.size() * 8); }
 };
 struct TileDec {
-    PagePool pool; std::vector<std::unique_ptr<RLGR::Decoder>> d; std::unique_ptr<BitStream::Reader> raw; Source sr[3];
-    TileDec(In& in, int planes) : pool(read_pages(in)) { raw.reset(new BitStream::Reader(pool));
-        for (int p = 0; p < planes; ++p) { for (int L = 0; L < 8; ++L) { d.emplace_back(new RLGR::Decoder(pool)); sr[p].d[L] = d.back().get(); } sr[p].raw = raw.get(); } }
+    PagePool pool; std::vector<std::unique_ptr<RDec>> d; std::unique_ptr<RRawR> raw; Source sr[3];
+    TileDec(In& in, int planes) : pool(read_pages(in)) { raw.reset(new RRawR(pool));
+        for (int p = 0; p < planes; ++p) { for (int L = 0; L < 8; ++L) { d.emplace_back(new RDec(pool)); sr[p].d[L] = d.back().get(); } sr[p].raw = raw.get(); } }
     static std::vector<uint64_t> read_pages(In& in) { size_t n = size_t(in.var()); std::vector<uint64_t> v(n); memcpy(v.data(), in.take(n * 8), n * 8); return v; }
 };
+#else
+struct TileEnc {                                // one page buffer per tile, shared by every coder of every plane
+    rlgrf::PageBuf pb; std::vector<REnc> e; RRawW raw; Sink sk[3];
+    explicit TileEnc(int planes, size_t px) : raw(&pb) { pb.w.resize(px / 4 + 64); e.reserve(24);
+        for (int p = 0; p < planes; ++p) { for (int L = 0; L < 8; ++L) e.emplace_back(&pb); sk[p].raw = &raw; }
+        for (int p = 0; p < planes; ++p) for (int L = 0; L < 8; ++L) sk[p].e[L] = &e[size_t(p) * 8 + L]; }
+    void finish(Out& o) { for (auto& x : e) x.flush(); raw.flush(); o.var(pb.top); o.raw(pb.w.data(), pb.top * 8); }
+};
+struct TileDec {
+    std::vector<uint64_t> pages; size_t top = 0; std::vector<RDec> d; std::unique_ptr<RRawR> raw; Source sr[3];
+    TileDec(In& in, int planes) { const size_t n = size_t(in.var()); pages.resize(n); memcpy(pages.data(), in.take(n * 8), n * 8);
+        raw.reset(new RRawR(pages.data(), &top, n)); d.reserve(24);
+        for (int p = 0; p < planes; ++p) for (int L = 0; L < 8; ++L) d.emplace_back(pages.data(), &top, n);
+        for (int p = 0; p < planes; ++p) { for (int L = 0; L < 8; ++L) sr[p].d[L] = &d[size_t(p) * 8 + L]; sr[p].raw = raw.get(); } }
+};
+#endif
 std::vector<uint8_t> compress(const uint8_t* img, int W, int H, const Cfg& c) {
     Grid g = grid(W, H); const int nt = g.nx * g.ny; static thread_local std::vector<uint8_t> tmp;
     Out o; o.b.reserve(size_t(W) * H + size_t(nt) * 4 + 4096);
@@ -386,12 +481,16 @@ static void tile_dec16(In& in, int16_t* img, int tw, int th, const Cfg& c) {
         }
     }
 
+#if defined(__clang__) && !defined(PLN_ROWS)
+    recon_wave<true>(img, tw, tw, th, z);
+#else
     for (int y = 0; y < th; ++y) {
         const uint16_t* zr = z + size_t(y) * tw;
         for (int x = 0; x < tw; ++x) e[x] = int16_t(int(zr[x] >> 1) ^ -int(zr[x] & 1));
         if (y == 0) recon16_row0(img + size_t(y) * tw, e.data(), tw);
         else recon16_row(img + size_t(y) * tw, img + size_t(y - 1) * tw, e.data(), tw);
     }
+#endif
 }
 static void rgb_split(const uint8_t* rgb, int W, int tw, int th, std::vector<uint8_t>& Y, std::vector<int16_t>& U, std::vector<int16_t>& V) {
     Y.resize(size_t(tw) * th); U.resize(Y.size()); V.resize(Y.size());
@@ -474,7 +573,7 @@ static std::vector<uint8_t> read_bin(const std::string& fn) {
 
 int main(int argc, char** argv) {
     using namespace palic2;
-    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.pln | d in.pln out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N]\n", argv[0]); return 1; }
+    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.pln (the input itself if it does not shrink) | d in.pln|pgm|ppm out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N]\n", argv[0]); return 1; }
     std::string cmd = argv[1]; Cfg c; int reps = 3; std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i) { std::string a = argv[i];
         if (a == "-r" && i + 1 < argc) reps = atoi(argv[++i]);
@@ -487,9 +586,16 @@ int main(int argc, char** argv) {
         if (cmd == "c" && pos.size() == 2) {
             int W, H; bool rgb; auto px = read_netpbm(pos[0], W, H, rgb);
             auto o = rgb ? compress_rgb(px.data(), W, H, c) : compress(px.data(), W, H, c);
+            // not smaller than the input file: store the input file itself (a P5/P6 text header like ours);
+            // the decoder sees "P5"/"P6" instead of "PLN" and just copies the file
+            auto src = read_bin(pos[0]);
+            if (!src.empty() && o.size() >= src.size()) o.swap(src);
             FILE* f = fopen(pos[1].c_str(), "wb"); if (!f) return 1; fwrite(o.data(), 1, o.size(), f); fclose(f); return 0; }
         if (cmd == "d" && pos.size() == 2) {
             auto d = read_bin(pos[0]); if (d.empty()) { fprintf(stderr, "cannot read %s\n", pos[0].c_str()); return 1; }
+            if (d.size() >= 2 && d[0] == 'P' && (d[1] == '5' || d[1] == '6')) {       // stored original: copy
+                FILE* f = fopen(pos[1].c_str(), "wb"); if (!f) return 1;
+                const bool ok = fwrite(d.data(), 1, d.size(), f) == d.size(); fclose(f); return ok ? 0 : 1; }
             std::vector<uint8_t> img; int W, H; bool rgb = d.size() >= 4 && memcmp(d.data(), "PLR2", 4) == 0;
             if (rgb) decompress_rgb(d, img, W, H); else decompress(d, img, W, H);
             write_netpbm(pos[1], img, W, H, rgb); return 0; }
@@ -500,8 +606,10 @@ int main(int argc, char** argv) {
                 double be = 1e9, bd = 1e9; std::vector<uint8_t> o, r; int w2, h2;
                 for (int k = 0; k < reps; ++k) { double a = now_s(); o = rgb ? compress_rgb(px.data(), W, H, c) : compress(px.data(), W, H, c); double b = now_s();
                     if (rgb) decompress_rgb(o, r, w2, h2); else decompress(o, r, w2, h2); double e = now_s(); be = std::min(be, b - a); bd = std::min(bd, e - b); }
-                bool g = r == px; ok &= g; double n = double(W) * H * (rgb ? 3 : 1); tpx += n; tpix += double(W) * H; tb += o.size(); te += be; td += bd;
-                printf("%-16s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s  %s\n", std::filesystem::path(fn).filename().string().c_str(), W, H, o.size(), 8.0 * o.size() / (double(W) * H), n / be / 1e6, n / bd / 1e6, g ? "ok" : "FAIL"); }
+                bool g = r == px; ok &= g; double n = double(W) * H * (rgb ? 3 : 1); tpx += n; tpix += double(W) * H; te += be; td += bd;
+                const size_t fsz = size_t(std::filesystem::file_size(fn)), sz = std::min(o.size(), fsz);   // "c" stores the input if it does not shrink
+                tb += sz;
+                printf("%-16s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s  %s%s\n", std::filesystem::path(fn).filename().string().c_str(), W, H, sz, 8.0 * sz / (double(W) * H), n / be / 1e6, n / bd / 1e6, g ? "ok" : "FAIL", sz < o.size() ? "  (stored)" : ""); }
             printf("TOTAL %zu files %.4f bpp  enc %.1f dec %.1f MB/s  (tile %d)  %s\n", pos.size(), 8 * tb / tpix, tpx / te / 1e6, tpx / td / 1e6, TILE, ok ? "all ok" : "FAIL");
             return ok ? 0 : 3; }
     } catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 2; }
