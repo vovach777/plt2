@@ -1,0 +1,156 @@
+--- /home/claude/plt2_repo/palic-2/palic2r.cpp	2026-11-11 23:38:37.414345852 +0300
++++ palic-2/palic2r.cpp	2026-11-12 00:03:44.195610801 +0300
+@@ -55,6 +55,9 @@
+ #endif
+ #if PLR_LAYOUT == 3
+ #include "rlgr_lane.hpp"
++#if defined(PLR_QH)
++#include "../qh.hpp"
++#endif
+ using REnc = rlgrl::Encoder; using RDec = rlgrl::Decoder; using RRawW = rlgrl::Lane; using RRawR = rlgrl::LaneR;
+ #undef RAW_PUT
+ #undef RAW_GET16
+@@ -186,10 +189,22 @@
+         z[x] = zz8(r[x] - p);
+     }
+ }
++#if defined(PLR_QH)
++static uint32_t g_sa = 64;                      // the causal sum of the current block (context of the QH tables)
++#endif
++#if defined(PLR_DUMP)
++static FILE* g_dump = nullptr; static uint32_t g_lastsum = 0;
++#endif
+ static inline int block_L(const uint16_t* s, int off) {
++#if defined(PLR_DUMP)
++    { uint32_t sum = 0; for (int j = 0; j < 16; ++j) sum += s[j]; g_lastsum = sum; }
++#endif
+ #if defined(PLN_SSE)
+     const __m128i a0 = _mm_loadu_si128((const __m128i*)s), a1 = _mm_loadu_si128((const __m128i*)(s + 8));
+     __m128i t = _mm_add_epi16(a0, a1); t = _mm_add_epi16(t, _mm_srli_si128(t, 8)); t = _mm_add_epi16(t, _mm_srli_si128(t, 4)); t = _mm_add_epi16(t, _mm_srli_si128(t, 2));
++#if defined(PLR_QH)
++    g_sa = uint32_t(_mm_extract_epi16(t, 0));
++#endif
+     return std::min(7, std::max(0, int(bwz(uint32_t(_mm_extract_epi16(t, 0)) >> 4)) - off));
+ #else
+     uint32_t sum = 0; for (int j = 0; j < 16; ++j) sum += s[j];
+@@ -207,6 +222,12 @@
+ static inline int causal_L(const uint16_t* z, size_t i, int tw, int off) {
+     const size_t px = i * 16;
+     if (tw >= 16 && px >= size_t(tw)) return block_L(z + px - tw, off);
++#if defined(PLR_DUMP)
++    if (!i) g_lastsum = 0xffffffffu;
++#endif
++#if defined(PLR_QH)
++    if (!i) { g_sa = 64; return 2; }
++#endif
+     return i ? block_L(z + px - 16, off) : 2;
+ }
+ static inline void block_split(const uint16_t* s, int L, uint16_t*& pw, uint16_t* hi) {
+@@ -306,9 +327,12 @@
+ // bits if a < u = 2^(k+1) - (a+b+1), else k+1 bits of a+u. Half the RLGR steps. pair_mask: bit L = pairs in bin L.
+ // -DPLR_RAWSPLIT: `a` in bw(a+b) bits as llrice does (experiment only, not a file format).
+ struct Sink {                                   // one plane: 8 RLGR coders + the shared raw writer
+-    REnc* e[8]; RRawW* raw; unsigned pair_mask = 0;
++    REnc* e[8]; RRawW* raw; unsigned pair_mask = 0; int pid = 0;
+     inline void block(int L, const uint16_t* hk, const uint16_t* m) {
+         REnc& c = *e[L];
++#if defined(PLR_DUMP)
++        const uint64_t dump_h0 = raw->head;
++#endif
+         if (pair_mask >> L & 1)
+         for (int j = 0; j < 16; j += 2) { const uint32_t s2 = uint32_t(hk[j]) + hk[j + 1]; c.put(s2);
+             if (s2) { const uint32_t a = hk[j];
+@@ -319,15 +343,29 @@
+                 const int n = 32 - __builtin_clz(s2); raw->reserve(n); RAW_PUT(raw, n, a);
+ #endif
+             } }
+-        else for (int j = 0; j < 16; ++j) c.put(hk[j]);
++        else
++#if defined(PLR_QH)
++        { (void)c; qh::qh_enc_block(*raw, pid ? 1u : 0u, g_sa, L, hk, m); return; }
++#else
++        for (int j = 0; j < 16; ++j) c.put(hk[j]);
++#endif
++#if defined(PLR_DUMP)
++        if (g_dump) { uint8_t hd[2] = {uint8_t(pid), uint8_t(L)}; uint32_t x[2] = {uint32_t(raw->head - dump_h0), g_lastsum};
++            uint16_t zz[16]; for (int j = 0; j < 16; ++j) { uint32_t v = uint32_t(hk[j]) << L; for (int k = 0; k < L; ++k) v |= uint32_t((m[k] >> j) & 1u) << k; zz[j] = uint16_t(v); }
++            fwrite(hd, 1, 2, g_dump); fwrite(x, 4, 2, g_dump); fwrite(zz, 2, 16, g_dump); }
++#endif
+         if (L) { raw->reserve(16 * L); for (int k = 0; k < L; ++k) RAW_PUT(raw, 16, m[k]); }
+     }
+ };
+ struct Source {
+-    RDec* d[8]; RRawR* raw; unsigned pair_mask = 0;
++    RDec* d[8]; RRawR* raw; unsigned pair_mask = 0; int pid = 0;
+     inline void block(int L, uint16_t* z) {
+         alignas(32) uint16_t h[16]; alignas(32) uint16_t m[8];
+         RDec& c = *d[L];
++#if defined(PLR_QH)
++        if (!(pair_mask >> L & 1)) { (void)c; qh::qh_dec_block(*raw, pid ? 1u : 0u, g_sa, L, h, m);
++            const uint8_t* pq = reinterpret_cast<const uint8_t*>(m); block_unpack(h, L, pq, z); return; }
++#endif
+         if (pair_mask >> L & 1)
+         for (int j = 0; j < 16; j += 2) { const uint32_t s2 = c.get(); uint32_t a = 0;
+ #if !defined(PLR_RAWSPLIT)
+@@ -451,7 +489,12 @@
+     explicit TileEnc(int planes, size_t px) { lane.w.assign(px / 16 + 64, 0); e.reserve(24);
+         for (int i = 0; i < planes * 8; ++i) e.emplace_back(&lane);
+         for (int p = 0; p < planes; ++p) { sk[p].raw = &lane; for (int L = 0; L < 8; ++L) sk[p].e[L] = &e[size_t(p) * 8 + L]; } }
+-    void finish(Out& o) { for (auto& x : e) x.flush(); const size_t n = lane.words(); o.var(n); o.raw(lane.w.data(), n * 8); }
++    void finish(Out& o) { for (auto& x : e) x.flush(); const size_t n = lane.words(); o.var(n); o.raw(lane.w.data(), n * 8);
++#if defined(PLR_DUMP)
++        if (g_dump) { uint8_t hd[2] = {255, 0}; uint32_t x[2] = {uint32_t(lane.head), uint32_t(n * 64)}; uint16_t z16[16] = {0};
++            fwrite(hd, 1, 2, g_dump); fwrite(x, 4, 2, g_dump); fwrite(z16, 2, 16, g_dump); }
++#endif
++    }
+ };
+ struct TileDec {
+     std::vector<uint64_t> words; rlgrl::LaneR lr; std::vector<RDec> d; Source sr[3];
+@@ -703,7 +746,7 @@
+         const size_t b = o.b.size();
+         rgb_split(rgb + (size_t(g.ty(i)) * W + g.tx(i)) * 3, W, g.tw(i), g.th(i), Y, U, V);
+         TileEnc te(3, size_t(g.tw(i)) * g.th(i) * 3); for (auto& k : te.sk) k.pair_mask = c.fast ? PLR_FAST_MASK : 0;
+-        g_sink = &te.sk[0]; tile_enc(Y.data(), g.tw(i), g.tw(i), g.th(i), c, o, tmp);
++        te.sk[1].pid = 1; te.sk[2].pid = 2; g_sink = &te.sk[0]; tile_enc(Y.data(), g.tw(i), g.tw(i), g.th(i), c, o, tmp);
+         if (!c.fast) { g_sink = &te.sk[1]; tile_enc_uv(U.data(), V.data(), g.tw(i), g.th(i), c); }
+         else {
+         g_sink = &te.sk[1]; tile_enc16(U.data(), g.tw(i), g.th(i), c, o, tmp);
+@@ -727,7 +770,7 @@
+         const int tw = g.tw(i), th = g.th(i);
+         Y.resize(size_t(tw) * th); U.resize(Y.size()); V.resize(Y.size());
+         TileDec td(ti, 3); for (auto& k : td.sr) k.pair_mask = c.fast ? PLR_FAST_MASK : 0;
+-        g_src = &td.sr[0]; tile_dec(ti, Y.data(), tw, tw, th, c);
++        td.sr[1].pid = 1; td.sr[2].pid = 2; g_src = &td.sr[0]; tile_dec(ti, Y.data(), tw, tw, th, c);
+         if (!c.fast) { g_src = &td.sr[1]; tile_dec_uv(U.data(), V.data(), tw, th, c); }
+         else {
+         g_src = &td.sr[1]; tile_dec16(ti, U.data(), tw, th, c);
+@@ -758,6 +801,9 @@
+ 
+ int main(int argc, char** argv) {
+     using namespace palic2;
++#if defined(PLR_QH)
++    { const char* tf = getenv("QH_TABLES"); if (!tf) { fprintf(stderr, "set QH_TABLES\n"); return 1; } qh::load_tables(tf); }
++#endif
+     if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.plr [-f] (the input itself if it does not shrink) | d in.plr|pgm|ppm out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N] [-f]  (-f: fast mode, pairs, files PLF1/PLF2)\n", argv[0]); return 1; }
+     std::string cmd = argv[1]; Cfg c; int reps = 3; std::vector<std::string> pos;
+     for (int i = 2; i < argc; ++i) { std::string a = argv[i];
+@@ -771,6 +817,9 @@
+     try {
+         if (cmd == "c" && pos.size() == 2) {
+             int W, H; bool rgb; auto px = read_netpbm(pos[0], W, H, rgb);
++#if defined(PLR_DUMP)
++            if (const char* dp = getenv("PLR_DUMP_FILE")) { palic2::g_dump = fopen(dp, "wb"); int hdr[4] = {W, H, rgb ? 3 : 1, c.fast ? 1 : 0}; fwrite(hdr, 4, 4, palic2::g_dump); }
++#endif
+             auto o = rgb ? compress_rgb(px.data(), W, H, c) : compress(px.data(), W, H, c);
+             // not smaller than the input file: store the input file itself (a P5/P6 text header like ours);
+             // the decoder sees "P5"/"P6" instead of "PLN" and just copies the file
+@@ -780,6 +829,9 @@
+             fprintf(stderr, "STATS %zu %llu %llu %llu %llu %llu %d\n", o.size(), (unsigned long long)rlgrf::g_payload, (unsigned long long)rlgrf::g_waste_full, (unsigned long long)rlgrf::g_nfull, (unsigned long long)rlgrf::g_waste_flush, (unsigned long long)rlgrf::g_nruns, (W + 287) / 288 * ((H + 287) / 288));
+             fprintf(stderr, "SIMB %llu %llu %llu\n", (unsigned long long)rlgrf::g_head, (unsigned long long)rlgrf::g_nshrink, (unsigned long long)rlgrf::g_lost_b);
+ #endif
++#if defined(PLR_DUMP)
++            if (palic2::g_dump) fclose(palic2::g_dump);
++#endif
+             FILE* f = fopen(pos[1].c_str(), "wb"); if (!f) return 1; fwrite(o.data(), 1, o.size(), f); fclose(f); return 0; }
+         if (cmd == "d" && pos.size() == 2) {
+             auto d = read_bin(pos[0]); if (d.empty()) { fprintf(stderr, "cannot read %s\n", pos[0].c_str()); return 1; }
