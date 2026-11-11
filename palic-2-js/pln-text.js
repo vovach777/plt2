@@ -14,8 +14,8 @@
 //   F1, then four nibbles one symbol above 14
 //   a varint count is in front, so a trailing pad nibble is ignored
 //
-// Rice (RC02 / RC01): k from the parabola of the three previous symbols,
-//   next = 3c - 3b + a, k = floor(log2(|next|)).
+// Rice (RC02 / RC01): k is the bit width of the mean of the last three
+// symbols. Fewer than three: the mean of those we have. k = 0 at the start.
 
 const { decomposeImage } = require('./tile-fse-layout');
 
@@ -259,13 +259,13 @@ function unpackRuns(bytes, image) {
 
 function riceK(hist) {
   const n = hist.length;
-  let pred = 0;
-  if (n >= 3) pred = 3 * hist[n - 1] - 3 * hist[n - 2] + hist[n - 3];
-  else if (n === 2) pred = 2 * hist[1] - hist[0];
-  else if (n === 1) pred = hist[0];
-  if (pred < 0) pred = -pred;
+  if (n === 0) return 0;
+  const used = Math.min(n, 3);
+  let sum = 0;
+  for (let i = n - used; i < n; i++) sum += hist[i];
+  const pred = sum / used;
   if (pred <= 1) return 0;
-  return Math.min(16, 31 - Math.clz32(pred));
+  return Math.min(16, 31 - Math.clz32(Math.round(pred)));
 }
 
 function encodeRice(values) {
