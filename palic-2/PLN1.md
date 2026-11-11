@@ -268,3 +268,9 @@ reconstructed by the PLN1 wave over 16-row bands. Format and file bytes unchange
 | clang, native | 423 | 218 -> 417 |
 | clang, x86-64-v2 (SSE4) | 362 | -> 390 |
 | gcc (no vector types, scalar paths) | 343 | 167 |
+
+## Stored original
+
+The PLN header is a text header like P5/P6. `palic-2 c` writes the input file itself (P5/P6, comments included)
+when the PLN file would not be smaller; `palic-2 d` sees `P5`/`P6` instead of `PLN` and copies the file.
+`bench` counts the smaller of the two and marks such files `(stored)`.

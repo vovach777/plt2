@@ -526,7 +526,7 @@ static std::vector<uint8_t> read_bin(const std::string& fn) {
 
 int main(int argc, char** argv) {
     using namespace palic2;
-    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.pln | d in.pln out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N]\n", argv[0]); return 1; }
+    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.pln (the input itself if it does not shrink) | d in.pln|pgm|ppm out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N]\n", argv[0]); return 1; }
     std::string cmd = argv[1]; Cfg c; int reps = 3; std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i) { std::string a = argv[i];
         if (a == "-r" && i + 1 < argc) reps = atoi(argv[++i]);
@@ -539,9 +539,16 @@ int main(int argc, char** argv) {
         if (cmd == "c" && pos.size() == 2) {
             int W, H; bool rgb; auto px = read_netpbm(pos[0], W, H, rgb);
             auto o = rgb ? compress_rgb(px.data(), W, H, c) : compress(px.data(), W, H, c);
+            // not smaller than the input file: store the input file itself (a P5/P6 text header like ours);
+            // the decoder sees "P5"/"P6" instead of "PLN" and just copies the file
+            auto src = read_bin(pos[0]);
+            if (!src.empty() && o.size() >= src.size()) o.swap(src);
             FILE* f = fopen(pos[1].c_str(), "wb"); if (!f) return 1; fwrite(o.data(), 1, o.size(), f); fclose(f); return 0; }
         if (cmd == "d" && pos.size() == 2) {
             auto d = read_bin(pos[0]); if (d.empty()) { fprintf(stderr, "cannot read %s\n", pos[0].c_str()); return 1; }
+            if (d.size() >= 2 && d[0] == 'P' && (d[1] == '5' || d[1] == '6')) {       // stored original: copy
+                FILE* f = fopen(pos[1].c_str(), "wb"); if (!f) return 1;
+                const bool ok = fwrite(d.data(), 1, d.size(), f) == d.size(); fclose(f); return ok ? 0 : 1; }
             std::vector<uint8_t> img; int W, H; bool rgb = d.size() >= 4 && memcmp(d.data(), "PLN2", 4) == 0;
             if (rgb) decompress_rgb(d, img, W, H); else decompress(d, img, W, H);
             write_netpbm(pos[1], img, W, H, rgb); return 0; }
@@ -552,8 +559,10 @@ int main(int argc, char** argv) {
                 double be = 1e9, bd = 1e9; std::vector<uint8_t> o, r; int w2, h2;
                 for (int k = 0; k < reps; ++k) { double a = now_s(); o = rgb ? compress_rgb(px.data(), W, H, c) : compress(px.data(), W, H, c); double b = now_s();
                     if (rgb) decompress_rgb(o, r, w2, h2); else decompress(o, r, w2, h2); double e = now_s(); be = std::min(be, b - a); bd = std::min(bd, e - b); }
-                bool g = r == px; ok &= g; double n = double(W) * H * (rgb ? 3 : 1); tpx += n; tpix += double(W) * H; tb += o.size(); te += be; td += bd;
-                printf("%-16s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s  %s\n", std::filesystem::path(fn).filename().string().c_str(), W, H, o.size(), 8.0 * o.size() / (double(W) * H), n / be / 1e6, n / bd / 1e6, g ? "ok" : "FAIL"); }
+                bool g = r == px; ok &= g; double n = double(W) * H * (rgb ? 3 : 1); tpx += n; tpix += double(W) * H; te += be; td += bd;
+                const size_t fsz = size_t(std::filesystem::file_size(fn)), sz = std::min(o.size(), fsz);   // "c" stores the input if it does not shrink
+                tb += sz;
+                printf("%-16s %5dx%-5d %9zu B %7.4f bpp  enc %6.1f dec %6.1f MB/s  %s%s\n", std::filesystem::path(fn).filename().string().c_str(), W, H, sz, 8.0 * sz / (double(W) * H), n / be / 1e6, n / bd / 1e6, g ? "ok" : "FAIL", sz < o.size() ? "  (stored)" : ""); }
             printf("TOTAL %zu files %.4f bpp  enc %.1f dec %.1f MB/s  (tile %d)  %s\n", pos.size(), 8 * tb / tpix, tpx / te / 1e6, tpx / td / 1e6, TILE, ok ? "all ok" : "FAIL");
             return ok ? 0 : 3; }
     } catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 2; }
