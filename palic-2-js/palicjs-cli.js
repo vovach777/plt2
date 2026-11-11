@@ -16,10 +16,19 @@ function loadEntropy(name) {
   return require(`./entropy_${name}.js`);
 }
 
+function pushByte(out, value) {
+  if (out.length === out.data.length) {
+    const next = new Uint8Array(out.data.length * 2);
+    next.set(out.data);
+    out.data = next;
+  }
+  out.data[out.length++] = value;
+}
+
 function pushVarint(out, value) {
   let n = value;
-  while (n >= 128) { out.push((n & 127) | 128); n = Math.floor(n / 128); }
-  out.push(n);
+  while (n >= 128) { pushByte(out, (n & 127) | 128); n = Math.floor(n / 128); }
+  pushByte(out, n);
 }
 
 function readVarint(bytes, cursor) {
@@ -78,23 +87,23 @@ function rowsOf(plane) {
 function encodePjs(image, name) {
   const entropy = loadEntropy(name);
   const planeCount = image.format === C.FORMAT_PLN1 ? 1 : 3;
-  const bin = [];
+  const bin = { data: new Uint8Array(4096), length: 0 };
   for (const tile of image.tiles) {
     const planes = planeCount === 1 ? [tile.data.planes[0]] : tile.data.planes;
     for (const plane of planes) {
       for (const values of rowsOf(plane)) {
         const bits = values instanceof Uint16Array ? 16 : 8;
         const packed = entropy.encode(values);
-        bin.push(bits);
+        pushByte(bin, bits);
         pushVarint(bin, values.length);
         pushVarint(bin, packed.length);
-        for (let i = 0; i < packed.length; i++) bin.push(packed[i]);
+        for (let i = 0; i < packed.length; i++) pushByte(bin, packed[i]);
       }
     }
   }
   const formatName = image.format === C.FORMAT_PLN1 ? 'PLN1' : 'PLN2';
   const head = Buffer.from(`${formatName}-${name.toUpperCase()}\n${image.width} ${image.height}\n`);
-  return Buffer.concat([head, Buffer.from(bin)]);
+  return Buffer.concat([head, Buffer.from(bin.data.subarray(0, bin.length))]);
 }
 
 function bucket(coefficients, plane, L) {

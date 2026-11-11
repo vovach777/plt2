@@ -3,16 +3,18 @@
 // Nibble run-length of one typed array.
 // 0..14 is one symbol, two per byte. F0 and two nibbles: a zero run from length 4.
 // F1 and four nibbles: one symbol above 14.
+// A symbol costs at most six nibbles, so the byte buffer is sized once.
 
 function encode(values) {
   if (!(values instanceof Uint8Array) && !(values instanceof Uint16Array)) {
     throw new TypeError('expected Uint8Array or Uint16Array');
   }
-  const bytes = [];
+  const bytes = new Uint8Array(values.length * 3 + 1);
+  let length = 0;
   let acc = 0, half = false;
   function nib(n) {
     if (!half) { acc = n << 4; half = true; }
-    else { bytes.push(acc | n); half = false; }
+    else { bytes[length++] = acc | n; half = false; }
   }
   let i = 0;
   while (i < values.length) {
@@ -37,12 +39,11 @@ function encode(values) {
     i++;
   }
   if (half) nib(0);
-  return Uint8Array.from(bytes);
+  return bytes.subarray(0, length);
 }
 
 function decode(bytes, length, bits) {
-  const Type = bits === 16 ? Uint16Array : Uint8Array;
-  const values = new Type(length);
+  const values = new (bits === 16 ? Uint16Array : Uint8Array)(length);
   let acc = 0, half = false, pos = 0, n = 0;
   function nib() {
     if (!half) {
