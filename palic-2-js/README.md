@@ -51,6 +51,49 @@ node palicjs-cli.js -d image.pjs -o image.ppm
 | [entropy_rl.js](entropy_rl.js) | ниблы и прогон нулей |
 | [entropy_rice.js](entropy_rice.js) | Райс, `k` по среднему трёх |
 
+## Свой модуль
+
+Имя из `-e` — это имя файла. `node palicjs-cli.js -e foo image.ppm` загружает [entropy_foo.js](entropy_foo.js) и пишет заголовок `PLN2-FOO` или `PLN1-FOO`. Программу править не нужно. Имя: строчные латинские буквы и цифры, с буквы.
+
+Модуль жмёт один массив и ничего не знает про картинку. Длина и ширина символа лежат в контейнере, не в твоих байтах.
+
+```js
+'use strict';
+
+function encode(values) {
+  if (!(values instanceof Uint8Array) && !(values instanceof Uint16Array)) {
+    throw new TypeError('expected Uint8Array or Uint16Array');
+  }
+  return new Uint8Array(values.buffer, values.byteOffset, values.byteLength);
+}
+
+function decode(bytes, length, bits) {
+  if (bits === 8) return bytes.slice(0, length);
+  const out = new Uint16Array(length);
+  for (let i = 0; i < length; i++) out[i] = bytes[i * 2] | (bytes[i * 2 + 1] << 8);
+  return out;
+}
+
+module.exports = { encode, decode };
+```
+
+`encode` получает `Uint8Array` или `Uint16Array` и возвращает `Uint8Array`. `decode(bytes, length, bits)` возвращает столько же символов: `bits` равен 8 или 16. Пустой массив законен, для него `encode` возвращает пустые байты.
+
+Проверка, прежде чем мерить файл:
+
+```js
+const back = decode(encode(values), values.length, values instanceof Uint16Array ? 16 : 8);
+```
+
+`back` должен совпасть с `values` побайтно. Потом:
+
+```bash
+node palicjs-cli.js -e foo kodim23.ppm -o kodim23.pjs
+node palicjs-cli.js -d kodim23.pjs -o kodim23.back.ppm
+```
+
+Пиксели `kodim23.back.ppm` и исходного P6 должны совпасть. В таблицу ниже попадает размер `.pjs`, серый считается на P5 и в рейтинг места не идёт.
+
 ## Рейтинг, kodim23
 
 `kodak_color_p6_full.zip` и `kodak_gray_all.zip`, кадр 500×500. Пиксели после `-d` совпали.
