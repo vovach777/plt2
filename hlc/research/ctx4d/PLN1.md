@@ -348,3 +348,15 @@ used by its next codes). Counted on the real streams:
 | PLF Kodak / gray / colour | 0.09 / 0.10 / 0.10% | 0.09 / 0.08 / 1.10% | +0.01 / −0.01 / +1.01% |
 
 The lazy page scheme already wastes < 0.1%; the holes of (b) waste 3–15 times more. (b) is not taken as it is.
+
+(b) with Vladimir's repair: a full window whose hole still ends at the head (nobody wrote after it during the run)
+gives its k unused bits back (`head −= k`). The decoder sees the same condition: after the flag 0 its head is set
+past the hole, and if nothing was read by the time the window ends it steps back by k. Simulated on the real
+streams (`-DRLGR_STATS`, SIMB line):
+
+| | full windows shrunk | lost | (b) + repair vs now |
+|---|---|---|---|
+| PLR Kodak | 282 575 of 312 677 | 0.0043 bpp | −0.02% |
+| PLR gray 17 | 434 428 of 466 488 | 0.0026 bpp | −0.02% |
+| PLR 19 colour | 1 306 717 of 1 473 591 | 0.0189 bpp | +0.15% |
+| PLF Kodak / gray / colour | 93 / 91 / 99% | ≤ 0.0008 bpp | −0.08 / −0.08 / −0.09% |

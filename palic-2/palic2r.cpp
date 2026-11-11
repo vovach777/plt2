@@ -743,6 +743,7 @@ int main(int argc, char** argv) {
             if (!src.empty() && o.size() >= src.size()) o.swap(src);
 #if defined(RLGR_STATS) && !defined(PLR_LLRICE)
             fprintf(stderr, "STATS %zu %llu %llu %llu %llu %llu %d\n", o.size(), (unsigned long long)rlgrf::g_payload, (unsigned long long)rlgrf::g_waste_full, (unsigned long long)rlgrf::g_nfull, (unsigned long long)rlgrf::g_waste_flush, (unsigned long long)rlgrf::g_nruns, (W + 287) / 288 * ((H + 287) / 288));
+            fprintf(stderr, "SIMB %llu %llu %llu\n", (unsigned long long)rlgrf::g_head, (unsigned long long)rlgrf::g_nshrink, (unsigned long long)rlgrf::g_lost_b);
 #endif
             FILE* f = fopen(pos[1].c_str(), "wb"); if (!f) return 1; fwrite(o.data(), 1, o.size(), f); fclose(f); return 0; }
         if (cmd == "d" && pos.size() == 2) {
