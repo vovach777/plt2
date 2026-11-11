@@ -249,3 +249,22 @@ Half the RLGR steps per block. Best of 3, all round trips ok, byte-identical wit
 |---|---|---|---|---|
 | PLR (off 1) | 10.1833 | 4.5726 | 8.2567 | 100 / 77 |
 | PLF fast | 10.2042 (+0.2%) | 4.6049 (+0.7%) | 8.3389 (+1.0%) | 120 / 95 |
+
+### llrice with the truncated split vs PLR (process wall clock incl. file I/O, best of 3, `../llrice_vs_plr.py`)
+
+llrice branch `trunc` (local, from refactor 81613e5): `CODER_G_RB_SUM` writes `r` in truncated binary over `rb + 1`
+values instead of `bit_width(rb)` bits. llrice reads only P6, so no gray set.
+
+| codec | full Kodak bpp | enc / dec | 19 colour bpp | enc / dec |
+|---|---|---|---|---|
+| llrice G_RB (one coder for U, V) | 10.3801 | 66 / 52 | 8.3416 | 78 / 61 |
+| llrice G_R_B (refactor default) | 10.3636 | 65 / 52 | 8.3485 | 75 / 56 |
+| llrice G_RB_SUM, `bit_width` (old) | 10.6171 | 87 / 67 | 8.5036 | 100 / 76 |
+| **llrice G_RB_SUM, truncated** | 10.3223 | 77 / 61 | 8.3187 | 96 / 72 |
+| PLR (off 1) | **10.1833** | 76 / 65 | **8.2567** | 94 / 78 |
+| PLF fast | 10.2042 | 89 / 78 | 8.3389 | **107 / 92** |
+
+In llrice the pair is U and V of one pixel and the truncated sum is the best llrice coder (−0.4% vs G_R_B, faster).
+PLF pairs a stream with itself (neighbours of one block, same plane, same bin). Partner distance inside the block,
+PLF, Kodak / gray 17 / 19 colour: 1 (default) 10.2042 / 4.6049 / 8.3389, 4: 10.2391 / 4.6079 / 8.3543,
+8: 10.2467 / 4.6108 / 8.3664: the nearest partner is best.
