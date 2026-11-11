@@ -32,6 +32,12 @@ extern "C" {
 size_t FSE_buildCTableU16(FSE_CTable* ct, const short* normalizedCounter, unsigned maxSymbolValue, unsigned tableLog);
 }
 #include "../palic-1/netpbm.hpp"
+#ifndef PLR_PAIR_LMIN
+#define PLR_PAIR_LMIN 0
+#endif
+#ifndef PLR_PAIR_LMAX
+#define PLR_PAIR_LMAX 7
+#endif
 #if defined(PLR_LLRICE)
 #include "llrice/rlgr.hpp"
 using REnc = RLGR::Encoder; using RDec = RLGR::Decoder; using RRawW = BitStream::Writer; using RRawR = BitStream::Reader;
@@ -137,7 +143,10 @@ namespace palic2 {
 static double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 static inline uint32_t bwz(uint32_t v) { return v ? 32 - __builtin_clz(v) : 0; }
 static inline int med(int a, int b, int c) { int mn = std::min(a, b), mx = std::max(a, b), p = a + b - c; return p < mn ? mn : (p > mx ? mx : p); }
-struct Cfg { int off = 2; };
+#ifndef PLR_OFF
+#define PLR_OFF 2
+#endif
+struct Cfg { int off = PLR_OFF; };
 static constexpr int TILE = 288;
 
 static inline uint16_t zz8(int e) { e = int8_t(e); return uint16_t(uint8_t((e << 1) ^ (e >> 7))); }
@@ -262,7 +271,21 @@ template <bool NINE, class T> static void recon_wave(T* img, int S, int tw, int 
 struct Sink {                                   // one plane: 8 RLGR coders + the shared raw writer
     REnc* e[8]; RRawW* raw;
     inline void block(int L, const uint16_t* hk, const uint16_t* m) {
-        REnc& c = *e[L]; for (int j = 0; j < 16; ++j) c.put(hk[j]);
+        REnc& c = *e[L];
+#if defined(PLR_PAIR)
+        if (L >= PLR_PAIR_LMIN && L <= PLR_PAIR_LMAX)       // llrice CODER_G_RB_SUM on neighbours: RLGR(a+b), a raw in bw(a+b) bits
+        for (int j = 0; j < 16; j += 2) { const uint32_t s2 = uint32_t(hk[j]) + hk[j + 1]; c.put(s2);
+            if (s2) { const uint32_t a = hk[j]; const int k = 31 - __builtin_clz(s2 + 1); const uint32_t u = (2u << k) - (s2 + 1);
+#if defined(PLR_TRUNC)                                  // truncated binary of a in 0..s2 (s2 + 1 values)
+                raw->reserve(k + 1); if (a < u) { if (k) RAW_PUT(raw, k, a); } else RAW_PUT(raw, k + 1, a + u);
+#else
+                const int n = 32 - __builtin_clz(s2); raw->reserve(n); RAW_PUT(raw, n, a); (void)k; (void)u;
+#endif
+            } }
+        else for (int j = 0; j < 16; ++j) c.put(hk[j]);
+#else
+        for (int j = 0; j < 16; ++j) c.put(hk[j]);
+#endif
         if (L) { raw->reserve(16 * L); for (int k = 0; k < L; ++k) RAW_PUT(raw, 16, m[k]); }
     }
 };
@@ -270,7 +293,21 @@ struct Source {
     RDec* d[8]; RRawR* raw;
     inline void block(int L, uint16_t* z) {
         alignas(32) uint16_t h[16]; alignas(32) uint16_t m[8];
-        RDec& c = *d[L]; for (int j = 0; j < 16; ++j) h[j] = uint16_t(c.get());
+        RDec& c = *d[L];
+#if defined(PLR_PAIR)
+        if (L >= PLR_PAIR_LMIN && L <= PLR_PAIR_LMAX)
+        for (int j = 0; j < 16; j += 2) { const uint32_t s2 = c.get(); uint32_t a = 0;
+#if defined(PLR_TRUNC)
+            if (s2) { const int k = 31 - __builtin_clz(s2 + 1); const uint32_t u = (2u << k) - (s2 + 1); raw->reserve(k + 1);
+                a = k ? raw->get(k) : 0; if (a >= u) a = ((a << 1) | raw->get(1)) - u; }
+#else
+            if (s2) { const int n = 32 - __builtin_clz(s2); raw->reserve(n); a = raw->get(n); }
+#endif
+            h[j] = uint16_t(a); h[j + 1] = uint16_t(s2 - a); }
+        else for (int j = 0; j < 16; ++j) h[j] = uint16_t(c.get());
+#else
+        for (int j = 0; j < 16; ++j) h[j] = uint16_t(c.get());
+#endif
         if (L) { raw->reserve(16 * L); for (int k = 0; k < L; ++k) m[k] = RAW_GET16(raw); }
         const uint8_t* pp = reinterpret_cast<const uint8_t*>(m); block_unpack(h, L, pp, z);
     }

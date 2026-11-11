@@ -188,3 +188,25 @@ one 64-bit window. Static clang `-march=native`, in-process, best of 3, all roun
 
 PLN2 FSE on full Kodak: enc 423, dec 417 MB/s. The coder is ~75% of the PLR time and the profile is instruction
 bound (IPC ~3), so the llrice format itself (a serial adaptive state per symbol) is the ceiling, not the bit I/O.
+
+### PLR: pair coding (llrice `CODER_G_RB_SUM`, Malvar RLGR3 idea) and `off`
+
+Compile switches of `palic2r.cpp`, defaults unchanged (off 2, no pairs = byte-identical to llrice):
+`-DPLR_PAIR` codes the high parts of neighbours `2j, 2j+1` of a block as RLGR(a+b) plus `a` raw in `bw(a+b)` bits
+(llrice) or, with `-DPLR_TRUNC`, as truncated binary of `0..a+b`; `-DPLR_PAIR_LMIN/LMAX` limit it to some L;
+`-DPLR_OFF` sets off. bpp, full Kodak / gray 17 / 19 colour; enc/dec MB/s on Kodak (one run, noisy ±5%):
+
+| variant | Kodak | gray 17 | 19 colour | enc/dec |
+|---|---|---|---|---|
+| PLR off 2 (llrice exact) | 10.2407 | 4.5963 | 8.2810 | 97 / 74 |
+| pairs all L, raw `bw(a+b)` (llrice) | 10.4654 | 4.7221 | 8.5801 | 131 / 108 |
+| pairs all L, truncated binary | 10.1419 | 4.6074 | 8.3368 | 112 / 92 |
+| pairs L = 0 only, truncated | 10.1328 | 4.6008 | 8.3249 | 110 / 83 |
+| pairs L >= 3 only, truncated | 10.2429 | 4.6003 | 8.2849 | 98 / 74 |
+| **off 1, no pairs** | 10.1833 | **4.5726** | **8.2567** | 95 / 73 |
+| off 1, pairs L = 0, truncated | **10.1267** | 4.5736 | 8.2891 | 107 / 81 |
+| off 0 / off 3, no pairs | 10.5648 / 10.2586 | 4.6979 / 4.6106 | 8.5352 / 8.2985 | |
+
+RLGR wants off 1 (FSE wanted 2). The raw split `bw(a+b)` loses 2–4%; truncated binary removes most of it. Pairs help
+in the L = 0 bins (the Rice floor of 1 bit per symbol at k = 0), mostly on Kodak, and are neutral or slightly worse
+elsewhere. Not done yet: the llrice pairing itself is across channels (U and V of one pixel), not neighbours.
