@@ -3,7 +3,7 @@
 #    Q(sa) = sa for sa < 32, else 32 + (bw(sa) - 6) * 4 + two bits under the top bit   (68 levels)
 #  letter = 4 neighbours of the block, each min(h, 3), 2 bits each (first symbol in the low bits) -> 256 letters, Huffman, len <= MAXLEN
 #  every symbol with min(h,3) == 3 then sends x = h - 3 as Rice(k of the table), escape: 24 ones + 10 raw bits
-import numpy as np, sys, struct
+import numpy as np, sys, struct, os
 from lib import *
 NQ = 68; QMAXQ = 24
 def Q(sa):
@@ -29,28 +29,31 @@ def cluster(tr, K):
     for k, a in enumerate(alive): mp[ids[a]] = k
     return mp, np.stack([rows[a] for a in alive])
 def train(trainset, K, maxlen, off=1):
-    t = prep(trainset, off); ct = ctx_of(t); lt = letters(t['h'])
+    t = prep(trainset, off); keep = ~t['skip']; ct = ctx_of(t)[keep]; lt = letters(t['h'][keep])
     trc = counts(ct, lt, 2 * NQ, 256); mp, tabs = cluster(trc, K)
     for c in np.where(mp < 0)[0]:              # unseen contexts: nearest seen one of the same plane type
         g = c // NQ; cand = [x for x in range(g * NQ, (g + 1) * NQ) if mp[x] >= 0] or [x for x in range(2 * NQ) if mp[x] >= 0]
         mp[c] = mp[min(cand, key=lambda x: abs(x - c))]
     K = len(tabs); lens = huff_len(tabs, maxlen).astype(np.int64); tt = mp[ct]
-    ks = np.zeros(K, np.int64); x = np.maximum(t['h'] - 3, 0); m = t['h'] >= 3
+    ks = np.zeros(K, np.int64); x = np.maximum(t['h'][keep] - 3, 0); m = t['h'][keep] >= 3
     for k in range(K):
         sel = (tt == k)[:, None] & m; ks[k] = int(np.argmin([rice_esc_bits(x[sel], kk).sum() for kk in range(5)]))
     return dict(map=mp, lens=lens, ks=ks, K=K, maxlen=maxlen)
 def cost(T, testset, off=1):
-    d = prep(testset, off); tb = T['map'][ctx_of(d)]; l = letters(d['h'])
-    lb = T['lens'][tb[:, None], l].sum(); x = np.maximum(d['h'] - 3, 0); m = d['h'] >= 3
-    xb = np.where(m, rice_esc_bits(x, T['ks'][tb][:, None]), 0).sum()
-    return lb, xb, d
+    d = prep(testset, off); keep = ~d['skip']; tb = T['map'][ctx_of(d)][keep]; l = letters(d['h'][keep])
+    lb = T['lens'][tb[:, None], l].sum(); x = np.maximum(d['h'][keep] - 3, 0); m = d['h'][keep] >= 3
+    xb = np.where(m, rice_esc_bits(x, T['ks'][tb][:, None]), 0).sum() + d['runbits'].sum()
+    raw = 16 * (d['Lo'][keep].astype(np.int64)).sum()
+    return lb, xb, d, raw
 if __name__ == '__main__':
     trainset, K, maxlen, out = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
-    T = train(trainset, K, maxlen)
+    OFF = int(os.environ.get('QH_OFF', '1'))
+    T = train(trainset, K, maxlen, OFF)
     with open(out, 'wb') as f:
         f.write(struct.pack('<4i', T['K'], maxlen, NQ, QMAXQ)); f.write(T['map'].astype(np.uint8).tobytes())
         f.write(T['lens'].astype(np.uint8).tobytes()); f.write(T['ks'].astype(np.uint8).tobytes())
     print(f'tables from {trainset}: K={T["K"]} maxlen={maxlen} rice k per table {T["ks"].tolist()}  -> {out}')
     for ts in sys.argv[5:]:
-        lb, xb, d = cost(T, ts); n = d['npx']; r = d['bits'].sum()
-        print(f'  test {ts}: letters {lb / n:.4f} + excess {xb / n:.4f} = {(lb + xb) / n:.4f} bpp  vs RLGR {r / n:.4f}  ({100 * ((lb + xb) / r - 1):+.2f}% of the RLGR part, {100 * (lb + xb - r) / d["fbits"]:+.2f}% of the file -> {(d["fbits"] + lb + xb - r) / n:.4f} bpp)')
+        lb, xb, d, raw = cost(T, ts, OFF); n = d['npx']; r = d['bits'].sum(); raw1 = 16 * d['L'].astype(np.int64).sum()
+        est = d['fbits'] - r - raw1 + lb + xb + raw          # file with RLGR + raw planes (off 1) replaced by QH + raw (OFF)
+        print(f'  test {ts} (off {OFF}): letters {lb / n:.4f} + tails/runs {xb / n:.4f} + raw {raw / n:.4f}  -> file ~{est / n:.4f} bpp (RLGR off1 file {d["fbits"] / n:.4f}, {100 * (est / d["fbits"] - 1):+.2f}%)')

@@ -391,3 +391,39 @@ is the scalar broadcast (`VSPL(T, x)`: clang `(T)x`, GCC `T{} + x`). Same files 
 ok. Decode MB/s, best of 5, GCC row path → GCC vector (clang): PLN2 Kodak 170 → 412 (416), gray 165 → 418 (430);
 PLR Kodak 65 → 84 (84), gray 60 → 77 (78), 19 colour 76 → 99 (99). `planes_codec.cpp` (PLN1, experiment) still
 uses clang bool vectors and stays clang-only.
+
+## PLR format: static QH tables instead of RLGR (default since this commit; PLF unchanged)
+
+Idea and prototype: a Claude Fable subagent (`../qh/`), integrated, zero-block runs and off 2 here.
+PLR (files PLR1 / PLR2) now codes the high parts of a block with static tables; PLF (`-f`) keeps the RLGR pairs.
+
+- **off = 2** for PLR (L = clamp(bw(mean) − 2, 0, 7), like PLN2's FSE); PLF keeps off = 1. Not in the file.
+- **Context of a block:** `t = ctxmap[plane type: 0 = Y, 1 = S][Q(sa)]`, sa = the causal sum of 16 z the L is made
+  from (row above, or the previous block in the first row / narrow tiles; 64 for block 0). `Q(sa) = sa` for sa < 32,
+  else `32 + (bw(sa) − 6)·4 + the two bits under the top bit` (max 67).
+- **Zero-block runs:** a block with sa = 0 first sends n = the number of all-zero blocks from it on (same tile, same
+  plane) as Exp-Golomb order 0 (`n + 1` in `2·bw(n+1) − 1` bits); those n blocks are not coded at all. n = 0: coded.
+- **Block:** 4 letters (4 neighbours each, `min(h, 3)` in 2 bits, first symbol in the low bits, 256 letters)
+  in canonical Huffman of table t (lengths ≤ 11); then for every symbol with h ≥ 3: `h − 3` as Rice(k_t),
+  escape (`q ≥ 24`): 24 ones + 10 raw bits; then the L raw bit planes; colour: then the zU splits of the S block.
+- **Tables:** `palic-2/qh_tables.h` (32 tables, 32 × 256 lengths + 136-byte map + 32 Rice k): trained on Kodak 24
+  colour + 12 CLIC professional gray images (off 2, `../qh/train_tables.py`). Decoder lookup: 32 × 2048 × 2 B.
+
+Process wall clock incl. file I/O, best of 3, every file round-trips (`../plr_rank.py`). Held-out sets: col19,
+gray 17 and CLIC B (8 CLIC gray images not in training). Kodak is in the training set (held-out tables
+trained on CLIC A + col19 give Kodak 9.9507):
+
+| codec | Kodak 24 | 19 colour | gray 17 | CLIC B 8 gray |
+|---|---|---|---|---|
+| **PLR (QH)** | **9.9111** 102 / 120 | **8.0673** 136 / 161 | **4.5084** 112 / 149 | **3.8049** 134 / 192 |
+| PLR (RLGR lane, before) | 10.1422 81 / 69 | 8.2334 99 / 85 | 4.5666 78 / 65 | 3.8692 81 / 66 |
+| PLF fast (RLGR pairs) | 10.1834 86 / 77 | 8.3196 105 / 94 | 4.5964 92 / 81 | 3.9006 92 / 82 |
+| PLN2 (FSE, two passes) | 9.8683 199 / 217 | 8.2631 232 / 257 | 4.5268 207 / 214 | 3.8077 235 / 256 |
+| HALIC 0.7.2 | 10.0994 191 / 125 | 8.4471 236 / 141 | 4.6495 (1 file fails) | 3.8749 (1 fails) |
+| HALIC FAST | 10.3259 240 / 139 | 8.7396 309 / 162 | 4.7115 (1 fails) | 3.9733 131 |
+
+Synthetic gray 1024×768 (bpp, PLR RLGR → PLR QH): flat 0.0047 → 0.0037, rectangles 0.089 → 0.075, stripes
+0.011 → 0.015, sparse spikes 0.067 → 0.080, **gradient 0.152 → 0.245** (residuals never zero: 4 letters ≥ 4 bits
+per block), noise equal or better. ASan + UBSan clean, 40 corrupted files rejected without a crash, clang = gcc
+files. CLIC colour could not be fetched through the Drive connector (P6 files are too big for one message), so
+the S tables saw Kodak only.

@@ -1,8 +1,16 @@
 # load.py - loader of the PLR dumps (records: plane u8, L u8, rlgr_bits u32, sum_above u32, z[16] u16)
 import numpy as np, glob, os
 REC = np.dtype([('pl','u1'),('L','u1'),('bits','<u4'),('sa','<u4'),('z','<u2',(16,))])
-D = '/tmp/fable_rlgr/dump'
+D = os.environ.get('QH_DUMP', '/tmp/fable_rlgr/dump')
 def load(setname):
+    if '+' in setname:                         # several sets: concatenate
+        parts = [load(x) for x in setname.split('+')]; o = {}
+        for k in ('pl', 'L', 'bits', 'sa', 'z', 'bi', 'tw'): o[k] = np.concatenate([p[k] for p in parts])
+        off_t = 0; off_i = 0; tl = []; il = []
+        for p in parts: tl.append(p['tile'] + off_t); il.append(p['img'] + off_i); off_t += p['ntile']; off_i += p['nimg']
+        o['tile'] = np.concatenate(tl); o['img'] = np.concatenate(il)
+        for k in ('npx', 'fbits', 'lanebits', 'nimg', 'ntile'): o[k] = sum(p[k] for p in parts)
+        return o
     out = dict(pl=[], L=[], bits=[], sa=[], z=[], img=[], tile=[], bi=[], tw=[])
     npx = 0; fbits = 0; lanebits = 0; ntile = 0
     files = sorted(glob.glob(f'{D}/{setname}/*.dmp'))

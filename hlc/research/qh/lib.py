@@ -22,6 +22,22 @@ def prep(setname, off=1):
     nxt_above = (d['bi'] + 1) * 16 >= d['tw']  # the next block's context is the row above (causal for this block too)
     d['sar'] = np.where(same_next & nxt_above & (d['tw'] >= 16), np.r_[d['sa'][1:], 0], d['sa'])
     d['ptype'] = np.minimum(d['pl'], 1)        # 0 = Y, 1 = S (chroma)
+    # zero-block runs of the codec (QH): a block with sa == 0 sends EG0(n), n = zero blocks from it on (same tile, plane);
+    # those n blocks are skipped. skip = block not coded; runbits = bits of the run codes sent at this block
+    zero = (d['z'] == 0).all(1); pk = d['tile'].astype(np.int64) * 4 + d['pl']; sa0 = d['sa'] == 0
+    skip = np.zeros(len(zero), bool); runbits = np.zeros(len(zero), np.int64)
+    # zero streak length from every block to the end of its (tile, plane): reverse cumulative
+    streak = np.zeros(len(zero) + 1, np.int64)
+    for i in range(len(zero) - 1, -1, -1):
+        streak[i] = 0 if not zero[i] else (streak[i + 1] + 1 if i + 1 < len(zero) and pk[i + 1] == pk[i] else 1)
+    left = 0; prevkey = -1
+    for i in range(len(zero)):
+        if pk[i] != prevkey: left = 0; prevkey = pk[i]
+        if left: left -= 1; skip[i] = True; continue
+        if sa0[i]:
+            n = int(streak[i]); runbits[i] = 2 * int(n + 1).bit_length() - 1
+            if n: skip[i] = True; left = n - 1
+    d['skip'] = skip; d['runbits'] = runbits
     _cache[key] = d; return d
 def esc_bits(h, ke=2):                         # Exp-Golomb order ke of h - (A-1), for h >= A-1
     x = (np.maximum(h - (A - 1), 0) >> ke) + 1

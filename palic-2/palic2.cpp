@@ -180,13 +180,14 @@ typedef int16_t v16s __attribute__((ext_vector_type(16)));
 #define PLR_VEC 1
 typedef uint16_t v16u __attribute__((vector_size(32)));
 typedef int16_t v16s __attribute__((vector_size(32)));
-#define VSPL(T, x) (T{} + (x))
+template <class T, class E> static inline T vspl_(E x) { T r; for (int i = 0; i < 16; ++i) r[i] = x; return r; }   // broadcast
+#define VSPL(T, x) (vspl_<T>(x))
 #endif
 static inline void block_unpack(const uint16_t* h, int L, const uint8_t*& pp, uint16_t* z) {
 #if defined(PLR_VEC)                                                    // vector: weights & mask != 0 -> bit k
     const v16u w = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768};
     v16u v; memcpy(&v, h, 32); v = v << uint16_t(L);
-    for (int k = 0; k < L; ++k) { uint16_t m; memcpy(&m, pp, 2); pp += 2; v |= (v16u)((VSPL(v16u, m) & w) != 0) & uint16_t(1u << k); }
+    for (int k = 0; k < L; ++k) { uint16_t m; memcpy(&m, pp, 2); pp += 2; v |= (v16u)((VSPL(v16u, m) & w) != 0) & VSPL(v16u, uint16_t(1u << k)); }
     memcpy(z, &v, 32);
 #else
     for (int j = 0; j < 16; ++j) z[j] = uint16_t(h[j] << L);

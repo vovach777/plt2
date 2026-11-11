@@ -21,3 +21,9 @@ no runs below 1 bit per 4 symbols. Proposed fix (simulated only): runs of zero b
 Files: `qh.hpp` (coder/decoder of a block), `palic2r_proto.diff` (-DPLR_DUMP, -DPLR_QH against palic2r.cpp of
 dec7993; tables via env QH_TABLES), `train_tables.py`, `exp1..7.py`, `lib.py`, `load.py`, `bench_entropy.cpp`,
 `tables/*.bin` (statistics only, trained on Kodak / col19).
+
+**Update:** QH is now the PLR format (`palic-2/qh.hpp`, `palic-2/qh_tables.h`), with off 2 and zero-block runs;
+see PLN1.md "PLR format: static QH tables". `lib.py` / `load.py` / `train_tables.py` here are the updated versions:
+several sets joined with `+`, `QH_DUMP` (dump dir), `QH_OFF`, and the zero-block runs simulated exactly as the codec
+does them (the estimate matches the codec to 4 decimals). Dumps: build palic2r with `-DPLR_DUMP -DPLR_NO_QH`, run
+`PLR_DUMP_FILE=x.dmp palic-2r c img x.plr`. Format tables: `tables/qh_pub_off2_K32_L11.bin` (Kodak + 12 CLIC gray).

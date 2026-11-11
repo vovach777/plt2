@@ -1,4 +1,7 @@
-// palic2r: PLN2 with the FSE streams replaced by interleaved one-pass RLGR. Files "PLR1"/"PLR2", fast mode "PLF1"/"PLF2".
+// palic2r: PLN2 with the two-pass FSE replaced by one-pass coders. Files "PLR1"/"PLR2": static QH tables (qh.hpp,
+// qh_tables.h; off 2; runs of zero blocks), fast mode "PLF1"/"PLF2": RLGR pairs (off 1). Both on one bit lane per tile
+// (rlgr_lane.hpp). -DPLR_NO_QH: PLR with RLGR as before (off 1). The notes below describe the RLGR history.
+// (old first line:) palic2r: PLN2 with the FSE streams replaced by interleaved one-pass RLGR.
 // (The page description below is layout 0, the previous format; the format is now layout 3, see PLR_LAYOUT.)
 // Every plane of a tile has 8 RLGR coders (one per L); they and one raw bit writer for the L bit planes share one
 // page buffer per tile (rlgr_fast.hpp: the llrice RLGR and its reservation rule on a lean page buffer), so all
@@ -53,8 +56,14 @@ using REnc = RLGR::Encoder; using RDec = RLGR::Decoder; using RRawW = BitStream:
 #ifndef PLR_LAYOUT
 #define PLR_LAYOUT 3
 #endif
+#if PLR_LAYOUT == 3 && !defined(PLR_NO_QH) && !defined(PLR_QH)
+#define PLR_QH 1                                // the format: static QH tables (qh.hpp) instead of RLGR, except PLF
+#endif
 #if PLR_LAYOUT == 3
 #include "rlgr_lane.hpp"
+#if defined(PLR_QH)
+#include "qh.hpp"
+#endif
 using REnc = rlgrl::Encoder; using RDec = rlgrl::Decoder; using RRawW = rlgrl::Lane; using RRawR = rlgrl::LaneR;
 #undef RAW_PUT
 #undef RAW_GET16
@@ -167,8 +176,15 @@ namespace palic2 {
 static double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 static inline uint32_t bwz(uint32_t v) { return v ? 32 - __builtin_clz(v) : 0; }
 static inline int med(int a, int b, int c) { int mn = std::min(a, b), mx = std::max(a, b), p = a + b - c; return p < mn ? mn : (p > mx ? mx : p); }
+#ifndef PLR_FAST_OFF
+#define PLR_FAST_OFF 1                          // PLF (RLGR pairs) keeps off 1
+#endif
 #ifndef PLR_OFF
+#if defined(PLR_QH)
+#define PLR_OFF 2                               // PLR with QH tables: off 2 (as FSE in PLN2)
+#else
 #define PLR_OFF 1
+#endif
 #endif
 struct Cfg { int off = PLR_OFF; bool fast = false; };
 static constexpr int TILE = 288;
@@ -186,13 +202,28 @@ static void resid_row(const uint8_t* __restrict r, const uint8_t* __restrict up,
         z[x] = zz8(r[x] - p);
     }
 }
+#if defined(PLR_QH)
+static uint32_t g_sa = 64;                      // the causal sum of the current block (context of the QH tables)
+#endif
+#if defined(PLR_DUMP)
+static FILE* g_dump = nullptr; static uint32_t g_lastsum = 0;
+#endif
 static inline int block_L(const uint16_t* s, int off) {
+#if defined(PLR_DUMP)
+    { uint32_t sum = 0; for (int j = 0; j < 16; ++j) sum += s[j]; g_lastsum = sum; }
+#endif
 #if defined(PLN_SSE)
     const __m128i a0 = _mm_loadu_si128((const __m128i*)s), a1 = _mm_loadu_si128((const __m128i*)(s + 8));
     __m128i t = _mm_add_epi16(a0, a1); t = _mm_add_epi16(t, _mm_srli_si128(t, 8)); t = _mm_add_epi16(t, _mm_srli_si128(t, 4)); t = _mm_add_epi16(t, _mm_srli_si128(t, 2));
+#if defined(PLR_QH)
+    g_sa = uint32_t(_mm_extract_epi16(t, 0));
+#endif
     return std::min(7, std::max(0, int(bwz(uint32_t(_mm_extract_epi16(t, 0)) >> 4)) - off));
 #else
     uint32_t sum = 0; for (int j = 0; j < 16; ++j) sum += s[j];
+#if defined(PLR_QH)
+    g_sa = sum;
+#endif
     return std::min(7, std::max(0, int(bwz(sum >> 4)) - off));
 #endif
 }
@@ -202,11 +233,20 @@ template<int Off>
 static inline int causal_Lt(const uint16_t* z, size_t i, int tw) {
     const size_t px = i * 16;
     if (tw >= 16 && px >= size_t(tw)) return block_Lt<Off>(z + px - tw);
+#if defined(PLR_QH)
+    if (!i) { g_sa = 64; return 2; }
+#endif
     return i ? block_Lt<Off>(z + px - 16) : 2;
 }
 static inline int causal_L(const uint16_t* z, size_t i, int tw, int off) {
     const size_t px = i * 16;
     if (tw >= 16 && px >= size_t(tw)) return block_L(z + px - tw, off);
+#if defined(PLR_DUMP)
+    if (!i) g_lastsum = 0xffffffffu;
+#endif
+#if defined(PLR_QH)
+    if (!i) { g_sa = 64; return 2; }
+#endif
     return i ? block_L(z + px - 16, off) : 2;
 }
 static inline void block_split(const uint16_t* s, int L, uint16_t*& pw, uint16_t* hi) {
@@ -232,13 +272,14 @@ typedef int16_t v16s __attribute__((ext_vector_type(16)));
 #define PLR_VEC 1
 typedef uint16_t v16u __attribute__((vector_size(32)));
 typedef int16_t v16s __attribute__((vector_size(32)));
-#define VSPL(T, x) (T{} + (x))
+template <class T, class E> static inline T vspl_(E x) { T r; for (int i = 0; i < 16; ++i) r[i] = x; return r; }   // broadcast
+#define VSPL(T, x) (vspl_<T>(x))
 #endif
 static inline void block_unpack(const uint16_t* h, int L, const uint8_t*& pp, uint16_t* z) {
 #if defined(PLR_VEC)                                                    // vector: weights & mask != 0 -> bit k
     const v16u w = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768};
     v16u v; memcpy(&v, h, 32); v = v << uint16_t(L);
-    for (int k = 0; k < L; ++k) { uint16_t m; memcpy(&m, pp, 2); pp += 2; v |= (v16u)((VSPL(v16u, m) & w) != 0) & uint16_t(1u << k); }
+    for (int k = 0; k < L; ++k) { uint16_t m; memcpy(&m, pp, 2); pp += 2; v |= (v16u)((VSPL(v16u, m) & w) != 0) & VSPL(v16u, uint16_t(1u << k)); }
     memcpy(z, &v, 32);
 #else
     for (int j = 0; j < 16; ++j) z[j] = uint16_t(h[j] << L);
@@ -306,9 +347,12 @@ template <bool NINE, class T> static void recon_wave(T* img, int S, int tw, int 
 // bits if a < u = 2^(k+1) - (a+b+1), else k+1 bits of a+u. Half the RLGR steps. pair_mask: bit L = pairs in bin L.
 // -DPLR_RAWSPLIT: `a` in bw(a+b) bits as llrice does (experiment only, not a file format).
 struct Sink {                                   // one plane: 8 RLGR coders + the shared raw writer
-    REnc* e[8]; RRawW* raw; unsigned pair_mask = 0;
+    REnc* e[8]; RRawW* raw; unsigned pair_mask = 0; int pid = 0;
     inline void block(int L, const uint16_t* hk, const uint16_t* m) {
         REnc& c = *e[L];
+#if defined(PLR_DUMP)
+        const uint64_t dump_h0 = raw->head;
+#endif
         if (pair_mask >> L & 1)
         for (int j = 0; j < 16; j += 2) { const uint32_t s2 = uint32_t(hk[j]) + hk[j + 1]; c.put(s2);
             if (s2) { const uint32_t a = hk[j];
@@ -319,15 +363,29 @@ struct Sink {                                   // one plane: 8 RLGR coders + th
                 const int n = 32 - __builtin_clz(s2); raw->reserve(n); RAW_PUT(raw, n, a);
 #endif
             } }
-        else for (int j = 0; j < 16; ++j) c.put(hk[j]);
+        else
+#if defined(PLR_QH)
+        { (void)c; qh::qh_enc_block(*raw, pid ? 1u : 0u, g_sa, L, hk, m); return; }
+#else
+        for (int j = 0; j < 16; ++j) c.put(hk[j]);
+#endif
+#if defined(PLR_DUMP)
+        if (g_dump) { uint8_t hd[2] = {uint8_t(pid), uint8_t(L)}; uint32_t x[2] = {uint32_t(raw->head - dump_h0), g_lastsum};
+            uint16_t zz[16]; for (int j = 0; j < 16; ++j) { uint32_t v = uint32_t(hk[j]) << L; for (int k = 0; k < L; ++k) v |= uint32_t((m[k] >> j) & 1u) << k; zz[j] = uint16_t(v); }
+            fwrite(hd, 1, 2, g_dump); fwrite(x, 4, 2, g_dump); fwrite(zz, 2, 16, g_dump); }
+#endif
         if (L) { raw->reserve(16 * L); for (int k = 0; k < L; ++k) RAW_PUT(raw, 16, m[k]); }
     }
 };
 struct Source {
-    RDec* d[8]; RRawR* raw; unsigned pair_mask = 0;
+    RDec* d[8]; RRawR* raw; unsigned pair_mask = 0; int pid = 0;
     inline void block(int L, uint16_t* z) {
         alignas(32) uint16_t h[16]; alignas(32) uint16_t m[8];
         RDec& c = *d[L];
+#if defined(PLR_QH)
+        if (!(pair_mask >> L & 1)) { (void)c; qh::qh_dec_block(*raw, pid ? 1u : 0u, g_sa, L, h, m);
+            const uint8_t* pq = reinterpret_cast<const uint8_t*>(m); block_unpack(h, L, pq, z); return; }
+#endif
         if (pair_mask >> L & 1)
         for (int j = 0; j < 16; j += 2) { const uint32_t s2 = c.get(); uint32_t a = 0;
 #if !defined(PLR_RAWSPLIT)
@@ -343,6 +401,39 @@ struct Source {
     }
 };
 static thread_local Sink* g_sink; static thread_local Source* g_src;
+#if defined(PLR_QH)
+// Runs of zero blocks (QH only; not in the fast mode): a block whose causal sum sa is 0 first sends n = the number of
+// all-zero blocks from it on (in block order, within the plane of the tile) as Exp-Golomb order 0; those n blocks
+// are not coded at all (no letters, no planes, no splits). n = 0: the block is coded as usual.
+static inline bool blk_zero(const uint16_t* b) { uint32_t o = 0; for (int j = 0; j < 16; ++j) o |= b[j]; return !o; }
+static inline bool qz_enc(size_t& left, const uint16_t* z, size_t i, size_t nb) {
+    if (g_sink->pair_mask) return false;
+    if (left) { --left; return true; }
+    if (g_sa) return false;
+    size_t n = 0; while (i + n < nb && blk_zero(z + (i + n) * 16)) ++n;
+    const uint64_t v = n + 1; const int b = int(64 - __builtin_clzll(v)); g_sink->raw->put64(2 * b - 1, v);
+    if (n) { left = n - 1; return true; }
+    return false;
+}
+static inline bool qz_dec(size_t& left, uint16_t* zb, size_t i, size_t nb) {
+    if (g_src->pair_mask) return false;
+    if (!left) {
+        if (g_sa) return false;
+        rlgrl::LaneR& r = *g_src->raw; const uint64_t w = r.window(); const int zc = w ? __builtin_clzll(w) : 64;
+        if (zc > 30) throw std::runtime_error("zero run code");
+        const uint64_t v = w >> (63 - 2 * zc); r.skip(2 * zc + 1); const size_t n = size_t(v - 1);
+        if (!n) return false;
+        if (n > nb - i) throw std::runtime_error("zero run too long");
+        left = n;
+    }
+    --left; memset(zb, 0, 32); return true;
+}
+#define QZ_ENC(z, i, nb) if (qz_enc(zl, z, i, nb)) continue
+#define QZ_DEC(z, i, nb) if (qz_dec(zl, (z) + (i) * 16, i, nb)) continue
+#else
+#define QZ_ENC(z, i, nb)
+#define QZ_DEC(z, i, nb)
+#endif
 static void tile_enc(const uint8_t* img, int S, int tw, int th, const Cfg& c, Out& o, std::vector<uint8_t>& tmp) {
     const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
     static thread_local UBuf<uint16_t> zb, hb[8], plb;
@@ -351,17 +442,18 @@ static void tile_enc(const uint8_t* img, int S, int tw, int th, const Cfg& c, Ou
     for (int y = 1; y < th; ++y) resid_row(img + size_t(y) * S, img + size_t(y - 1) * S, z + size_t(y) * tw, tw);
     plb.need(nb * 8); uint16_t* pw = plb.data(); size_t hn[8] = {0};
     for (auto& h : hb) h.need(nb * 16);
+    size_t zl = 0; (void)zl;
     if (c.off == 2) {
         for (size_t i = 0; i < nb; ++i) {
             alignas(32) uint16_t hk[16];
-            const int L = causal_Lt<2>(z, i, tw);
+            const int L = causal_Lt<2>(z, i, tw); QZ_ENC(z, i, nb);
             block_split(z + i * 16, L, pw, hk);
             g_sink->block(L, hk, pw - L); (void)hn;
         }
     } else {
         for (size_t i = 0; i < nb; ++i) {
             alignas(32) uint16_t hk[16];
-            const int L = causal_L(z, i, tw, c.off);
+            const int L = causal_L(z, i, tw, c.off); QZ_ENC(z, i, nb);
             block_split(z + i * 16, L, pw, hk);
             g_sink->block(L, hk, pw - L); (void)hn;
         }
@@ -382,15 +474,15 @@ static void tile_dec(In& in, uint8_t* img, int S, int tw, int th, const Cfg& c) 
     const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
     static thread_local UBuf<uint16_t> zb, hb[8]; static thread_local std::vector<int8_t> e;
     zb.need(nb * 16 + 16); uint16_t* z = zb.data(); if (e.size() < size_t(tw)) e.resize(tw);
-    (void)in; (void)hb;
+    (void)in; (void)hb; size_t zl = 0; (void)zl;
     if (c.off == 2) {
         for (size_t i = 0; i < nb; ++i) {
-            const int L = causal_Lt<2>(z, i, tw);
+            const int L = causal_Lt<2>(z, i, tw); QZ_DEC(z, i, nb);
             g_src->block(L, z + i * 16);
         }
     } else {
         for (size_t i = 0; i < nb; ++i) {
-            const int L = causal_L(z, i, tw, c.off);
+            const int L = causal_L(z, i, tw, c.off); QZ_DEC(z, i, nb);
             g_src->block(L, z + i * 16);
         }
     }
@@ -451,7 +543,12 @@ struct TileEnc {                                // one bit lane per tile for eve
     explicit TileEnc(int planes, size_t px) { lane.w.assign(px / 16 + 64, 0); e.reserve(24);
         for (int i = 0; i < planes * 8; ++i) e.emplace_back(&lane);
         for (int p = 0; p < planes; ++p) { sk[p].raw = &lane; for (int L = 0; L < 8; ++L) sk[p].e[L] = &e[size_t(p) * 8 + L]; } }
-    void finish(Out& o) { for (auto& x : e) x.flush(); const size_t n = lane.words(); o.var(n); o.raw(lane.w.data(), n * 8); }
+    void finish(Out& o) { for (auto& x : e) x.flush(); const size_t n = lane.words(); o.var(n); o.raw(lane.w.data(), n * 8);
+#if defined(PLR_DUMP)
+        if (g_dump) { uint8_t hd[2] = {255, 0}; uint32_t x[2] = {uint32_t(lane.head), uint32_t(n * 64)}; uint16_t z16[16] = {0};
+            fwrite(hd, 1, 2, g_dump); fwrite(x, 4, 2, g_dump); fwrite(z16, 2, 16, g_dump); }
+#endif
+    }
 };
 struct TileDec {
     std::vector<uint64_t> words; rlgrl::LaneR lr; std::vector<RDec> d; Source sr[3];
@@ -536,7 +633,7 @@ std::vector<uint8_t> compress(const uint8_t* img, int W, int H, const Cfg& c) {
     return std::move(o.b);
 }
 void decompress(const std::vector<uint8_t>& d, std::vector<uint8_t>& img, int& W, int& H) {
-    Cfg c; bool rgb = false; size_t pos = read_text_header(d, rgb, W, H, c.fast);
+    Cfg c; bool rgb = false; size_t pos = read_text_header(d, rgb, W, H, c.fast); if (c.fast) c.off = PLR_FAST_OFF;
     if (rgb) throw std::runtime_error("not PLR1/PLF1");
     Grid g = grid(W, H); const int nt = g.nx * g.ny; std::vector<uint32_t> len(nt);
     if (d.size() < pos + size_t(nt) * 4) throw std::runtime_error("truncated");
@@ -570,17 +667,18 @@ static void tile_enc16(const int16_t* img, int tw, int th, const Cfg& c, Out& o,
     for (int y = 1; y < th; ++y) resid16_row(img + size_t(y) * tw, img + size_t(y - 1) * tw, z + size_t(y) * tw, tw);
     plb.need(nb * 8); uint16_t* pw = plb.data(); size_t hn[8] = {0};
     for (auto& h : hb) h.need(nb * 16);
+    size_t zl = 0; (void)zl;
     if (c.off == 2) {
         for (size_t i = 0; i < nb; ++i) {
             alignas(32) uint16_t hk[16];
-            const int L = causal_Lt<2>(z, i, tw);
+            const int L = causal_Lt<2>(z, i, tw); QZ_ENC(z, i, nb);
             block_split(z + i * 16, L, pw, hk);
             g_sink->block(L, hk, pw - L); (void)hn;
         }
     } else {
         for (size_t i = 0; i < nb; ++i) {
             alignas(32) uint16_t hk[16];
-            const int L = causal_L(z, i, tw, c.off);
+            const int L = causal_L(z, i, tw, c.off); QZ_ENC(z, i, nb);
             block_split(z + i * 16, L, pw, hk);
             g_sink->block(L, hk, pw - L); (void)hn;
         }
@@ -596,15 +694,15 @@ static void tile_dec16(In& in, int16_t* img, int tw, int th, const Cfg& c) {
     const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
     static thread_local UBuf<uint16_t> zb, hb[8]; static thread_local std::vector<int16_t> e;
     zb.need(nb * 16 + 16); uint16_t* z = zb.data(); if (e.size() < size_t(tw)) e.resize(tw);
-    (void)in; (void)hb;
+    (void)in; (void)hb; size_t zl = 0; (void)zl;
     if (c.off == 2) {
         for (size_t i = 0; i < nb; ++i) {
-            const int L = causal_Lt<2>(z, i, tw);
+            const int L = causal_Lt<2>(z, i, tw); QZ_DEC(z, i, nb);
             g_src->block(L, z + i * 16);
         }
     } else {
         for (size_t i = 0; i < nb; ++i) {
-            const int L = causal_L(z, i, tw, c.off);
+            const int L = causal_L(z, i, tw, c.off); QZ_DEC(z, i, nb);
             g_src->block(L, z + i * 16);
         }
     }
@@ -644,22 +742,31 @@ static void tile_enc_uv(const int16_t* U, const int16_t* V, int tw, int th, cons
                                    resid16_row(V + size_t(y) * tw, V + size_t(y - 1) * tw, b + size_t(y) * tw, tw); }
     for (size_t p = 0; p < n; ++p) S[p] = uint16_t(a[p] + b[p]);
     std::fill(S + n, S + nb * 16 + 16, uint16_t(0)); std::fill(a + n, a + nb * 16 + 16, uint16_t(0));
-    plb.need(nb * 8); uint16_t* pw = plb.data();
+    plb.need(nb * 8); uint16_t* pw = plb.data(); size_t zl = 0; (void)zl;
     for (size_t i = 0; i < nb; ++i) {
         alignas(32) uint16_t hk[16];
-        const int L = causal_L(S, i, tw, c.off + PLR_UVOFF);
+        const int L = causal_L(S, i, tw, c.off + PLR_UVOFF); QZ_ENC(S, i, nb);
         block_split(S + i * 16, L, pw, hk);
         g_sink->block(L, hk, pw - L);
         for (int j = 0; j < 16; ++j) { const uint32_t s2 = S[i * 16 + j]; if (s2) tb_put(g_sink->raw, a[i * 16 + j], s2); }
     }
 }
+#if defined(PLR_QH)
+static inline bool qz_dec_uv(size_t& zl, uint16_t* S, uint16_t* a, uint16_t* b, size_t i, size_t nb) {
+    if (!qz_dec(zl, S + i * 16, i, nb)) return false;
+    memset(a + i * 16, 0, 32); memset(b + i * 16, 0, 32); return true;
+}
+#else
+static inline bool qz_dec_uv(size_t&, uint16_t*, uint16_t*, uint16_t*, size_t, size_t) { return false; }
+#endif
 static void tile_dec_uv(int16_t* U, int16_t* V, int tw, int th, const Cfg& c) {
     const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
     static thread_local UBuf<uint16_t> zu, zv, sb;
     zu.need(nb * 16 + 16); zv.need(nb * 16 + 16); sb.need(nb * 16 + 16);
-    uint16_t* a = zu.data(); uint16_t* b = zv.data(); uint16_t* S = sb.data();
+    uint16_t* a = zu.data(); uint16_t* b = zv.data(); uint16_t* S = sb.data(); size_t zl = 0; (void)zl;
     for (size_t i = 0; i < nb; ++i) {
         const int L = causal_L(S, i, tw, c.off + PLR_UVOFF);
+        if (qz_dec_uv(zl, S, a, b, i, nb)) continue;
         g_src->block(L, S + i * 16);
         for (int j = 0; j < 16; ++j) { const size_t p = i * 16 + j; const uint32_t s2 = S[p];
             const uint32_t x = s2 ? tb_get(g_src->raw, s2) : 0; a[p] = uint16_t(x); b[p] = uint16_t(s2 - x); }
@@ -703,7 +810,7 @@ std::vector<uint8_t> compress_rgb(const uint8_t* rgb, int W, int H, const Cfg& c
         const size_t b = o.b.size();
         rgb_split(rgb + (size_t(g.ty(i)) * W + g.tx(i)) * 3, W, g.tw(i), g.th(i), Y, U, V);
         TileEnc te(3, size_t(g.tw(i)) * g.th(i) * 3); for (auto& k : te.sk) k.pair_mask = c.fast ? PLR_FAST_MASK : 0;
-        g_sink = &te.sk[0]; tile_enc(Y.data(), g.tw(i), g.tw(i), g.th(i), c, o, tmp);
+        te.sk[1].pid = 1; te.sk[2].pid = 2; g_sink = &te.sk[0]; tile_enc(Y.data(), g.tw(i), g.tw(i), g.th(i), c, o, tmp);
         if (!c.fast) { g_sink = &te.sk[1]; tile_enc_uv(U.data(), V.data(), g.tw(i), g.th(i), c); }
         else {
         g_sink = &te.sk[1]; tile_enc16(U.data(), g.tw(i), g.th(i), c, o, tmp);
@@ -714,7 +821,7 @@ std::vector<uint8_t> compress_rgb(const uint8_t* rgb, int W, int H, const Cfg& c
     return std::move(o.b);
 }
 void decompress_rgb(const std::vector<uint8_t>& d, std::vector<uint8_t>& rgb, int& W, int& H) {
-    Cfg c; bool rgb_file = false; size_t pos = read_text_header(d, rgb_file, W, H, c.fast);
+    Cfg c; bool rgb_file = false; size_t pos = read_text_header(d, rgb_file, W, H, c.fast); if (c.fast) c.off = PLR_FAST_OFF;
     if (!rgb_file) throw std::runtime_error("not PLR2/PLF2");
     Grid g = grid(W, H); const int nt = g.nx * g.ny; std::vector<uint32_t> len(nt);
     if (d.size() < pos + size_t(nt) * 4) throw std::runtime_error("truncated");
@@ -727,7 +834,7 @@ void decompress_rgb(const std::vector<uint8_t>& d, std::vector<uint8_t>& rgb, in
         const int tw = g.tw(i), th = g.th(i);
         Y.resize(size_t(tw) * th); U.resize(Y.size()); V.resize(Y.size());
         TileDec td(ti, 3); for (auto& k : td.sr) k.pair_mask = c.fast ? PLR_FAST_MASK : 0;
-        g_src = &td.sr[0]; tile_dec(ti, Y.data(), tw, tw, th, c);
+        td.sr[1].pid = 1; td.sr[2].pid = 2; g_src = &td.sr[0]; tile_dec(ti, Y.data(), tw, tw, th, c);
         if (!c.fast) { g_src = &td.sr[1]; tile_dec_uv(U.data(), V.data(), tw, th, c); }
         else {
         g_src = &td.sr[1]; tile_dec16(ti, U.data(), tw, th, c);
@@ -758,11 +865,14 @@ static std::vector<uint8_t> read_bin(const std::string& fn) {
 
 int main(int argc, char** argv) {
     using namespace palic2;
+#if defined(PLR_QH)
+    qh::init();
+#endif
     if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.plr [-f] (the input itself if it does not shrink) | d in.plr|pgm|ppm out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N] [-f]  (-f: fast mode, pairs, files PLF1/PLF2)\n", argv[0]); return 1; }
     std::string cmd = argv[1]; Cfg c; int reps = 3; std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i) { std::string a = argv[i];
         if (a == "-r" && i + 1 < argc) reps = atoi(argv[++i]);
-        else if (a == "-f") c.fast = true;
+        else if (a == "-f") { c.fast = true; c.off = PLR_FAST_OFF; }
         else if (cmd == "bench" && std::filesystem::is_directory(a)) { std::vector<std::string> v;
             for (auto& e : std::filesystem::directory_iterator(a)) { auto x = e.path().extension();
                 if (x == ".pgm" || x == ".ppm" || x == ".pnm") v.push_back(e.path().string()); }
@@ -771,6 +881,9 @@ int main(int argc, char** argv) {
     try {
         if (cmd == "c" && pos.size() == 2) {
             int W, H; bool rgb; auto px = read_netpbm(pos[0], W, H, rgb);
+#if defined(PLR_DUMP)
+            if (const char* dp = getenv("PLR_DUMP_FILE")) { palic2::g_dump = fopen(dp, "wb"); int hdr[4] = {W, H, rgb ? 3 : 1, c.fast ? 1 : 0}; fwrite(hdr, 4, 4, palic2::g_dump); }
+#endif
             auto o = rgb ? compress_rgb(px.data(), W, H, c) : compress(px.data(), W, H, c);
             // not smaller than the input file: store the input file itself (a P5/P6 text header like ours);
             // the decoder sees "P5"/"P6" instead of "PLN" and just copies the file
@@ -779,6 +892,9 @@ int main(int argc, char** argv) {
 #if defined(RLGR_STATS) && !defined(PLR_LLRICE)
             fprintf(stderr, "STATS %zu %llu %llu %llu %llu %llu %d\n", o.size(), (unsigned long long)rlgrf::g_payload, (unsigned long long)rlgrf::g_waste_full, (unsigned long long)rlgrf::g_nfull, (unsigned long long)rlgrf::g_waste_flush, (unsigned long long)rlgrf::g_nruns, (W + 287) / 288 * ((H + 287) / 288));
             fprintf(stderr, "SIMB %llu %llu %llu\n", (unsigned long long)rlgrf::g_head, (unsigned long long)rlgrf::g_nshrink, (unsigned long long)rlgrf::g_lost_b);
+#endif
+#if defined(PLR_DUMP)
+            if (palic2::g_dump) fclose(palic2::g_dump);
 #endif
             FILE* f = fopen(pos[1].c_str(), "wb"); if (!f) return 1; fwrite(o.data(), 1, o.size(), f); fclose(f); return 0; }
         if (cmd == "d" && pos.size() == 2) {
