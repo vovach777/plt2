@@ -63,7 +63,7 @@ endif()
 # palic-2 (PLN2 colour, mode 2 only) from palic-2/
 option(PLT_BUILD_PALIC2 "build palic-2 (PLN2, mode 2 only)" ON)
 if(PLT_BUILD_PALIC2)
-  add_subdirectory(palic-2)
+  add_subdirectory(palic-2 palic-2_build)   # own build dir: a folder named palic-2 next to the palic-2 binary breaks the link on Linux
   set_target_properties(palic-2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
                         RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR} RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR})
 endif()

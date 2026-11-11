@@ -256,3 +256,15 @@ no such files, and that heuristic is not part of the format.
 
 A stream is empty, or all symbols equal (one value), or FSE4. The bit planes stay raw. A text dump of the
 high symbols is the same baskets, written out so they can be read by eye; it is not a second codec.
+
+## PLN2 decoder: vector unpack and the MED wave restored (palic2.cpp)
+
+The first PLN2 decoder reconstructed with the scalar MED chain and a scalar bit-plane unpack. Now (clang) the
+blocks unpack in ext_vector_type and both the Y (8-bit, `& 255`) and the U/V (9-bit, `fold9`) planes are
+reconstructed by the PLN1 wave over 16-row bands. Format and file bytes unchanged. Full Kodak 768x512, in-process:
+
+| build | enc MB/s | dec MB/s, before -> after |
+|---|---|---|
+| clang, native | 423 | 218 -> 417 |
+| clang, x86-64-v2 (SSE4) | 362 | -> 390 |
+| gcc (no vector types, scalar paths) | 343 | 167 |

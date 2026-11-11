@@ -1,6 +1,6 @@
 # palic-2: PLN2 colour codec, mode 2 only (causal L, off=2). Built from the plt2 root.
 cmake_minimum_required(VERSION 3.16)
-project(palic2 CXX)
+project(palic2 C CXX)   # C: the FSE sources
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
