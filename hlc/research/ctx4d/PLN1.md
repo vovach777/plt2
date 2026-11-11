@@ -406,8 +406,9 @@ PLR (files PLR1 / PLR2) now codes the high parts of a block with static tables; 
 - **Block:** 4 letters (4 neighbours each, `min(h, 3)` in 2 bits, first symbol in the low bits, 256 letters)
   in canonical Huffman of table t (lengths ≤ 11); then for every symbol with h ≥ 3: `h − 3` as Rice(k_t),
   escape (`q ≥ 24`): 24 ones + 10 raw bits; then the L raw bit planes; colour: then the zU splits of the S block.
-- **Tables:** `palic-2/qh_tables.h` (32 tables, 32 × 256 lengths + 136-byte map + 32 Rice k): trained on Kodak 24
-  colour + 12 CLIC professional gray images (off 2, `../qh/train_tables.py`). Decoder lookup: 32 × 2048 × 2 B.
+- **Tables:** `palic-2/qh_tables.h` (32 tables, 32 × 256 lengths + 136-byte map + 32 Rice k). First version: Kodak 24
+  + 12 CLIC gray (`../qh/train_tables.py`); now (see below): 117 CLIC 2020 professional train images, colour and gray,
+  + Kodak 24 (`../qh/train_stream.py`). Decoder lookup: 32 × 2048 × 2 B.
 
 Process wall clock incl. file I/O, best of 3, every file round-trips (`../plr_rank.py`). Held-out sets: col19,
 gray 17 and CLIC B (8 CLIC gray images not in training). Kodak is in the training set (held-out tables
@@ -427,3 +428,34 @@ Synthetic gray 1024×768 (bpp, PLR RLGR → PLR QH): flat 0.0047 → 0.0037, rec
 per block), noise equal or better. ASan + UBSan clean, 40 corrupted files rejected without a crash, clang = gcc
 files. CLIC colour could not be fetched through the Drive connector (P6 files are too big for one message), so
 the S tables saw Kodak only.
+
+### Tables retrained on CLIC 2020 (full corpus from github vovach777/clic-palic2, decoded with palic-2)
+
+CLIC 2020 professional train, 585 images, colour P6 and gray P5 (1364 Mpx each). Split by sorted name: index % 5 == 0
+= test (117), the training images = every 4th of the rest (117, colour + gray) + Kodak 24 (`../qh/train_stream.py`,
+one image at a time). Same tables for every set; bpp (in-process bench):
+
+| set | tables Kodak + 12 CLIC gray | tables CLIC 117 + Kodak | PLN2 |
+|---|---|---|---|
+| CLIC test 39 colour | 8.4527 | **8.4105** | 8.5125 |
+| CLIC test 39 gray | 3.8222 | 3.8225 | 3.8370 |
+| 19 colour photos | **8.0673** | 8.0754 | 8.2631 |
+| gray 17 | 4.5084 | 4.5078 | 4.5268 |
+| Kodak 24 (in training both times) | **9.9111** | 9.9588 | 9.8683 |
+| synthetic gradient / spikes / noise σ2 | 0.245 / 0.080 / 3.688 | **0.169 / 0.069** / 3.716 | |
+
+The format now uses the CLIC tables (the target corpus; Kodak is old film scans).
+Full held-out CLIC test part (117 images, process wall clock incl. I/O, `../plr_rank.py`, every file round-trips
+except where noted):
+
+| codec | colour bpp | enc / dec MB/s | gray bpp | enc / dec MB/s |
+|---|---|---|---|---|
+| **PLR (QH)** | **8.6639** | 133 / 163 | **3.8826** | 140 / 205 |
+| PLR (RLGR lane) | 8.8366 | 90 / 80 | 3.9406 | 86 / 70 |
+| PLF fast | 8.8673 | 106 / 95 | 3.9758 | 99 / 88 |
+| PLN2 (FSE) | 8.7555 | 231 / 265 | 3.8947 | 245 / 273 |
+| HALIC 0.7.2 | 8.7519 | 240 / 152 | 3.9181 (2 files fail) | 272 / 156 |
+| HALIC FAST | 9.1271 | 357 / 170 | 4.0265 (1 fails) | 310 / 145 |
+
+PLR is 1.0% (colour) / 0.9% (gray) smaller than HALIC 0.7.2 on held-out CLIC and decodes faster; its encoder is
+~1.8x slower. Full CLIC with PLN2 (the clic-palic2 repo): colour 8.6320, gray 3.9070 bpp.

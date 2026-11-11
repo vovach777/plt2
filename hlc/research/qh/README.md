@@ -27,3 +27,6 @@ see PLN1.md "PLR format: static QH tables". `lib.py` / `load.py` / `train_tables
 several sets joined with `+`, `QH_DUMP` (dump dir), `QH_OFF`, and the zero-block runs simulated exactly as the codec
 does them (the estimate matches the codec to 4 decimals). Dumps: build palic2r with `-DPLR_DUMP -DPLR_NO_QH`, run
 `PLR_DUMP_FILE=x.dmp palic-2r c img x.plr`. Format tables: `tables/qh_pub_off2_K32_L11.bin` (Kodak + 12 CLIC gray).
+
+**CLIC tables:** `train_stream.py DUMPER OFF K MAXLEN OUT images...` trains from any number of images, one at a time
+(dump, count, delete); the format tables are `tables/qh_clic117_kodak_off2_K32_L11.bin` (see PLN1.md).
