@@ -524,6 +524,58 @@ static void tile_dec16(In& in, int16_t* img, int tw, int th, const Cfg& c) {
     }
 #endif
 }
+#if defined(PLR_UVSUM)
+#ifndef PLR_UVOFF
+#define PLR_UVOFF 0                             // added to off for the S plane
+#endif
+// Experiment (Vladimir): one chroma plane S = zU + zV (zigzag residuals of U and V at the same pixel, 0..1022) goes
+// through the plane coder (causal L on S, L bit planes, RLGR on S >> L); after every block the raw writer gets zU of
+// its 16 pixels in truncated binary over the S + 1 values (nothing when S = 0). zV = S - zU.
+static inline void tb_put(RRawW* w, uint32_t a, uint32_t s2) {
+    const int k = 31 - __builtin_clz(s2 + 1); const uint32_t u = (2u << k) - (s2 + 1);
+    w->reserve(k + 1); if (a < u) { if (k) RAW_PUT(w, k, a); } else RAW_PUT(w, k + 1, a + u);
+}
+static inline uint32_t tb_get(RRawR* r, uint32_t s2) {
+    const int k = 31 - __builtin_clz(s2 + 1); const uint32_t u = (2u << k) - (s2 + 1); r->reserve(k + 1);
+    uint32_t a = k ? RAW_GET(r, k) : 0; if (a >= u) a = ((a << 1) | RAW_GET(r, 1)) - u; return a;
+}
+static void tile_enc_uv(const int16_t* U, const int16_t* V, int tw, int th, const Cfg& c) {
+    const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
+    static thread_local UBuf<uint16_t> zu, zv, sb, plb;
+    zu.need(nb * 16 + 16); zv.need(nb * 16 + 16); sb.need(nb * 16 + 16);
+    uint16_t* a = zu.data(); uint16_t* b = zv.data(); uint16_t* S = sb.data();
+    resid16_row0(U, a, tw); resid16_row0(V, b, tw);
+    for (int y = 1; y < th; ++y) { resid16_row(U + size_t(y) * tw, U + size_t(y - 1) * tw, a + size_t(y) * tw, tw);
+                                   resid16_row(V + size_t(y) * tw, V + size_t(y - 1) * tw, b + size_t(y) * tw, tw); }
+    for (size_t p = 0; p < n; ++p) S[p] = uint16_t(a[p] + b[p]);
+    std::fill(S + n, S + nb * 16 + 16, uint16_t(0)); std::fill(a + n, a + nb * 16 + 16, uint16_t(0));
+    plb.need(nb * 8); uint16_t* pw = plb.data();
+    for (size_t i = 0; i < nb; ++i) {
+        alignas(32) uint16_t hk[16];
+        const int L = causal_L(S, i, tw, c.off + PLR_UVOFF);
+        block_split(S + i * 16, L, pw, hk);
+        g_sink->block(L, hk, pw - L);
+        for (int j = 0; j < 16; ++j) { const uint32_t s2 = S[i * 16 + j]; if (s2) tb_put(g_sink->raw, a[i * 16 + j], s2); }
+    }
+}
+static void tile_dec_uv(int16_t* U, int16_t* V, int tw, int th, const Cfg& c) {
+    const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
+    static thread_local UBuf<uint16_t> zu, zv, sb;
+    zu.need(nb * 16 + 16); zv.need(nb * 16 + 16); sb.need(nb * 16 + 16);
+    uint16_t* a = zu.data(); uint16_t* b = zv.data(); uint16_t* S = sb.data();
+    for (size_t i = 0; i < nb; ++i) {
+        const int L = causal_L(S, i, tw, c.off + PLR_UVOFF);
+        g_src->block(L, S + i * 16);
+        for (int j = 0; j < 16; ++j) { const size_t p = i * 16 + j; const uint32_t s2 = S[p];
+            const uint32_t x = s2 ? tb_get(g_src->raw, s2) : 0; a[p] = uint16_t(x); b[p] = uint16_t(s2 - x); }
+    }
+#if defined(__clang__) && !defined(PLN_ROWS)
+    recon_wave<true>(U, tw, tw, th, a); recon_wave<true>(V, tw, tw, th, b);
+#else
+#error "PLR_UVSUM needs the clang wave decoder"
+#endif
+}
+#endif
 static void rgb_split(const uint8_t* rgb, int W, int tw, int th, std::vector<uint8_t>& Y, std::vector<int16_t>& U, std::vector<int16_t>& V) {
     Y.resize(size_t(tw) * th); U.resize(Y.size()); V.resize(Y.size());
     for (int y = 0; y < th; ++y) {
@@ -554,8 +606,12 @@ std::vector<uint8_t> compress_rgb(const uint8_t* rgb, int W, int H, const Cfg& c
         rgb_split(rgb + (size_t(g.ty(i)) * W + g.tx(i)) * 3, W, g.tw(i), g.th(i), Y, U, V);
         TileEnc te(3, size_t(g.tw(i)) * g.th(i) * 3); for (auto& k : te.sk) k.pair_mask = c.fast ? PLR_FAST_MASK : 0;
         g_sink = &te.sk[0]; tile_enc(Y.data(), g.tw(i), g.tw(i), g.th(i), c, o, tmp);
+#if defined(PLR_UVSUM)
+        g_sink = &te.sk[1]; tile_enc_uv(U.data(), V.data(), g.tw(i), g.th(i), c);
+#else
         g_sink = &te.sk[1]; tile_enc16(U.data(), g.tw(i), g.th(i), c, o, tmp);
         g_sink = &te.sk[2]; tile_enc16(V.data(), g.tw(i), g.th(i), c, o, tmp);
+#endif
         te.finish(o);
         const uint32_t l = uint32_t(o.b.size() - b); memcpy(&o.b[lens + size_t(i) * 4], &l, 4);
     }
@@ -576,8 +632,12 @@ void decompress_rgb(const std::vector<uint8_t>& d, std::vector<uint8_t>& rgb, in
         Y.resize(size_t(tw) * th); U.resize(Y.size()); V.resize(Y.size());
         TileDec td(ti, 3); for (auto& k : td.sr) k.pair_mask = c.fast ? PLR_FAST_MASK : 0;
         g_src = &td.sr[0]; tile_dec(ti, Y.data(), tw, tw, th, c);
+#if defined(PLR_UVSUM)
+        g_src = &td.sr[1]; tile_dec_uv(U.data(), V.data(), tw, th, c);
+#else
         g_src = &td.sr[1]; tile_dec16(ti, U.data(), tw, th, c);
         g_src = &td.sr[2]; tile_dec16(ti, V.data(), tw, th, c);
+#endif
         if (ti.p != ti.e) throw std::runtime_error("tile trailing bytes");
         rgb_join(rgb.data() + (size_t(g.ty(i)) * W + g.tx(i)) * 3, W, tw, th, Y.data(), U.data(), V.data());
     }

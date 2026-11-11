@@ -268,3 +268,20 @@ In llrice the pair is U and V of one pixel and the truncated sum is the best llr
 PLF pairs a stream with itself (neighbours of one block, same plane, same bin). Partner distance inside the block,
 PLF, Kodak / gray 17 / 19 colour: 1 (default) 10.2042 / 4.6049 / 8.3389, 4: 10.2391 / 4.6079 / 8.3543,
 8: 10.2467 / 4.6108 / 8.3664: the nearest partner is best.
+
+### PLR: one chroma plane S = zU + zV (Vladimir's idea, `-DPLR_UVSUM`)
+
+The zigzag residuals of U and V at the same pixel are added, `S = zU + zV` (0..1022), and S is one plane through the
+usual coder (causal L on S with the same off 1, L bit planes, RLGR on `S >> L`). After every block the raw writer
+gets `zU` of its 16 pixels in truncated binary over the `S + 1` values (nothing when S = 0); `zV = S − zU`. The
+decoder rebuilds zU, zV per block and runs the two MED waves as before. Y unchanged, so gray is unchanged.
+Best of 3, all round trips ok:
+
+| | full Kodak | enc / dec | 19 colour | enc / dec |
+|---|---|---|---|---|
+| PLR (U, V planes) | 10.1833 | 100 / 77 | 8.2567 | 118 / 89 |
+| **PLR, S plane** | **10.1541 (−0.29%)** | 104 / 81 | **8.2299 (−0.32%)** | 121 / 96 |
+| PLF fast (U, V planes) | 10.2042 | 120 / 95 | 8.3389 | 141 / 110 |
+| PLF fast, S plane | 10.2385 | 114 / 95 | 8.3085 | 133 / 111 |
+
+off for the S plane: off 0 / 1 / 2: Kodak 10.2623 / 10.1541 / 10.1741, colour 8.3264 / 8.2299 / 8.2318.
