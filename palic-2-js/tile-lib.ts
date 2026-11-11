@@ -1,12 +1,10 @@
-// Одна либа тайла для TypeScript Native 0.0.pre35 JIT (No GC).
-// Склеена из ts/rgb.ts, ts/plane.ts, ts/rlgr.ts, ts/tile.ts.
-// Смотреть: splitRgb, transformPlane, encodeSymbols, compressTile.
-// main() без аргументов и без результата: так требует компилятор.
+// Тайл для TypeScript Native 0.0.pre35, GC.
+// Буферы: Uint8 и Uint16, выделены на 288x288. Знак хромы — младшие 16 бит.
+// Склейка ts/rgb.ts ts/plane.ts ts/rlgr.ts ts/tile.ts. main(): void.
 
-// Слой 1. RGB -> плоскости Y, U, V.
-// Часть tile-lib.ts. Склейка: rgb, plane, rlgr, tile. import этому компилятору не нужен.
+// Слой 1. RGB -> плоскости. Y байты, U и V знаковые 16 бит.
 
-function splitRgb(rgb: number[], y: number[], u: number[], v: number[], n: number): void {
+function splitRgb(rgb: Uint8Array, y: Uint8Array, u: Uint16Array, v: Uint16Array, n: number): void {
   let i = 0;
   while (i < n) {
     let p = i * 3;
@@ -16,23 +14,26 @@ function splitRgb(rgb: number[], y: number[], u: number[], v: number[], n: numbe
     let du = r - g;
     let v0 = b - g;
     y[i] = (g + ((du + v0 + 2) >> 2)) & 255;
-    u[i] = du;
-    v[i] = v0 - (du >> 2);
+    u[i] = du & 65535;
+    v[i] = (v0 - (du >> 2)) & 65535;
     i = i + 1;
   }
 }
-// Слой 2. Плоскость -> 8 корзин старших бит и сырые младшие.
-// MED, wrap8 у яркости, wrap9 у хромы, зигзаг, L со сдвигом 2.
-// Буферы живут один тайл. В цикле пикселя новая память не берётся.
+// Слой 2. Плоскость -> корзины L0..L7 и сырые слова.
+// Буферы на максимальный тайл 288x288 выделяются один раз.
+// Яркость: коэффициенты Uint8. Хрома: Uint16, потому что L0 доходит до 511.
 
-let hist: number[] = [];
-let blockZ: number[] = [];
-let coeff: number[] = [];
-let coeffPos: number[] = [];
-let maxSymbol: number[] = [];
-let raw: number[] = [];
+let hist: Uint16Array = new Uint16Array(288);
+let blockZ: Uint16Array = new Uint16Array(16);
+let wide: Uint16Array = new Uint16Array(82944);
+let coeff8: Uint8Array = new Uint8Array(663552);
+let coeff16: Uint16Array = new Uint16Array(663552);
+let coeffPos: Uint32Array = new Uint32Array(8);
+let maxSymbol: Uint16Array = new Uint16Array(8);
+let raw: Uint16Array = new Uint16Array(36288);
 let rawCount = 0;
 let stride = 0;
+let planeChroma = 0;
 
 function bitWidth(value: number): number {
   let n = value >>> 0;
@@ -57,18 +58,31 @@ function zigzag(value: number): number {
   return -value * 2 - 1;
 }
 
-function predict(samples: number[], width: number, x: number, y: number): number {
-  if (y === 0) return x === 0 ? 0 : samples[x - 1];
-  if (x === 0) return samples[(y - 1) * width + x];
+let pred = 0;
+
+function sx(bits: number): number {
+  if (bits >= 32768) return bits - 65536;
+  return bits;
+}
+
+function predict(samples: Uint16Array, width: number, x: number, y: number): void {
+  if (y === 0) {
+    pred = x === 0 ? 0 : sx(samples[x - 1]);
+    return;
+  }
+  if (x === 0) {
+    pred = sx(samples[(y - 1) * width + x]);
+    return;
+  }
   let i = y * width + x;
-  let a = samples[i - 1];
-  let b = samples[i - width];
-  let c = samples[i - width - 1];
+  let a = sx(samples[i - 1]);
+  let b = sx(samples[i - width]);
+  let c = sx(samples[i - width - 1]);
   let lo = a < b ? a : b;
   let hi = a > b ? a : b;
-  if (c >= hi) return lo;
-  if (c <= lo) return hi;
-  return a + b - c;
+  if (c >= hi) { pred = lo; return; }
+  if (c <= lo) { pred = hi; return; }
+  pred = a + b - c;
 }
 
 function chooseL(blockIndex: number, width: number, previousSum: number): number {
@@ -92,30 +106,15 @@ function chooseL(blockIndex: number, width: number, previousSum: number): number
   return w;
 }
 
-function bindPlane(padded: number, blockCount: number): void {
+function bindPlane(padded: number): void {
   stride = padded;
   let i = 0;
   while (i < 8) {
     coeffPos[i] = 0;
-    maxSymbol[i] = -1;
-    i = i + 1;
-  }
-  i = 0;
-  while (i < padded * 8) {
-    coeff[i] = 0;
-    i = i + 1;
-  }
-  i = 0;
-  while (i < blockCount * 7) {
-    raw[i] = 0;
+    maxSymbol[i] = 65535;
     i = i + 1;
   }
   rawCount = 0;
-  i = 0;
-  while (i < 16) {
-    blockZ[i] = 0;
-    i = i + 1;
-  }
 }
 
 function appendBlock(L: number): void {
@@ -134,18 +133,20 @@ function appendBlock(L: number): void {
   let pos = coeffPos[L];
   let max = maxSymbol[L];
   let symbol = 0;
-  let base = L * stride;
+  let base = L * stride + pos;
   while (symbol < 16) {
     let top = blockZ[symbol] >>> L;
-    coeff[base + pos + symbol] = top;
-    if (top > max) max = top;
+    if (planeChroma === 0) coeff8[base + symbol] = top;
+    else coeff16[base + symbol] = top;
+    if (top > sx(max)) max = top;
     symbol = symbol + 1;
   }
   coeffPos[L] = pos + 16;
-  maxSymbol[L] = max;
+  maxSymbol[L] = max & 65535;
 }
 
-function transformPlane(samples: number[], width: number, height: number, chroma: number): void {
+function transform(samples: Uint16Array, width: number, height: number, chroma: number): void {
+  planeChroma = chroma;
   let size = width * height;
   let blockCount = (size + 15) >> 4;
   let i = 0;
@@ -153,7 +154,7 @@ function transformPlane(samples: number[], width: number, height: number, chroma
     hist[i] = 0;
     i = i + 1;
   }
-  bindPlane(blockCount * 16, blockCount);
+  bindPlane(blockCount * 16);
   let previousSum = 0;
   let histPos = 0;
   let rasterX = 0;
@@ -170,7 +171,8 @@ function transformPlane(samples: number[], width: number, height: number, chroma
       } else {
         let x = rasterX;
         let y = rasterY;
-        let original = samples[pixel] - predict(samples, width, x, y);
+        predict(samples, width, x, y);
+        let original = sx(samples[pixel]) - pred;
         let delta = chroma === 0 ? wrap8(original) : wrap9(original);
         let z = zigzag(delta);
         blockZ[slot] = z;
@@ -191,13 +193,22 @@ function transformPlane(samples: number[], width: number, height: number, chroma
     blockIndex = blockIndex + 1;
   }
 }
-// Слой 3. RLGR одного потока символов. Тот же автомат, что entropy_rlgr.js.
+
+function widen(src: Uint8Array, n: number): void {
+  let i = 0;
+  while (i < n) {
+    wide[i] = src[i];
+    i = i + 1;
+  }
+}
+// Слой 3. RLGR. Вход копируется в Uint16, выход пишется в заранее выделенный Uint8.
 // k и kr хранятся умноженными на 8. Частное 32 и больше — 32 единицы и сырое слово.
 
 let acc = 0;
 let nbits = 0;
 let kr = 8;
-let pack: number[] = [];
+let sym: Uint16Array = new Uint16Array(82944);
+let pack: Uint8Array = new Uint8Array(663560);
 let packCount = 0;
 
 function writeBits(value: number, width: number): void {
@@ -245,7 +256,7 @@ function writeRice(x: number, m: number): void {
   }
 }
 
-function encodeSymbols(symbols: number[], base: number, count: number): number {
+function encodeLoaded(count: number): number {
   acc = 0;
   nbits = 0;
   kr = 8;
@@ -254,7 +265,7 @@ function encodeSymbols(symbols: number[], base: number, count: number): number {
   let rl = 0;
   let s = 0;
   while (s < count) {
-    let value = symbols[base + s];
+    let value = sym[s];
     let kShift = k >> 3;
     let krShift = kr >> 3;
     if (kShift > 0) {
@@ -296,14 +307,30 @@ function encodeSymbols(symbols: number[], base: number, count: number): number {
   }
   return packCount;
 }
-// Либа одного тайла. Сжимает RGB и дописывает три плоскости в out.
-// На плоскость девять потоков: корзины L0..L7, затем сырые слова.
-// Заголовок файла сюда не входит.
 
-let yPlane: number[] = [];
-let uPlane: number[] = [];
-let vPlane: number[] = [];
-let out: number[] = [];
+function load8(src: Uint8Array, base: number, count: number): void {
+  let i = 0;
+  while (i < count) {
+    sym[i] = src[base + i];
+    i = i + 1;
+  }
+}
+
+function load16(src: Uint16Array, base: number, count: number): void {
+  let i = 0;
+  while (i < count) {
+    sym[i] = src[base + i];
+    i = i + 1;
+  }
+}
+// Либа одного тайла. Три плоскости в out, заголовок файла сюда не входит.
+// 82944 = 288*288. 663552 = 82944*8. 36288 = 5184*7. 663560 байт пакета RLGR.
+// 3145728 байт на весь тайл: три плоскости, худший RLGR.
+
+let yPlane: Uint8Array = new Uint8Array(82944);
+let uPlane: Uint16Array = new Uint16Array(82944);
+let vPlane: Uint16Array = new Uint16Array(82944);
+let out: Uint8Array = new Uint8Array(3145728);
 let outCount = 0;
 
 function writeVarint(value: number): void {
@@ -317,8 +344,8 @@ function writeVarint(value: number): void {
   outCount = outCount + 1;
 }
 
-function frame(symbols: number[], base: number, count: number, bits: number): void {
-  let packed = encodeSymbols(symbols, base, count);
+function frame(count: number, bits: number): void {
+  let packed = encodeLoaded(count);
   out[outCount] = bits;
   outCount = outCount + 1;
   writeVarint(count);
@@ -336,28 +363,34 @@ function emitPlane(chroma: number): void {
   while (L < 8) {
     let count = coeffPos[L];
     let bits = 8;
-    if (chroma !== 0 && L === 0 && count !== 0 && maxSymbol[L] > 255) bits = 16;
-    frame(coeff, L * stride, count, bits);
+    let max = maxSymbol[L];
+    if (max >= 32768) max = max - 65536;
+    if (chroma !== 0 && L === 0 && count !== 0 && max > 255) bits = 16;
+    if (chroma === 0) load8(coeff8, L * stride, count);
+    else load16(coeff16, L * stride, count);
+    frame(count, bits);
     L = L + 1;
   }
-  frame(raw, 0, rawCount, 16);
+  load16(raw, 0, rawCount);
+  frame(rawCount, 16);
 }
 
-function compressTile(rgb: number[], width: number, height: number): number {
-  if (width > 288 || height > 288) return 0;
+function compressTile(rgb: Uint8Array, width: number, height: number): number {
+  if (width > 288 || height > 288 || width <= 0 || height <= 0) return 0;
   let n = width * height;
   splitRgb(rgb, yPlane, uPlane, vPlane, n);
   outCount = 0;
-  transformPlane(yPlane, width, height, 0);
+  widen(yPlane, n);
+  transform(wide, width, height, 0);
   emitPlane(0);
-  transformPlane(uPlane, width, height, 1);
+  transform(uPlane, width, height, 1);
   emitPlane(1);
-  transformPlane(vPlane, width, height, 1);
+  transform(vPlane, width, height, 1);
   emitPlane(1);
   return outCount;
 }
 
-let demo: number[] = [];
+let demo: Uint8Array = new Uint8Array(12);
 let digest = 0;
 
 function main(): void {

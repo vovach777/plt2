@@ -1,11 +1,11 @@
-// Либа одного тайла. Сжимает RGB и дописывает три плоскости в out.
-// На плоскость девять потоков: корзины L0..L7, затем сырые слова.
-// Заголовок файла сюда не входит.
+// Либа одного тайла. Три плоскости в out, заголовок файла сюда не входит.
+// 82944 = 288*288. 663552 = 82944*8. 36288 = 5184*7. 663560 байт пакета RLGR.
+// 3145728 байт на весь тайл: три плоскости, худший RLGR.
 
-let yPlane: number[] = [];
-let uPlane: number[] = [];
-let vPlane: number[] = [];
-let out: number[] = [];
+let yPlane: Uint8Array = new Uint8Array(82944);
+let uPlane: Uint16Array = new Uint16Array(82944);
+let vPlane: Uint16Array = new Uint16Array(82944);
+let out: Uint8Array = new Uint8Array(3145728);
 let outCount = 0;
 
 function writeVarint(value: number): void {
@@ -19,8 +19,8 @@ function writeVarint(value: number): void {
   outCount = outCount + 1;
 }
 
-function frame(symbols: number[], base: number, count: number, bits: number): void {
-  let packed = encodeSymbols(symbols, base, count);
+function frame(count: number, bits: number): void {
+  let packed = encodeLoaded(count);
   out[outCount] = bits;
   outCount = outCount + 1;
   writeVarint(count);
@@ -38,28 +38,34 @@ function emitPlane(chroma: number): void {
   while (L < 8) {
     let count = coeffPos[L];
     let bits = 8;
-    if (chroma !== 0 && L === 0 && count !== 0 && maxSymbol[L] > 255) bits = 16;
-    frame(coeff, L * stride, count, bits);
+    let max = maxSymbol[L];
+    if (max >= 32768) max = max - 65536;
+    if (chroma !== 0 && L === 0 && count !== 0 && max > 255) bits = 16;
+    if (chroma === 0) load8(coeff8, L * stride, count);
+    else load16(coeff16, L * stride, count);
+    frame(count, bits);
     L = L + 1;
   }
-  frame(raw, 0, rawCount, 16);
+  load16(raw, 0, rawCount);
+  frame(rawCount, 16);
 }
 
-function compressTile(rgb: number[], width: number, height: number): number {
-  if (width > 288 || height > 288) return 0;
+function compressTile(rgb: Uint8Array, width: number, height: number): number {
+  if (width > 288 || height > 288 || width <= 0 || height <= 0) return 0;
   let n = width * height;
   splitRgb(rgb, yPlane, uPlane, vPlane, n);
   outCount = 0;
-  transformPlane(yPlane, width, height, 0);
+  widen(yPlane, n);
+  transform(wide, width, height, 0);
   emitPlane(0);
-  transformPlane(uPlane, width, height, 1);
+  transform(uPlane, width, height, 1);
   emitPlane(1);
-  transformPlane(vPlane, width, height, 1);
+  transform(vPlane, width, height, 1);
   emitPlane(1);
   return outCount;
 }
 
-let demo: number[] = [];
+let demo: Uint8Array = new Uint8Array(12);
 let digest = 0;
 
 function main(): void {

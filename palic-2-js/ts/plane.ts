@@ -1,15 +1,18 @@
-// Слой 2. Плоскость -> 8 корзин старших бит и сырые младшие.
-// MED, wrap8 у яркости, wrap9 у хромы, зигзаг, L со сдвигом 2.
-// Буферы живут один тайл. В цикле пикселя новая память не берётся.
+// Слой 2. Плоскость -> корзины L0..L7 и сырые слова.
+// Буферы на максимальный тайл 288x288 выделяются один раз.
+// Яркость: коэффициенты Uint8. Хрома: Uint16, потому что L0 доходит до 511.
 
-let hist: number[] = [];
-let blockZ: number[] = [];
-let coeff: number[] = [];
-let coeffPos: number[] = [];
-let maxSymbol: number[] = [];
-let raw: number[] = [];
+let hist: Uint16Array = new Uint16Array(288);
+let blockZ: Uint16Array = new Uint16Array(16);
+let wide: Uint16Array = new Uint16Array(82944);
+let coeff8: Uint8Array = new Uint8Array(663552);
+let coeff16: Uint16Array = new Uint16Array(663552);
+let coeffPos: Uint32Array = new Uint32Array(8);
+let maxSymbol: Uint16Array = new Uint16Array(8);
+let raw: Uint16Array = new Uint16Array(36288);
 let rawCount = 0;
 let stride = 0;
+let planeChroma = 0;
 
 function bitWidth(value: number): number {
   let n = value >>> 0;
@@ -34,18 +37,31 @@ function zigzag(value: number): number {
   return -value * 2 - 1;
 }
 
-function predict(samples: number[], width: number, x: number, y: number): number {
-  if (y === 0) return x === 0 ? 0 : samples[x - 1];
-  if (x === 0) return samples[(y - 1) * width + x];
+let pred = 0;
+
+function sx(bits: number): number {
+  if (bits >= 32768) return bits - 65536;
+  return bits;
+}
+
+function predict(samples: Uint16Array, width: number, x: number, y: number): void {
+  if (y === 0) {
+    pred = x === 0 ? 0 : sx(samples[x - 1]);
+    return;
+  }
+  if (x === 0) {
+    pred = sx(samples[(y - 1) * width + x]);
+    return;
+  }
   let i = y * width + x;
-  let a = samples[i - 1];
-  let b = samples[i - width];
-  let c = samples[i - width - 1];
+  let a = sx(samples[i - 1]);
+  let b = sx(samples[i - width]);
+  let c = sx(samples[i - width - 1]);
   let lo = a < b ? a : b;
   let hi = a > b ? a : b;
-  if (c >= hi) return lo;
-  if (c <= lo) return hi;
-  return a + b - c;
+  if (c >= hi) { pred = lo; return; }
+  if (c <= lo) { pred = hi; return; }
+  pred = a + b - c;
 }
 
 function chooseL(blockIndex: number, width: number, previousSum: number): number {
@@ -69,30 +85,15 @@ function chooseL(blockIndex: number, width: number, previousSum: number): number
   return w;
 }
 
-function bindPlane(padded: number, blockCount: number): void {
+function bindPlane(padded: number): void {
   stride = padded;
   let i = 0;
   while (i < 8) {
     coeffPos[i] = 0;
-    maxSymbol[i] = -1;
-    i = i + 1;
-  }
-  i = 0;
-  while (i < padded * 8) {
-    coeff[i] = 0;
-    i = i + 1;
-  }
-  i = 0;
-  while (i < blockCount * 7) {
-    raw[i] = 0;
+    maxSymbol[i] = 65535;
     i = i + 1;
   }
   rawCount = 0;
-  i = 0;
-  while (i < 16) {
-    blockZ[i] = 0;
-    i = i + 1;
-  }
 }
 
 function appendBlock(L: number): void {
@@ -111,18 +112,20 @@ function appendBlock(L: number): void {
   let pos = coeffPos[L];
   let max = maxSymbol[L];
   let symbol = 0;
-  let base = L * stride;
+  let base = L * stride + pos;
   while (symbol < 16) {
     let top = blockZ[symbol] >>> L;
-    coeff[base + pos + symbol] = top;
-    if (top > max) max = top;
+    if (planeChroma === 0) coeff8[base + symbol] = top;
+    else coeff16[base + symbol] = top;
+    if (top > sx(max)) max = top;
     symbol = symbol + 1;
   }
   coeffPos[L] = pos + 16;
-  maxSymbol[L] = max;
+  maxSymbol[L] = max & 65535;
 }
 
-function transformPlane(samples: number[], width: number, height: number, chroma: number): void {
+function transform(samples: Uint16Array, width: number, height: number, chroma: number): void {
+  planeChroma = chroma;
   let size = width * height;
   let blockCount = (size + 15) >> 4;
   let i = 0;
@@ -130,7 +133,7 @@ function transformPlane(samples: number[], width: number, height: number, chroma
     hist[i] = 0;
     i = i + 1;
   }
-  bindPlane(blockCount * 16, blockCount);
+  bindPlane(blockCount * 16);
   let previousSum = 0;
   let histPos = 0;
   let rasterX = 0;
@@ -147,7 +150,8 @@ function transformPlane(samples: number[], width: number, height: number, chroma
       } else {
         let x = rasterX;
         let y = rasterY;
-        let original = samples[pixel] - predict(samples, width, x, y);
+        predict(samples, width, x, y);
+        let original = sx(samples[pixel]) - pred;
         let delta = chroma === 0 ? wrap8(original) : wrap9(original);
         let z = zigzag(delta);
         blockZ[slot] = z;
@@ -166,5 +170,13 @@ function transformPlane(samples: number[], width: number, height: number, chroma
     appendBlock(L);
     previousSum = blockSum;
     blockIndex = blockIndex + 1;
+  }
+}
+
+function widen(src: Uint8Array, n: number): void {
+  let i = 0;
+  while (i < n) {
+    wide[i] = src[i];
+    i = i + 1;
   }
 }

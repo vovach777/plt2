@@ -1,10 +1,11 @@
-// Слой 3. RLGR одного потока символов. Тот же автомат, что entropy_rlgr.js.
+// Слой 3. RLGR. Вход копируется в Uint16, выход пишется в заранее выделенный Uint8.
 // k и kr хранятся умноженными на 8. Частное 32 и больше — 32 единицы и сырое слово.
 
 let acc = 0;
 let nbits = 0;
 let kr = 8;
-let pack: number[] = [];
+let sym: Uint16Array = new Uint16Array(82944);
+let pack: Uint8Array = new Uint8Array(663560);
 let packCount = 0;
 
 function writeBits(value: number, width: number): void {
@@ -52,7 +53,7 @@ function writeRice(x: number, m: number): void {
   }
 }
 
-function encodeSymbols(symbols: number[], base: number, count: number): number {
+function encodeLoaded(count: number): number {
   acc = 0;
   nbits = 0;
   kr = 8;
@@ -61,7 +62,7 @@ function encodeSymbols(symbols: number[], base: number, count: number): number {
   let rl = 0;
   let s = 0;
   while (s < count) {
-    let value = symbols[base + s];
+    let value = sym[s];
     let kShift = k >> 3;
     let krShift = kr >> 3;
     if (kShift > 0) {
@@ -102,4 +103,20 @@ function encodeSymbols(symbols: number[], base: number, count: number): number {
     packCount = packCount + 1;
   }
   return packCount;
+}
+
+function load8(src: Uint8Array, base: number, count: number): void {
+  let i = 0;
+  while (i < count) {
+    sym[i] = src[base + i];
+    i = i + 1;
+  }
+}
+
+function load16(src: Uint16Array, base: number, count: number): void {
+  let i = 0;
+  while (i < count) {
+    sym[i] = src[base + i];
+    i = i + 1;
+  }
 }
