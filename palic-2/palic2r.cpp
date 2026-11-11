@@ -162,7 +162,7 @@ static inline int med(int a, int b, int c) { int mn = std::min(a, b), mx = std::
 struct Cfg { int off = PLR_OFF; bool fast = false; };
 static constexpr int TILE = 288;
 
-static inline uint16_t zz8(int e) { e = int8_t(e); return uint16_t(uint8_t((e << 1) ^ (e >> 7))); }
+static inline uint16_t zz8(int e) { e = int8_t(e); return uint16_t(uint8_t((unsigned(e) << 1) ^ unsigned(e >> 7))); }
 static void resid_row0(const uint8_t* __restrict r, uint16_t* __restrict z, int w) {
     z[0] = zz8(r[0]);
     for (int x = 1; x < w; ++x) z[x] = zz8(r[x] - r[x - 1]);
@@ -518,7 +518,7 @@ void decompress(const std::vector<uint8_t>& d, std::vector<uint8_t>& img, int& W
 // U,V are -255..255; residual -510..510 folds mod 512 into -256..255.
 static inline int wrap9(int d) { return int(unsigned(d + 256) & 511u) - 256; }
 static inline int fold9(int s) { if (s > 255) return s - 512; if (s < -255) return s + 512; return s; }
-static inline uint16_t zz16(int e) { return uint16_t((e << 1) ^ (e >> 31)); }
+static inline uint16_t zz16(int e) { return uint16_t((unsigned(e) << 1) ^ unsigned(e >> 31)); }
 static void resid16_row0(const int16_t* __restrict r, uint16_t* __restrict z, int w) {
     z[0] = zz16(r[0]);
     for (int x = 1; x < w; ++x) z[x] = zz16(wrap9(r[x] - r[x - 1]));

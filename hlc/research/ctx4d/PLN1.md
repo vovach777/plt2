@@ -308,3 +308,27 @@ bpp and enc / dec MB/s, best of 5, two runs agree within ~2%, all round trips ok
 The interleaving is almost free (layout 1 is +1–2%, inside the noise); coding each bin at the end gains 5–13% in PLR
 and loses in PLF. The size grows by 0.04–0.08% (stream headers, a half page per stream). The time is the RLGR state
 machine itself, not the page sharing.
+
+### PLR / PLF format: lazy reservation (default; `-DRLGR_RESERVE64` = old llrice rule, byte-identical to llrice)
+
+Why a stream reserves at all: (1) **reader time ≠ writer time**: in a run the encoder writes the run header
+(0, or 1 + rl in k bits) at the end of the run, the decoder reads it at the start, and other streams take pages in
+between, so the header's bits must be laid at the start of the run (`reserve(1 + k)` on entering a run and after a
+full window: the ring of reserved pages exists for this); (2) **unknown length**: llrice also laid 64 bits before
+every Rice code because the decoder peeks a 64-bit window. (2) is not needed: a Rice code is written and read at the
+same symbol, so now a page is taken when the first bit that does not fit is written / read. The encoder reserves
+exactly `q + 1 + m` (with the run end: `1 + k + q + 1 + m`) bits when it writes the code; the decoder counts the
+prefix only over the bits the stream already holds and takes the next page when they are all ones (the encoder
+took that page while writing this same code), then makes exactly `q + 1 + m` bits available. Escape (32 ones):
+`skip(32)`, `reserve(32)`. The raw writer reserves the exact bits of what it writes next. Result: fewer laid but
+unused bits. Best of 5, two runs; all round trips ok incl. noise / spike / stripe stress images, ASan + UBSan clean,
+clang = gcc files:
+
+| | Kodak | gray 17 | 19 colour |
+|---|---|---|---|
+| PLR, reserve 64 (old) | 10.1541 101 / 81 | 4.5726 100 / 74 | 8.2299 119 / 95 |
+| **PLR, lazy** | **10.1436** 97 / 82 | **4.5668** 95 / 78 | **8.2199** 114 / 98 |
+| PLF, reserve 64 (old) | 10.2042 116 / 94 | 4.6049 117 / 95 | 8.3389 136 / 109 |
+| **PLF, lazy** | **10.1902** 114 / 96 | **4.5991** 117 / 96 | **8.3258** 132 / 111 |
+
+−0.10..−0.16% size everywhere, decode +1..5%, encode −0..5%.
