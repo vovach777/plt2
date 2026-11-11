@@ -360,3 +360,25 @@ streams (`-DRLGR_STATS`, SIMB line):
 | PLR gray 17 | 434 428 of 466 488 | 0.0026 bpp | −0.02% |
 | PLR 19 colour | 1 306 717 of 1 473 591 | 0.0189 bpp | +0.15% |
 | PLF Kodak / gray / colour | 93 / 91 / 99% | ≤ 0.0008 bpp | −0.08 / −0.08 / −0.09% |
+
+### PLR / PLF format: one bit lane per tile (`rlgr_lane.hpp`, `PLR_LAYOUT 3`, default)
+
+The (b) scheme built for real. A tile is `var(number of 64-bit words)` + the words of one bit lane. Every code
+(Rice, the L bit planes, the zU split) is written at the lane head when it is known. A run header gets a hole of
+`1 + k` bits at the head when the run starts and right after a full window; the encoder fills it at the end of the
+run (a full window is the flag 0: nothing to write), the decoder reads it by position when the run starts. A full
+window whose hole still ends at the head gives back k bits (`head = hole + 1`), on both sides. An open hole at the
+end of the tile stays (zeros). Each coder keeps one open hole; no pages, rings or reservation of worst cases; the
+decoder is one sequential reader. Round trips ok (edge sizes, noise / spike / stripe stress), ASan + UBSan clean,
+20 corrupted files rejected without a crash, clang = gcc files. Best of 5, two runs agree:
+
+| | Kodak | gray 17 | 19 colour |
+|---|---|---|---|
+| PLR, pages (lazy) | 10.1436 97 / 83 | 4.5668 95 / 78 | 8.2199 114 / 98 |
+| **PLR, lane** | **10.1422** 106 / 84 | **4.5666** 102 / 78 | 8.2334 (+0.16%) 125 / 101 |
+| PLF, pages (lazy) | 10.1902 116 / 97 | 4.5991 118 / 97 | 8.3258 135 / 111 |
+| **PLF, lane** | **10.1834** 122 / 103 | **4.5964** 123 / 104 | **8.3196** 143 / 119 |
+
+Encoder +5..11%, decoder +1..7%; size −0.07..0% except PLR on the colour photos (+0.16%: full windows whose hole
+was passed by the raw bits of the blocks). `-DPLR_LAYOUT=0` builds the page format; with `-DRLGR_RESERVE64` it is
+byte-identical with `-DPLR_LLRICE`.

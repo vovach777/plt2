@@ -3,7 +3,7 @@
 palic2r (STATS line on stderr of `c`): size_b = file - pages + bits/8, where bits = payload + k per full window
 (the hole of 1 + k when only the bit 0 is used) + the hole of an open run at the end; pages are replaced by one
 bit stream per tile (rounded to 64 bits: + 4 bytes per tile on average).
-STATS_BINARY: palic2r.cpp built with -DRLGR_STATS.
+STATS_BINARY: palic2r.cpp built with -DRLGR_STATS -DPLR_LAYOUT=0 (the page engine the counters live in).
 usage: plr_onestream_estimate.py STATS_BINARY [-f] dir..."""
 import os, sys, subprocess, tempfile
 b = sys.argv[1]; args = sys.argv[2:]; fast = '-f' in args; dirs = [a for a in args if a != '-f']

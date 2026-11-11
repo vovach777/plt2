@@ -1,4 +1,5 @@
 // palic2r: PLN2 with the FSE streams replaced by interleaved one-pass RLGR. Files "PLR1"/"PLR2", fast mode "PLF1"/"PLF2".
+// (The page description below is layout 0, the previous format; the format is now layout 3, see PLR_LAYOUT.)
 // Every plane of a tile has 8 RLGR coders (one per L); they and one raw bit writer for the L bit planes share one
 // page buffer per tile (rlgr_fast.hpp: the llrice RLGR and its reservation rule on a lean page buffer), so all
 // streams are interleaved in coding order and written on the fly; the decoder reserves pages at the same points
@@ -44,14 +45,24 @@ using REnc = RLGR::Encoder; using RDec = RLGR::Decoder; using RRawW = BitStream:
 #define RAW_GET(r, n) ([&] { const int n_ = (n); uint32_t v_ = uint32_t((r)->peek_n(n_)); (r)->skip(n_); return v_; }())
 #else
 #include "rlgr_fast.hpp"
-// PLR_LAYOUT (experiment): 0 = all streams of a tile interleaved in one page buffer (the format);
+// PLR_LAYOUT: 3 = one bit lane per tile, run headers in holes (rlgr_lane.hpp; the format of PLR / PLF);
+// experiments: 0 = all streams of a tile interleaved in one page buffer (rlgr_fast.hpp, the previous format);
 // 1 = every coder and the raw writer has its own stream, coded on the fly; 2 = own streams, the symbols of each bin
 // are collected first and every bin is RLGR-coded at the end of the tile in one tight loop (the decoder decodes
 // every bin up front from its symbol count, then the block loop only reads arrays).
 #ifndef PLR_LAYOUT
-#define PLR_LAYOUT 0
+#define PLR_LAYOUT 3
 #endif
-#if PLR_LAYOUT == 2
+#if PLR_LAYOUT == 3
+#include "rlgr_lane.hpp"
+using REnc = rlgrl::Encoder; using RDec = rlgrl::Decoder; using RRawW = rlgrl::Lane; using RRawR = rlgrl::LaneR;
+#undef RAW_PUT
+#undef RAW_GET16
+#undef RAW_GET
+#define RAW_PUT(w, n, v) (w)->put(n, v)
+#define RAW_GET16(r) uint16_t((r)->get(16))
+#define RAW_GET(r, n) (r)->get(n)
+#elif PLR_LAYOUT == 2
 struct BinEnc { std::vector<uint32_t> v; inline void put(uint32_t x) { v.push_back(x); } };
 struct BinDec { std::vector<uint32_t> v; size_t i = 0; inline uint32_t get() { return v[i++]; } };
 using REnc = BinEnc; using RDec = BinDec; using RRawW = rlgrf::Writer; using RRawR = rlgrf::Reader;
@@ -425,7 +436,22 @@ struct TileDec {
     static std::vector<uint64_t> read_pages(In& in) { size_t n = size_t(in.var()); std::vector<uint64_t> v(n); memcpy(v.data(), in.take(n * 8), n * 8); return v; }
 };
 #else
-#if PLR_LAYOUT == 0
+#if PLR_LAYOUT == 3
+struct TileEnc {                                // one bit lane per tile for every coder and the raw bits
+    rlgrl::Lane lane; std::vector<REnc> e; Sink sk[3];
+    explicit TileEnc(int planes, size_t px) { lane.w.assign(px / 16 + 64, 0); e.reserve(24);
+        for (int i = 0; i < planes * 8; ++i) e.emplace_back(&lane);
+        for (int p = 0; p < planes; ++p) { sk[p].raw = &lane; for (int L = 0; L < 8; ++L) sk[p].e[L] = &e[size_t(p) * 8 + L]; } }
+    void finish(Out& o) { for (auto& x : e) x.flush(); const size_t n = lane.words(); o.var(n); o.raw(lane.w.data(), n * 8); }
+};
+struct TileDec {
+    std::vector<uint64_t> words; rlgrl::LaneR lr; std::vector<RDec> d; Source sr[3];
+    TileDec(In& in, int planes) { const size_t n = size_t(in.var()); words.assign(n + 2, 0); memcpy(words.data(), in.take(n * 8), n * 8);
+        lr.w = words.data(); lr.nw = n + 2; d.reserve(24);
+        for (int i = 0; i < planes * 8; ++i) d.emplace_back(&lr);
+        for (int p = 0; p < planes; ++p) { sr[p].raw = &lr; for (int L = 0; L < 8; ++L) sr[p].d[L] = &d[size_t(p) * 8 + L]; } }
+};
+#elif PLR_LAYOUT == 0
 struct TileEnc {                                // one page buffer per tile, shared by every coder of every plane
     rlgrf::PageBuf pb; std::vector<REnc> e; RRawW raw; Sink sk[3];
     explicit TileEnc(int planes, size_t px) : raw(&pb) { pb.w.resize(px / 4 + 64); e.reserve(24);
