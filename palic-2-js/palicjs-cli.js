@@ -92,7 +92,8 @@ function encodePjs(image, name) {
       }
     }
   }
-  const head = Buffer.from(`PLN5-${name.toUpperCase()}\n${image.width} ${image.height} ${planeCount}\n`);
+  const formatName = image.format === C.FORMAT_PLN1 ? 'PLN1' : 'PLN2';
+  const head = Buffer.from(`${formatName}-${name.toUpperCase()}\n${image.width} ${image.height}\n`);
   return Buffer.concat([head, Buffer.from(bin)]);
 }
 
@@ -138,10 +139,11 @@ function decodePjs(buf) {
     if (buf[headerEnd++] === 10) newlines++;
   }
   const [magic, sizeLine] = buf.toString('latin1', 0, headerEnd).trimEnd().split('\n');
-  const method = /^PLN5-([A-Z0-9]+)$/.exec(magic);
+  const method = /^PLN([12])-([A-Z0-9]+)$/.exec(magic);
   if (!method) throw new Error(`bad magic ${magic}`);
-  const name = method[1].toLowerCase();
-  const [width, height, planeCount] = sizeLine.split(' ').map(Number);
+  const planeCount = method[1] === '1' ? 1 : 3;
+  const name = method[2].toLowerCase();
+  const [width, height] = sizeLine.split(' ').map(Number);
   const entropy = loadEntropy(name);
   const format = planeCount === 1 ? C.FORMAT_PLN1 : C.FORMAT_PLN2;
   const cursor = { i: headerEnd };

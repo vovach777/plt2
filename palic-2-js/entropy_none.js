@@ -1,7 +1,7 @@
 'use strict';
 
 // Raw symbols. Uint8Array is copied. Uint16Array is little-endian bytes.
-// bzip2 of a PLN5-NONE file is the entropy reference.
+// bzip2 of a PLN1-NONE or PLN2-NONE file is the entropy reference.
 
 function encode(values) {
   if (values instanceof Uint8Array) return new Uint8Array(values);
