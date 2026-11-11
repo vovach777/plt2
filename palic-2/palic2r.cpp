@@ -44,7 +44,20 @@ using REnc = RLGR::Encoder; using RDec = RLGR::Decoder; using RRawW = BitStream:
 #define RAW_GET(r, n) ([&] { const int n_ = (n); uint32_t v_ = uint32_t((r)->peek_n(n_)); (r)->skip(n_); return v_; }())
 #else
 #include "rlgr_fast.hpp"
+// PLR_LAYOUT (experiment): 0 = all streams of a tile interleaved in one page buffer (the format);
+// 1 = every coder and the raw writer has its own stream, coded on the fly; 2 = own streams, the symbols of each bin
+// are collected first and every bin is RLGR-coded at the end of the tile in one tight loop (the decoder decodes
+// every bin up front from its symbol count, then the block loop only reads arrays).
+#ifndef PLR_LAYOUT
+#define PLR_LAYOUT 0
+#endif
+#if PLR_LAYOUT == 2
+struct BinEnc { std::vector<uint32_t> v; inline void put(uint32_t x) { v.push_back(x); } };
+struct BinDec { std::vector<uint32_t> v; size_t i = 0; inline uint32_t get() { return v[i++]; } };
+using REnc = BinEnc; using RDec = BinDec; using RRawW = rlgrf::Writer; using RRawR = rlgrf::Reader;
+#else
 using REnc = rlgrf::Encoder; using RDec = rlgrf::Decoder; using RRawW = rlgrf::Writer; using RRawR = rlgrf::Reader;
+#endif
 #define RAW_PUT(w, n, v) (w)->put(n, v)
 #define RAW_GET16(r) uint16_t((r)->get(16))
 #define RAW_GET(r, n) (r)->get(n)
@@ -412,6 +425,7 @@ struct TileDec {
     static std::vector<uint64_t> read_pages(In& in) { size_t n = size_t(in.var()); std::vector<uint64_t> v(n); memcpy(v.data(), in.take(n * 8), n * 8); return v; }
 };
 #else
+#if PLR_LAYOUT == 0
 struct TileEnc {                                // one page buffer per tile, shared by every coder of every plane
     rlgrf::PageBuf pb; std::vector<REnc> e; RRawW raw; Sink sk[3];
     explicit TileEnc(int planes, size_t px) : raw(&pb) { pb.w.resize(px / 4 + 64); e.reserve(24);
@@ -426,6 +440,52 @@ struct TileDec {
         for (int p = 0; p < planes; ++p) for (int L = 0; L < 8; ++L) d.emplace_back(pages.data(), &top, n);
         for (int p = 0; p < planes; ++p) { for (int L = 0; L < 8; ++L) sr[p].d[L] = &d[size_t(p) * 8 + L]; sr[p].raw = raw.get(); } }
 };
+#else
+struct TileEnc {                                // own stream per coder (and for the raw writer)
+    std::vector<rlgrf::PageBuf> pb; std::vector<REnc> e; RRawW raw; Sink sk[3]; int ns;
+    explicit TileEnc(int planes, size_t px) : pb(size_t(planes) * 8 + 1), raw(&pb[size_t(planes) * 8]) { ns = planes * 8;
+        for (auto& b : pb) b.w.resize(px / 64 + 64); e.reserve(24);
+#if PLR_LAYOUT == 1
+        for (int i = 0; i < ns; ++i) e.emplace_back(&pb[size_t(i)]);
+#else
+        for (int i = 0; i < ns; ++i) { e.emplace_back(); e.back().v.reserve(px / 4); }
+#endif
+        for (int p = 0; p < planes; ++p) { sk[p].raw = &raw; for (int L = 0; L < 8; ++L) sk[p].e[L] = &e[size_t(p) * 8 + L]; } }
+    void finish(Out& o) {
+        for (int i = 0; i < ns; ++i) {
+#if PLR_LAYOUT == 1
+            e[size_t(i)].flush();
+#else
+            o.var(e[size_t(i)].v.size()); rlgrf::Encoder c(&pb[size_t(i)]);
+            for (const uint32_t v : e[size_t(i)].v) c.put(v);
+            c.flush();
+#endif
+        }
+        raw.flush();
+        for (auto& b : pb) { o.var(b.top); o.raw(b.w.data(), b.top * 8); }
+    }
+};
+struct TileDec {
+    std::vector<uint64_t> pages; std::vector<size_t> top, off, cnt; std::vector<RDec> d; std::unique_ptr<RRawR> raw; Source sr[3];
+    TileDec(In& in, int planes) { const int ns = planes * 8; cnt.resize(size_t(ns)); top.assign(size_t(ns) + 1, 0); off.resize(size_t(ns) + 2);
+#if PLR_LAYOUT == 2
+        for (auto& x : cnt) x = size_t(in.var());
+#endif
+        std::vector<std::pair<const uint8_t*, size_t>> st; size_t tot = 0;
+        for (int i = 0; i <= ns; ++i) { const size_t n = size_t(in.var()); st.push_back({in.take(n * 8), n}); off[size_t(i)] = tot; tot += n; }
+        pages.resize(tot); for (int i = 0; i <= ns; ++i) memcpy(pages.data() + off[size_t(i)], st[size_t(i)].first, st[size_t(i)].second * 8);
+        raw.reset(new RRawR(pages.data() + off[size_t(ns)], &top[size_t(ns)], st[size_t(ns)].second)); d.reserve(24);
+        for (int i = 0; i < ns; ++i) {
+#if PLR_LAYOUT == 1
+            d.emplace_back(pages.data() + off[size_t(i)], &top[size_t(i)], st[size_t(i)].second);
+#else
+            d.emplace_back(); rlgrf::Decoder c(pages.data() + off[size_t(i)], &top[size_t(i)], st[size_t(i)].second);
+            auto& v = d.back().v; v.resize(cnt[size_t(i)]); for (auto& x : v) x = c.get();
+#endif
+        }
+        for (int p = 0; p < planes; ++p) { sr[p].raw = raw.get(); for (int L = 0; L < 8; ++L) sr[p].d[L] = &d[size_t(p) * 8 + L]; } }
+};
+#endif
 #endif
 std::vector<uint8_t> compress(const uint8_t* img, int W, int H, const Cfg& c) {
     Grid g = grid(W, H); const int nt = g.nx * g.ny; static thread_local std::vector<uint8_t> tmp;

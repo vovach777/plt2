@@ -288,3 +288,23 @@ off for the S plane: off 0 / 1 / 2: Kodak 10.2623 / 10.1541 / 10.1741, colour 8.
 Fractional off for S (L = bw(mean · c) − 1, c = 4/8 .. 16/8, i.e. off 2 .. 0): c = 5/8, 6/8, 7/8, 1, 10/8, 12/8:
 Kodak 10.1695 / 10.1633 / 10.1574 / **10.1541** / 10.1634 / 10.1908, colour 8.2298 / 8.2275 / **8.2272** / 8.2299 /
 8.2440 / 8.2678. Off 1 stays: the best fraction is within 0.03%.
+
+### Does the interleaving cost speed? (`-DPLR_LAYOUT`, experiment; the format stays layout 0)
+
+0 = all streams of a tile in one page buffer (the format); 1 = own stream per coder and for the raw writer, coded on
+the fly; 2 = own streams, the symbols of each bin collected and RLGR-coded at the end of the tile in one tight loop
+(symbol count per bin in the file; the decoder decodes every bin up front, the block loop reads arrays).
+bpp and enc / dec MB/s, best of 5, two runs agree within ~2%, all round trips ok:
+
+| layout | Kodak | gray 17 | 19 colour |
+|---|---|---|---|
+| PLR 0 | 10.1541 101 / 81 | 4.5726 99 / 75 | 8.2299 119 / 95 |
+| PLR 1 | 10.1578 103 / 83 | 4.5741 101 / 77 | 8.2337 122 / 98 |
+| PLR 2 | 10.1625 106 / 85 | 4.5759 108 / 85 | 8.2383 125 / 103 |
+| PLF 0 | 10.2042 116 / 94 | 4.6049 120 / 95 | 8.3389 136 / 109 |
+| PLF 1 | 10.2081 118 / 95 | 4.6063 121 / 95 | 8.3427 140 / 109 |
+| PLF 2 | 10.2128 105 / 89 | 4.6080 107 / 89 | 8.3474 120 / 101 |
+
+The interleaving is almost free (layout 1 is +1–2%, inside the noise); coding each bin at the end gains 5–13% in PLR
+and loses in PLF. The size grows by 0.04–0.08% (stream headers, a half page per stream). The time is the RLGR state
+machine itself, not the page sharing.
