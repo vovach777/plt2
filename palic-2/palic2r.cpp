@@ -4,7 +4,7 @@
 // streams are interleaved in coding order and written on the fly; the decoder reserves pages at the same points
 // in the same order. Tile = var number of pages, pages (uint64). No histograms, no second pass. With -DPLR_LLRICE
 // the coders are llrice's own classes (llrice/, the proof of concept). The rest (tiles, MED, causal L, planes,
-// RCT, the wave decoder, stored original) is palic2.cpp as is.
+// RCT, the wave decoder, stored original) is palic2.cpp as is, except off: PLR uses off = 1 (PLN uses 2), see PLN1.md.
 // --- original header of palic2.cpp:
 // palic-2: PLN2 colour (and P5 gray) codec, mode 2 only.
 // Independent 288x288 tiles, MED + zigzag, causal L from the block above (off=2),
@@ -144,7 +144,7 @@ static double now_s() { return std::chrono::duration<double>(std::chrono::steady
 static inline uint32_t bwz(uint32_t v) { return v ? 32 - __builtin_clz(v) : 0; }
 static inline int med(int a, int b, int c) { int mn = std::min(a, b), mx = std::max(a, b), p = a + b - c; return p < mn ? mn : (p > mx ? mx : p); }
 #ifndef PLR_OFF
-#define PLR_OFF 2
+#define PLR_OFF 1
 #endif
 struct Cfg { int off = PLR_OFF; };
 static constexpr int TILE = 288;

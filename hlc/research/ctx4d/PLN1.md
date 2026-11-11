@@ -189,7 +189,16 @@ one 64-bit window. Static clang `-march=native`, in-process, best of 3, all roun
 PLN2 FSE on full Kodak: enc 423, dec 417 MB/s. The coder is ~75% of the PLR time and the profile is instruction
 bound (IPC ~3), so the llrice format itself (a serial adaptive state per symbol) is the ceiling, not the bit I/O.
 
-### PLR: pair coding (llrice `CODER_G_RB_SUM`, Malvar RLGR3 idea) and `off`
+### PLR spec: off = 1
+
+**PLR uses `off = 1`** in `L = clamp(bw(mean of 16 z) − off, 0, 7)` (PLN1 / PLN2 with FSE keep `off = 2`).
+`off` is not written into the file: it is part of the format (`-DPLR_OFF` only for experiments). Measured:
+off 0 / 1 / 2 / 3 on full Kodak 10.5648 / **10.1833** / 10.2407 / 10.2586, gray 17 4.6979 / **4.5726** / 4.5963 /
+4.6106, 19 colour 8.5352 / **8.2567** / 8.2810 / 8.2985. Why: off 1 sends one more bit of every symbol raw and
+leaves RLGR smaller high parts, where its runs of zeros work; FSE codes those small alphabets near the entropy
+anyway, so for it the extra raw bit was a loss.
+
+ (llrice `CODER_G_RB_SUM`, Malvar RLGR3 idea) and `off`
 
 Compile switches of `palic2r.cpp`, defaults unchanged (off 2, no pairs = byte-identical to llrice):
 `-DPLR_PAIR` codes the high parts of neighbours `2j, 2j+1` of a block as RLGR(a+b) plus `a` raw in `bw(a+b)` bits
@@ -210,3 +219,19 @@ Compile switches of `palic2r.cpp`, defaults unchanged (off 2, no pairs = byte-id
 RLGR wants off 1 (FSE wanted 2). The raw split `bw(a+b)` loses 2–4%; truncated binary removes most of it. Pairs help
 in the L = 0 bins (the Rice floor of 1 bit per symbol at k = 0), mostly on Kodak, and are neutral or slightly worse
 elsewhere. Not done yet: the llrice pairing itself is across channels (U and V of one pixel), not neighbours.
+
+Pairs re-measured at off 1 (now the PLR default), best of 3, all round trips ok; enc/dec MB/s on Kodak:
+
+| variant | Kodak | gray 17 | 19 colour | enc / dec |
+|---|---|---|---|---|
+| **no pairs (default)** | 10.1833 | **4.5726** | **8.2567** | 99 / 76 |
+| pairs L = 0, truncated binary | **10.1267** | 4.5736 | 8.2891 | 109 / 82 |
+| pairs L = 0..1, truncated | 10.1711 | 4.5816 | 8.3115 | 114 / 88 |
+| pairs L = 0..3, truncated | 10.1974 | 4.5947 | 8.3292 | 117 / 92 |
+| pairs L >= 3, truncated | 10.1994 | 4.5892 | 8.2738 | 103 / 77 |
+| pairs all L, truncated | 10.2042 | 4.6049 | 8.3389 | 116 / 92 |
+| pairs L = 0, raw `bw(a+b)` | 10.2292 | 4.5902 | 8.3860 | 110 / 86 |
+| pairs all L, raw `bw(a+b)` (llrice) | 10.4309 | 4.6765 | 8.5140 | 128 / 109 |
+
+Pairs of neighbours are a speed knob, not a size gain: only Kodak (L = 0) gets smaller; on the photos the
+neighbours are correlated and the sum is coded worse than the two symbols.
