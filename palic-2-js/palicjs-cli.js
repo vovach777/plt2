@@ -92,7 +92,7 @@ function encodePjs(image, name) {
       }
     }
   }
-  const head = Buffer.from(`PJS\n${name}\n${image.width} ${image.height} ${planeCount}\n`);
+  const head = Buffer.from(`PLN5-${name.toUpperCase()}\n${image.width} ${image.height} ${planeCount}\n`);
   return Buffer.concat([head, Buffer.from(bin)]);
 }
 
@@ -134,11 +134,13 @@ function tileData(width, height, format, planes) {
 
 function decodePjs(buf) {
   let headerEnd = 0, newlines = 0;
-  while (headerEnd < buf.length && newlines < 3) {
+  while (headerEnd < buf.length && newlines < 2) {
     if (buf[headerEnd++] === 10) newlines++;
   }
-  const [magic, name, sizeLine] = buf.toString('latin1', 0, headerEnd).trimEnd().split('\n');
-  if (magic !== 'PJS') throw new Error(`bad magic ${magic}`);
+  const [magic, sizeLine] = buf.toString('latin1', 0, headerEnd).trimEnd().split('\n');
+  const method = /^PLN5-([A-Z0-9]+)$/.exec(magic);
+  if (!method) throw new Error(`bad magic ${magic}`);
+  const name = method[1].toLowerCase();
   const [width, height, planeCount] = sizeLine.split(' ').map(Number);
   const entropy = loadEntropy(name);
   const format = planeCount === 1 ? C.FORMAT_PLN1 : C.FORMAT_PLN2;

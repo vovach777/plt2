@@ -132,21 +132,22 @@ function render(rgb, width, height) {
 }
 
 function renderTxt(rgb, width, height) {
-  return renderImage(decomposeImage(rgb, width, height), 'PLN2-TXT', encodeRuns);
+  return renderImage(decomposeImage(rgb, width, height), 'PLN5-TXT', encodeRuns);
 }
 
 function renderGrayTxt(gray, width, height) {
-  return renderImage(decomposeGrayImage(gray, width, height), 'PLN1-TXT', encodeRuns);
+  return renderImage(decomposeGrayImage(gray, width, height), 'PLN5-TXT', encodeRuns);
 }
 
 function parseTxt(text) {
   const lines = text.trimEnd().split('\n');
   const magic = lines[0];
-  const gray = magic.startsWith('PLN1');
   const coded = magic.endsWith('-TXT');
   const [width, height] = lines[1].split(' ').map(Number);
   const ny = Math.ceil(height / TILE);
   const nx = Math.ceil(width / TILE);
+  const gray = magic.startsWith('PLN1')
+    || (magic.startsWith('PLN5') && lines[2].split('\t')[0].split(' ').length === 1);
   const planes = gray ? 1 : 3;
   const data = lines.slice(2 + ny);
   const expected = nx * ny * planes * 9;
