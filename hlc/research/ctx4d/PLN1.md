@@ -537,3 +537,18 @@ CLIC 117 colour 8.6639 -> 8.6627, gray 3.8826 -> 3.8816; Kodak 9.9588 -> 9.9587;
 Checks: ASan+UBSan on all sets, 300 corrupted files (245 rejected, 0 crashes), clang/gcc AVX2 and gcc x86-64-v2
 byte-identical on 133 images; PLR files unchanged.
 Backlog: escape (8,2) for PLR, screen tables on a larger corpus, decoder speed without AVX2 (~80 MB/s, also PLR).
+
+### Decoder speed by compiler / ISA (checked 2026-11-13, first 25 CLIC colour, bench -r 3, -O3; gcc 13.3, clang 18.1)
+enc / dec MB/s:
+| build | PLN2 | PLR | PLS |
+|---|---|---|---|
+| gcc, x86-64-v2 (SSE4.2) | 335 / 182 | 391 / 150 | 320 / 151 |
+| gcc, x86-64-v3 (AVX2) | 374 / 418 | 689 / 324 | 649 / 320 |
+| clang, x86-64-v2 | 351 / 394 | 398 / 271 | 341 / 265 |
+| clang, x86-64-v3 | 400 / 403 | 724 / 306 | 678 / 304 |
+| gcc, x86-64-v2, palic2r_gcc.cpp | | 389 / 276 | 316 / 275 |
+Not a regression: GCC without AVX2 lowers the 256-bit generic vectors of the MED wave poorly (gcc SSE before d3a7db9:
+PLN2 dec 169; -DPLN_ROWS scalar rows: 171 / 143); clang splits them into SSE pairs well. palic2r_gcc.cpp (experiment,
+separate file): for GCC && !__AVX2__ the wave on 128-bit vectors, bands of 8 rows, 8x8 transposes, block_unpack in
+halves -> PLR dec 150 -> 276 MB/s (= clang SSE); files byte-identical to palic2r (208 checks, cross-decode), ASan clean.
+Backlog: checked, closed. Possible later: fold the 8-lane path into palic2r.cpp, the same for palic2.cpp (PLN2).
