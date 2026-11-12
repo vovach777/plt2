@@ -2,6 +2,7 @@
 # above empty) and, on a miss, the cheapest L (argmin of the exact block cost) coded conditionally on the causal L.
 # Costs with the format tables (letters + tails + 16 L) + runs + zU split (exp_pred.costs). Side info = ideal adaptive
 # (per-image conditional entropy) -> optimistic by the table cost. Also the free oracle (no side info) as the ceiling.
+# ESC_T=T: send the escape only when the block gains more than T bits (Qwen's threshold; default 0).
 # usage: exp_l_escape.py DUMPER NAME img...   (optional env TILE_CSV=out.csv TILE=k: write the blocks of tile k, plane Y)
 import sys, os, numpy as np
 sys.argv, _a = sys.argv[:1] + ['x', 'y'], sys.argv
@@ -22,7 +23,7 @@ for img in imgs:
         h = z >> L; x = np.maximum(h - 3, 0); q = x >> T['rk'][t][:, None]
         CL[:, L] = T['lens'][t[:, None], qhsim.letters(h)].sum(1) + np.where(h >= 3, np.where(q >= T['QESC'], T['QESC'] + 10, q + 1 + T['rk'][t][:, None]), 0).sum(1) + 16 * L
     Lc = d['Lo'].astype(np.int64); n = len(z); i = np.arange(n); cc = CL[i, Lc]; Lb = CL.argmin(1); cb = CL[i, Lb]
-    miss = (cb < cc) & k
+    miss = (cc - cb > float(os.environ.get('ESC_T', '0'))) & k   # Qwen: escape only when it gains more than T bits
     pk = d['tile'].astype(np.int64) * 4 + d['pl']; prev_empty = np.r_[True, (z[:-1] == 0).all(1)] | np.r_[True, pk[1:] != pk[:-1]]
     ctx = (np.minimum(bwv(d['sa'].astype(np.int64)), 15) * 2 + prev_empty) * 2 + (d['sa'] < 16) + 64 * d['ptype']
     side = H(miss[k].astype(np.int64), ctx[k]) + H(Lb[miss], Lc[miss] + 8 * d['ptype'][miss])
