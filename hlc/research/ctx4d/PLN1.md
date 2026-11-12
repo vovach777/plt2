@@ -552,3 +552,7 @@ PLN2 dec 169; -DPLN_ROWS scalar rows: 171 / 143); clang splits them into SSE pai
 separate file): for GCC && !__AVX2__ the wave on 128-bit vectors, bands of 8 rows, 8x8 transposes, block_unpack in
 halves -> PLR dec 150 -> 276 MB/s (= clang SSE); files byte-identical to palic2r (208 checks, cross-decode), ASan clean.
 Backlog: checked, closed. Possible later: fold the 8-lane path into palic2r.cpp, the same for palic2.cpp (PLN2).
+
+### PLS encoder choice: -s / -s=auto (default, detector per plane), -s=screen (every plane PLS), -s=photo (every plane
+the PLR coding). Encoder only, the format is the same. bpp: 12 screens auto 1.2914 / screen 1.2919 / photo 1.8361
+(= PLR); first 25 CLIC 9.2118 / 9.4880 / 9.2140 (= PLR); document render + phone screenshot 3.4517 / 3.5932 / 3.5578.

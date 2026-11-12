@@ -557,9 +557,12 @@ static inline uint32_t qh_block_bits_fast(uint32_t pt, uint32_t sa, bool first, 
 #endif
 }
 
+// PLS encoder choice per plane (-s / -s=auto: the detector; -s=screen: always PLS; -s=photo: always the PLR coding of
+// the plane). Encoder only: the file format (1 bit per plane) is the same for all three.
+static int g_pls_force = 0;                     // 0 auto, 1 screen, 2 photo
 static void qhs_plane_enc(const uint16_t* z, const uint16_t* a, size_t nb, int tw) {
 #if !defined(PLS_NO_SWITCH)
-    const int sp_mode = qhs::screen_plane_mode(z, nb);
+    const int sp_mode = g_pls_force == 1 ? 2 : g_pls_force == 2 ? 0 : qhs::screen_plane_mode(z, nb);
     if (!sp_mode) {
         { rlgrl::LaneW w(*g_sink->raw); w.room(); w.put(1, 0); w.sync(); }
         qh_plane_enc(z, a, nb, tw, PLR_OFF);
@@ -1233,12 +1236,14 @@ int main(int argc, char** argv) {
 #if defined(PLR_QH)
     qh::init(); qhs::init();
 #endif
-    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.plr [-f] (the input itself if it does not shrink) | d in.plr|pgm|ppm out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N] [-f]  (-f: fast mode, pairs, files PLF1/PLF2; -s: screen mode, files PLS1/PLS2)\n", argv[0]); return 1; }
+    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.plr [-f] (the input itself if it does not shrink) | d in.plr|pgm|ppm out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N] [-f]  (-f: fast mode, pairs, files PLF1/PLF2; -s or -s=auto: screen mode PLS1/PLS2, PLR or PLS per plane by a detector; -s=screen: every plane PLS; -s=photo: every plane PLR coding)\n", argv[0]); return 1; }
     std::string cmd = argv[1]; Cfg c; int reps = 3; std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i) { std::string a = argv[i];
         if (a == "-r" && i + 1 < argc) reps = atoi(argv[++i]);
         else if (a == "-f") { c.fast = true; c.off = PLR_FAST_OFF; c.screen = false; }
-        else if (a == "-s") { c.screen = !c.fast; }
+        else if (a == "-s" || a == "-s=auto") { c.screen = !c.fast; g_pls_force = 0; }
+        else if (a == "-s=screen") { c.screen = !c.fast; g_pls_force = 1; }
+        else if (a == "-s=photo") { c.screen = !c.fast; g_pls_force = 2; }
         else if (cmd == "bench" && std::filesystem::is_directory(a)) { std::vector<std::string> v;
             for (auto& e : std::filesystem::directory_iterator(a)) { auto x = e.path().extension();
                 if (x == ".pgm" || x == ".ppm" || x == ".pnm") v.push_back(e.path().string()); }
