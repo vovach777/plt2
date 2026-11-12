@@ -489,3 +489,13 @@ PLR enc / dec 651 / 440 and 787 / 403 MB/s there. HALIC's lead on gb82-sc comes 
 dithered palette image: PLR 2.94, HALIC 0.76), windows 2.23 / 1.65, imessage 1.53 / 1.23. "Zero run" as the 257th
 symbol of the first letter (`qh_enc/exp_zr.py`): gb82-sc −1.42%, screenshot_web −1.25% of the file; it does not close
 that gap — palette / repeated content needs another tool.
+
+## Screen content: hybrid screen mode (2026-11-12, model estimates, not in the codec)
+Cost model (qhsim + runs + zU split), screen tables trained on 12 screens of /tmp/sc, tested on the 12 halic-wins-screen-p6
+(held-out) and CLIC test 39 colour / 39 gray. % vs the format (12 screens 1.8385, CLIC c 8.4241, g 3.8213 bpp).
+- escape (8,2) = 8 ones + EG2 instead of 24 ones + 10 bits (Fable): screens -6.7%, CLIC -0.03 / -0.07%.
+- Fable screen mode (own 32 tables, L = bw(max(sa, sl) >> 4) - 2 - 3, 1 bit per tile): screens -23.5%, CLIC -0.06 / -0.13%.
+- Argon Sparse-Raw (h = 0 if z == 0 else ((z-1) >> Ls) + 1, Ls raw bits only for z > 0), format tables, per-tile Ls: -21.4%.
+- Hybrid = both (Sparse-Raw inside the screen mode, tables retrained for it): H0 (Ls = bw(max(sa,sl)>>4) - 2, no shift)
+  1.3173 bpp (-28.4%); best of H0..H4 / HF3..6 per tile 1.3041 (-29.1%); CLIC -0.06 / -0.12%. HALIC 1.554, PALIC-1 1.543.
+Scripts: qh_enc/exp_sparse_raw.py, exp_hybrid.py, fable_l/ (Fable's lspike*.py, REPORT.md, rounds, hybrid results).

@@ -1,0 +1,13 @@
+gb82sc_imac_dark.ppm         F(8,2) 1.677 T:S3 1.377 T:H2 1.308 T:all 1.296 T:H* 1.296
+gb82sc_imac_g3.ppm           F(8,2) 1.518 T:S3 1.205 T:H2 1.122 T:all 1.105 T:H* 1.104
+gb82sc_imessage.ppm          F(8,2) 1.493 T:S3 1.307 T:H2 1.279 T:all 1.263 T:H* 1.263
+gb82sc_terminal.ppm          F(8,2) 1.225 T:S3 0.971 T:H2 0.932 T:all 0.898 T:H* 0.898
+gb82sc_windows.ppm           F(8,2) 2.061 T:S3 1.682 T:H2 1.548 T:all 1.506 T:H* 1.506
+gb82sc_windows95.ppm         F(8,2) 2.656 T:S3 1.844 T:H2 1.640 T:all 1.494 T:H* 1.494
+qoiweb_duckduckgo.com.ppm    F(8,2) 0.732 T:S3 0.548 T:H2 0.514 T:all 0.490 T:H* 0.490
+qoiweb_en.wikipedia.org.ppm  F(8,2) 3.166 T:S3 2.544 T:H2 2.378 T:all 2.329 T:H* 2.329
+qoiweb_news.ycombinator.com. F(8,2) 1.253 T:S3 0.991 T:H2 0.929 T:all 0.922 T:H* 0.922
+qoiweb_phoboslab.org.ppm     F(8,2) 1.894 T:S3 1.586 T:H2 1.511 T:all 1.501 T:H* 1.501
+qoiweb_stripe.com.ppm        F(8,2) 1.202 T:S3 0.984 T:H2 0.949 T:all 0.922 T:H* 0.922
+qoiweb_sublime.ppm           F(8,2) 1.711 T:S3 1.321 T:H2 1.255 T:all 1.206 T:H* 1.206
+screens12 npx 74967858 F(8,2) 1.7150 T:S2 1.4584 T:S3 1.3996 T:H0 1.3173 T:H1 1.3220 T:H2 1.3273 T:H3 1.3256 T:H4 1.3281 T:HF3 1.3355 T:HF4 1.3476 T:HF5 1.3678 T:HF6 1.3948 T:all 1.3041 T:H* 1.3041
