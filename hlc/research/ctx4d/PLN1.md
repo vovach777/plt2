@@ -477,3 +477,15 @@ not shrink. In-process MB/s enc / dec (8b2c816 -> now, verified): Kodak 565 / 18
 554 / 205 -> 720 / 323, gray 536 / 288 -> 621 / 316. Process wall clock incl. I/O on CLIC 117 (Fable's run):
 colour 401 / 230, gray 285 / 202 MB/s (HALIC 0.7.2: 240 / 152, 272 / 156). Files identical (474 cmp on clang /
 gcc / x86-64-v2, PLF too), ASan + UBSan clean, corrupted files rejected without a crash.
+
+### Screen content (github imazen/codec-corpus v1.1.0; `../sc_convert.py`, process wall clock, all round trips ok)
+
+| set | PLR (QH) | PLR (RLGR) | PLF | PLN2 | HALIC 0.7.2 | HALIC FAST | PNG (as shipped) |
+|---|---|---|---|---|---|---|---|
+| gb82-sc, 10 screenshots | 1.3433 | 1.2955 | 1.3537 | 1.3469 | **1.1844** | 1.4457 | 0.78 |
+| qoi screenshot_web, 14 pages | 2.0392 | **1.9603** | 2.0078 | 2.0787 | 2.0466 | 2.3042 | 2.83 (incl. alpha) |
+
+PLR enc / dec 651 / 440 and 787 / 403 MB/s there. HALIC's lead on gb82-sc comes from a few files: windows95 (a
+dithered palette image: PLR 2.94, HALIC 0.76), windows 2.23 / 1.65, imessage 1.53 / 1.23. "Zero run" as the 257th
+symbol of the first letter (`qh_enc/exp_zr.py`): gb82-sc −1.42%, screenshot_web −1.25% of the file; it does not close
+that gap — palette / repeated content needs another tool.
