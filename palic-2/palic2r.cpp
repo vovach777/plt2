@@ -199,8 +199,16 @@ static void resid_row0(const uint8_t* __restrict r, uint16_t* __restrict z, int 
     z[0] = zz8(r[0]);
     for (int x = 1; x < w; ++x) z[x] = zz8(r[x] - r[x - 1]);
 }
+// Research only (dump builds): -DPLR_PRED=1 replaces MED by W (left) in the residuals of the old encoder path, to
+// cost other predictors on dumps (../hlc/research/qh_enc/exp_pred.py). Not a format: the decoder still uses MED.
+#if defined(PLR_PRED) && !defined(PLR_DUMP)
+#error "PLR_PRED is for dump builds only"
+#endif
 static void resid_row(const uint8_t* __restrict r, const uint8_t* __restrict up, uint16_t* __restrict z, int w) {
     z[0] = zz8(r[0] - up[0]);
+#if defined(PLR_PRED) && PLR_PRED == 1
+    for (int x = 1; x < w; ++x) z[x] = zz8(r[x] - r[x - 1]); return;
+#endif
     for (int x = 1; x < w; ++x) {
         const int a = r[x - 1], b = up[x], c = up[x - 1], mn = a < b ? a : b, mx = a < b ? b : a;
         int p = a + b - c; p = p < mn ? mn : p; p = p > mx ? mx : p;
@@ -749,6 +757,9 @@ static void resid16_row0(const int16_t* __restrict r, uint16_t* __restrict z, in
 }
 static void resid16_row(const int16_t* __restrict r, const int16_t* __restrict up, uint16_t* __restrict z, int w) {
     z[0] = zz16(wrap9(r[0] - up[0]));
+#if defined(PLR_PRED) && PLR_PRED == 1
+    for (int x = 1; x < w; ++x) z[x] = zz16(wrap9(r[x] - r[x - 1])); return;
+#endif
     for (int x = 1; x < w; ++x) z[x] = zz16(wrap9(r[x] - med(r[x - 1], up[x], up[x - 1])));
 }
 static void tile_enc16(const int16_t* img, int tw, int th, const Cfg& c, Out& o, std::vector<uint8_t>& tmp) {
