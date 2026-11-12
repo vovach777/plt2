@@ -467,3 +467,13 @@ joining of the 16 codes of a block, branchless zU split (`tb_put16`), one loop p
 In-process encode, AVX2 (decode unchanged): Kodak 146 -> 551, CLIC 117 colour 172 -> 542, gray 188 -> 548 MB/s;
 without AVX2 (x86-64-v2) ~2x. Files identical on every set (clang, gcc, x86-64-v2; PLF too). The front end
 (RCT + MED) is now ~40% of the encoder.
+
+### Second round (Claude Fable): front end and decoder, byte-identical
+
+Encoder: one pass over the rows of a tile (RCT -> MED of Y, U, V -> S) with vector MED, prefetch 4 rows ahead
+(tile rows are short strided runs). Decoder: branchless zU split (`tb_get16`; the old one had ~8 mispredicts per S
+block), one rare refill check for the tails, 4 planes per window. `c` reads the input again only when the file did
+not shrink. In-process MB/s enc / dec (8b2c816 -> now, verified): Kodak 565 / 182 -> 700 / 304, CLIC 117 colour
+554 / 205 -> 720 / 323, gray 536 / 288 -> 621 / 316. Process wall clock incl. I/O on CLIC 117 (Fable's run):
+colour 401 / 230, gray 285 / 202 MB/s (HALIC 0.7.2: 240 / 152, 272 / 156). Files identical (474 cmp on clang /
+gcc / x86-64-v2, PLF too), ASan + UBSan clean, corrupted files rejected without a crash.

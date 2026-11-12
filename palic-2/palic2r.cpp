@@ -474,10 +474,58 @@ static void qh_plane_enc(const uint16_t* z, const uint16_t* a, size_t nb, int tw
 #define QZ_ENC(z, i, nb)
 #define QZ_DEC(z, i, nb)
 #endif
+#if defined(PLR_QH) && defined(PLR_VEC) && !defined(PLR_DUMP) && !defined(PLR_OLD_ENC)
+#define PLR_FRONT 1
+// Encoder front end by rows (PLR): the tile is read once; every row goes to int16 lines (cur / up, with one zero sample
+// before x = 0 and a zero line above row 0, which make the first column and the first row the ordinary MED), and the
+// residuals of 16 pixels are one vector step. BITS = 8: Y (zz8 of the difference mod 256), 9: U, V (zz16 of wrap9).
+// Reads / writes up to 15 samples past w (the lines and the z planes have the room; the next row overwrites them).
+static constexpr int PF = 4;                         // rows ahead
+template <int BITS> static inline void med_row16(const int16_t* r, const int16_t* up, uint16_t* z, int w) {
+    for (int x = 0; x < w; x += 16) {
+        v16s a, b, c, v; memcpy(&a, r + x - 1, 32); memcpy(&v, r + x, 32); memcpy(&b, up + x, 32); memcpy(&c, up + x - 1, 32);
+        const v16s mn = a < b ? a : b, mx = a < b ? b : a; v16s p = a + b - c; p = p < mn ? mn : p; p = p > mx ? mx : p;
+        const v16s e = (v16s)((v16u)(v - p) << (16 - BITS)) >> (16 - BITS);                 // mod 2^BITS, signed
+        const v16u zz = ((v16u)e << 1) ^ (v16u)(e >> 15); memcpy(z + x, &zz, 32);
+    }
+}
+struct FrontLines { UBuf<int16_t> b; int16_t* l[6];                                         // 3 planes x (cur, up)
+    void init(int tw) { const size_t n = size_t(tw) + 48; b.need(6 * n); std::fill(b.data(), b.data() + 6 * n, int16_t(0)); for (int i = 0; i < 6; ++i) l[i] = b.data() + size_t(i) * n + 16; } };
+static void front_gray(const uint8_t* img, int S, int tw, int th, uint16_t* z) {
+    static thread_local FrontLines f; f.init(tw); int16_t* cur = f.l[0]; int16_t* up = f.l[1];
+    for (int y = 0; y < th; ++y) { const uint8_t* __restrict r = img + size_t(y) * S; int16_t* __restrict q = cur;
+        if (y + PF < th) for (int x = 0; x < tw; x += 64) __builtin_prefetch(r + size_t(PF) * S + x);
+        for (int x = 0; x < tw; ++x) q[x] = r[x];
+        med_row16<8>(cur, up, z + size_t(y) * tw, tw); std::swap(cur, up); }
+}
+// colour: RCT + the three residual planes + S = zU + zV in one pass over the rows (zy, zu, S: nb * 16 + 16 samples)
+static void front_rgb(const uint8_t* rgb, int W, int tw, int th, uint16_t* zy, uint16_t* zu, uint16_t* S) {
+    static thread_local FrontLines f; static thread_local UBuf<uint16_t> zvb; f.init(tw); zvb.need(size_t(tw) + 32); uint16_t* zv = zvb.data();
+    int16_t* yc = f.l[0]; int16_t* yu = f.l[1]; int16_t* uc = f.l[2]; int16_t* uu = f.l[3]; int16_t* vc = f.l[4]; int16_t* vu = f.l[5]; int bad = 0;
+    for (int y = 0; y < th; ++y) {
+        const uint8_t* __restrict p = rgb + size_t(y) * W * 3; int16_t* __restrict py = yc; int16_t* __restrict pu = uc; int16_t* __restrict pv = vc;
+        if (y + PF < th) for (int x = 0; x < tw * 3; x += 64) __builtin_prefetch(p + size_t(PF) * W * 3 + x);   // a tile row is a short run: help the prefetcher
+        for (int x = 0; x < tw; ++x) {
+            int r = p[3 * x], g = p[3 * x + 1], b = p[3 * x + 2];
+            int u = r - g, v = b - g, yy = g + ((u + v + 2) >> 2); v -= u >> 2;
+            bad |= yy; py[x] = int16_t(yy); pu[x] = int16_t(u); pv[x] = int16_t(v);
+        }
+        const size_t o = size_t(y) * tw;
+        med_row16<8>(yc, yu, zy + o, tw); med_row16<9>(uc, uu, zu + o, tw); med_row16<9>(vc, vu, zv, tw);
+        for (int x = 0; x < tw; x += 16) { v16u a, b; memcpy(&a, zu + o + x, 32); memcpy(&b, zv + x, 32); a += b; memcpy(S + o + x, &a, 32); }
+        std::swap(yc, yu); std::swap(uc, uu); std::swap(vc, vu);
+    }
+    if (unsigned(bad) > 255) throw std::runtime_error("Y out of range");
+}
+#endif
 static void tile_enc(const uint8_t* img, int S, int tw, int th, const Cfg& c, Out& o, std::vector<uint8_t>& tmp) {
     const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
     static thread_local UBuf<uint16_t> zb, hb[8], plb;
-    zb.need(nb * 16 + 16); uint16_t* z = zb.data(); std::fill(z + n, z + nb * 16 + 16, uint16_t(0));
+    zb.need(nb * 16 + 16); uint16_t* z = zb.data();
+#if defined(PLR_FRONT)
+    if (!g_sink->pair_mask) { front_gray(img, S, tw, th, z); std::fill(z + n, z + nb * 16 + 16, uint16_t(0)); qh_plane_enc(z, nullptr, nb, tw, c.off); return; }
+#endif
+    std::fill(z + n, z + nb * 16 + 16, uint16_t(0));
     resid_row0(img, z, tw);
     for (int y = 1; y < th; ++y) resid_row(img + size_t(y) * S, img + size_t(y - 1) * S, z + size_t(y) * tw, tw);
 #if defined(PLR_QH) && !defined(PLR_DUMP) && !defined(PLR_OLD_ENC)
@@ -771,6 +819,48 @@ static inline void tb_put(RRawW* w, uint32_t a, uint32_t s2) {
     const int k = 31 - __builtin_clz(s2 + 1); const uint32_t u = (2u << k) - (s2 + 1);
     w->reserve(k + 1); if (a < u) { if (k) RAW_PUT(w, k, a); } else RAW_PUT(w, k + 1, a + u);
 }
+#if PLR_LAYOUT == 3
+// 16 x tb_get without a branch per symbol; 16, 8 or 4 symbols per window, by the most bits they can take (k + 1 each).
+// top = the first k + 1 bits; the code has k + 1 bits when its first k bits are >= u, i.e. top >= 2u.
+static inline void tb_get16(rlgrl::LaneR& r, const uint16_t* S, uint16_t* a, uint16_t* b) {
+    uint64_t pos = r.head;
+#if defined(__AVX2__)                               // k, u and the values by vectors; the scalar chain only finds the code ends
+    alignas(32) uint32_t kv[16], u2[16], tp[16]; __m256i sv[2], uv[2]; unsigned nh[2];
+    for (int g = 0; g < 2; ++g) { const __m256i s2 = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(S + 8 * g))), s1 = _mm256_add_epi32(s2, _mm256_set1_epi32(1));
+        const __m256i k = _mm256_sub_epi32(_mm256_srli_epi32(_mm256_castps_si256(_mm256_cvtepi32_ps(s1)), 23), _mm256_set1_epi32(127));
+        const __m256i u = _mm256_sub_epi32(_mm256_sllv_epi32(_mm256_set1_epi32(2), k), s1);
+        _mm256_store_si256((__m256i*)(kv + 8 * g), k); _mm256_store_si256((__m256i*)(u2 + 8 * g), _mm256_add_epi32(u, u)); sv[g] = s2; uv[g] = u;
+        const __m256i q = _mm256_sad_epu8(k, _mm256_setzero_si256()); const __m128i q2 = _mm_add_epi64(_mm256_castsi256_si128(q), _mm256_extracti128_si256(q, 1));
+        nh[g] = 8 + unsigned(_mm_cvtsi128_si32(q2)) + unsigned(_mm_extract_epi32(q2, 2)); }
+    const int step = nh[0] + nh[1] <= 64 ? 16 : ((nh[0] <= 64) & (nh[1] <= 64)) ? 8 : 4;   // symbols per window, by the most bits they can take
+    for (int g = 0; g < 16; g += step) { uint64_t w = r.peek_at(pos); unsigned used = 0;
+        for (int j = g; j < g + step; ++j) { const uint32_t k = kv[j], top = uint32_t(w >> (63 - k)); tp[j] = top;
+            const uint32_t n = k + (top >= u2[j]); w <<= n; used += n; }
+        pos += used; }
+    __m256i xv[2];
+    for (int g = 0; g < 2; ++g) { const __m256i top = _mm256_load_si256((const __m256i*)(tp + 8 * g)), ge = _mm256_cmpgt_epi32(_mm256_add_epi32(top, _mm256_set1_epi32(1)), _mm256_add_epi32(uv[g], uv[g]));
+        xv[g] = _mm256_blendv_epi8(_mm256_srli_epi32(top, 1), _mm256_sub_epi32(top, uv[g]), ge); }
+    const __m256i x16 = _mm256_permute4x64_epi64(_mm256_packus_epi32(xv[0], xv[1]), 0xD8), s16 = _mm256_loadu_si256((const __m256i*)S);
+    _mm256_storeu_si256((__m256i*)a, x16); _mm256_storeu_si256((__m256i*)b, _mm256_sub_epi16(s16, x16));
+#else
+    uint8_t kk[16]; unsigned na = 8, nb = 8;                                             // na, nb: most bits of each half
+    for (int j = 0; j < 8; ++j) { kk[j] = uint8_t(31 - __builtin_clz(uint32_t(S[j]) + 1)); na += kk[j]; kk[j + 8] = uint8_t(31 - __builtin_clz(uint32_t(S[j + 8]) + 1)); nb += kk[j + 8]; }
+    const int step = na + nb <= 64 ? 16 : ((na <= 64) & (nb <= 64)) ? 8 : 4;             // symbols per window
+    for (int g = 0; g < 16; g += step) { uint64_t w = r.peek_at(pos); unsigned used = 0;
+        for (int j = g; j < g + step; ++j) { const uint32_t s2 = S[j], s1 = s2 + 1, k = kk[j], u = (2u << k) - s1;
+            const uint32_t top = uint32_t(w >> (63 - k));
+#if defined(__clang__)                              // two selects (clang makes cmov; gcc would jump: arithmetic instead)
+            const bool ge = top >= 2 * u; const uint64_t w0 = w << k, w1 = w << (k + 1);
+            const uint32_t x = __builtin_unpredictable(ge) ? top - u : top >> 1; w = __builtin_unpredictable(ge) ? w1 : w0; used += k + ge;
+#else
+            const uint32_t ge = top >= 2 * u, n = k + ge, x = (top >> (1 - ge)) - (u & (0u - ge)); w <<= n; used += n;
+#endif
+            a[j] = uint16_t(x); b[j] = uint16_t(s2 - x); }
+        pos += used; }
+#endif
+    r.head = pos;
+}
+#endif
 static inline uint32_t tb_get(RRawR* r, uint32_t s2) {
     const int k = 31 - __builtin_clz(s2 + 1); const uint32_t u = (2u << k) - (s2 + 1); r->reserve(k + 1);
     uint32_t a = k ? RAW_GET(r, k) : 0; if (a >= u) a = ((a << 1) | RAW_GET(r, 1)) - u; return a;
@@ -814,8 +904,12 @@ static void tile_dec_uv(int16_t* U, int16_t* V, int tw, int th, const Cfg& c) {
         const int L = causal_L(S, i, tw, c.off + PLR_UVOFF);
         if (qz_dec_uv(zl, S, a, b, i, nb)) continue;
         g_src->block(L, S + i * 16);
+#if PLR_LAYOUT == 3 && !defined(PLR_RAWSPLIT) && !defined(PLR_OLD_DEC)
+        tb_get16(*g_src->raw, S + i * 16, a + i * 16, b + i * 16);
+#else
         for (int j = 0; j < 16; ++j) { const size_t p = i * 16 + j; const uint32_t s2 = S[p];
             const uint32_t x = s2 ? tb_get(g_src->raw, s2) : 0; a[p] = uint16_t(x); b[p] = uint16_t(s2 - x); }
+#endif
     }
 #if defined(PLR_VEC) && !defined(PLN_ROWS)
     recon_wave<true>(U, tw, tw, th, a); recon_wave<true>(V, tw, tw, th, b);
@@ -855,6 +949,19 @@ std::vector<uint8_t> compress_rgb(const uint8_t* rgb, int W, int H, const Cfg& c
     const size_t lens = o.b.size(); o.b.resize(lens + size_t(nt) * 4);
     for (int i = 0; i < nt; ++i) {
         const size_t b = o.b.size();
+#if defined(PLR_FRONT)
+        if (!c.fast) {                                 // PLR: one pass over the tile's rows, then the two planes
+            static thread_local UBuf<uint16_t> zy, zu, zs; const int tw = g.tw(i), th = g.th(i); const size_t n = size_t(tw) * th, nb = (n + 15) / 16, m = nb * 16 + 16;
+            zy.need(m); zu.need(m); zs.need(m);
+            front_rgb(rgb + (size_t(g.ty(i)) * W + g.tx(i)) * 3, W, tw, th, zy.data(), zu.data(), zs.data());
+            std::fill(zy.data() + n, zy.data() + m, uint16_t(0)); std::fill(zu.data() + n, zu.data() + m, uint16_t(0)); std::fill(zs.data() + n, zs.data() + m, uint16_t(0));
+            TileEnc te(3, n * 3); for (auto& k : te.sk) k.pair_mask = 0;
+            te.sk[1].pid = 1; te.sk[2].pid = 2; g_sink = &te.sk[0]; qh_plane_enc(zy.data(), nullptr, nb, tw, c.off);
+            g_sink = &te.sk[1]; qh_plane_enc(zs.data(), zu.data(), nb, tw, c.off + PLR_UVOFF);
+            te.finish(o);
+            const uint32_t l = uint32_t(o.b.size() - b); memcpy(&o.b[lens + size_t(i) * 4], &l, 4); continue;
+        }
+#endif
         rgb_split(rgb + (size_t(g.ty(i)) * W + g.tx(i)) * 3, W, g.tw(i), g.th(i), Y, U, V);
         TileEnc te(3, size_t(g.tw(i)) * g.th(i) * 3); for (auto& k : te.sk) k.pair_mask = c.fast ? PLR_FAST_MASK : 0;
         te.sk[1].pid = 1; te.sk[2].pid = 2; g_sink = &te.sk[0]; tile_enc(Y.data(), g.tw(i), g.tw(i), g.th(i), c, o, tmp);
@@ -934,8 +1041,9 @@ int main(int argc, char** argv) {
             auto o = rgb ? compress_rgb(px.data(), W, H, c) : compress(px.data(), W, H, c);
             // not smaller than the input file: store the input file itself (a P5/P6 text header like ours);
             // the decoder sees "P5"/"P6" instead of "PLN" and just copies the file
-            auto src = read_bin(pos[0]);
-            if (!src.empty() && o.size() >= src.size()) o.swap(src);
+            std::error_code ec; const auto fsz = std::filesystem::file_size(pos[0], ec);      // read the input again only if it is stored
+            if (ec || o.size() >= fsz) { auto src = read_bin(pos[0]);
+                if (!src.empty() && o.size() >= src.size()) o.swap(src); }
 #if defined(RLGR_STATS) && !defined(PLR_LLRICE)
             fprintf(stderr, "STATS %zu %llu %llu %llu %llu %llu %d\n", o.size(), (unsigned long long)rlgrf::g_payload, (unsigned long long)rlgrf::g_waste_full, (unsigned long long)rlgrf::g_nfull, (unsigned long long)rlgrf::g_waste_flush, (unsigned long long)rlgrf::g_nruns, (W + 287) / 288 * ((H + 287) / 288));
             fprintf(stderr, "SIMB %llu %llu %llu\n", (unsigned long long)rlgrf::g_head, (unsigned long long)rlgrf::g_nshrink, (unsigned long long)rlgrf::g_lost_b);

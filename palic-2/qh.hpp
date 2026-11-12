@@ -153,14 +153,20 @@ __attribute__((always_inline)) static inline void qh_dec_block(LaneR& s, uint32_
     uint64_t pos = s.head; uint64_t w = s.peek_at(pos); int used = 0; uint32_t em = 0;       // local window: w = bits from pos + used
     for (int q = 0; q < 4; ++q) { const uint32_t e = T[w >> (64 - ML)]; const int ln = int(e >> 8); const uint32_t l = e & 255;
         memcpy(h + 4 * q, &expand[l], 8); em |= uint32_t(escmask[l]) << (4 * q); w <<= ln; used += ln; }
+    // tails: the only test per tail is "the code ends inside the window" (rare miss: refill and read it again)
     if (em) { const uint32_t k = rk[t];
         do { const int j = __builtin_ctz(em); em &= em - 1;
-            if (__builtin_expect(used > 64 - (QESC + 10), 0)) { pos += uint64_t(used); w = s.peek_at(pos); used = 0; }
-            const int q = __builtin_clzll(~w | 1);                                           // leading ones
-            if (__builtin_expect(q >= QESC, 0)) { h[j] = uint16_t(3 + uint32_t((w << QESC) >> 54)); w <<= QESC + 10; used += QESC + 10; }
-            else { const uint32_t low = uint32_t((w << (q + 1)) >> 1 >> (63 - k)); const int n = q + 1 + int(k); h[j] = uint16_t(3 + ((uint32_t(q) << k) | low)); w <<= n; used += n; }
+            int q = __builtin_clzll(~w | 1);                                                 // leading ones
+            if (__builtin_expect((q >= QESC) | (used + q + 1 + int(k) > 64), 0)) {
+                pos += uint64_t(used); w = s.peek_at(pos); used = 0; q = __builtin_clzll(~w | 1);
+                if (q >= QESC) { h[j] = uint16_t(3 + uint32_t((w << QESC) >> 54)); w <<= QESC + 10; used += QESC + 10; continue; } }
+            const uint32_t low = uint32_t((w << q) >> (63 - k)); const int n = q + 1 + int(k); h[j] = uint16_t(3 + ((uint32_t(q) << k) | low)); w <<= n; used += n;   // (w << q): the 0 that ends the ones, then the k low bits
         } while (em); }
-    for (int p = 0; p < L; ++p) { if (used > 48) { pos += uint64_t(used); w = s.peek_at(pos); used = 0; } m[p] = uint16_t(w >> 48); w <<= 16; used += 16; }
+    // planes: 4 per window at fixed places (m[p], p >= L: not used by the caller)
+    if (L) { if ((L >= 2) | (used > 48)) { pos += uint64_t(used); w = s.peek_at(pos); used = 0; }      // L = 1 mostly fits the window
+        m[0] = uint16_t(w >> 48); m[1] = uint16_t(w >> 32); m[2] = uint16_t(w >> 16); m[3] = uint16_t(w);
+        if (L > 4) { pos += 64; w = s.peek_at(pos); m[4] = uint16_t(w >> 48); m[5] = uint16_t(w >> 32); m[6] = uint16_t(w >> 16); m[7] = uint16_t(w); used = 16 * (L - 4); }
+        else used += 16 * L; }
     s.head = pos + uint64_t(used);
 }
 }  // namespace qh
