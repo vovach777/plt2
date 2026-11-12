@@ -33,6 +33,9 @@
 #if defined(PLN_SSE)
 #include <smmintrin.h>
 #endif
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 extern "C" {
 #define FSE_STATIC_LINKING_ONLY
 #include "fse.h"
@@ -432,6 +435,39 @@ static inline bool qz_dec(size_t& left, uint16_t* zb, size_t i, size_t nb) {
     }
     --left; memset(zb, 0, 32); return true;
 }
+// The encoder loop of one plane (PLR): the same bits as QZ_ENC + block_split + Sink::block (+ tb_put), written
+// through the register writer. a != nullptr: the S plane, a = zU, split after every coded block.
+static inline void tb_put16(rlgrl::LaneW& w, const uint16_t* a, const uint16_t* S) {     // 16 x tb_put, no branch per symbol: 4 (AVX2: 8 if they fit) per put
+#if defined(__AVX2__)
+    for (int g = 0; g < 16; g += 8) {
+        const __m256i s1 = _mm256_add_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(S + g))), _mm256_set1_epi32(1));
+        const __m256i x = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(a + g)));
+        const __m256i k = _mm256_sub_epi32(_mm256_srli_epi32(_mm256_castps_si256(_mm256_cvtepi32_ps(s1)), 23), _mm256_set1_epi32(127));   // floor(log2(s1)), s1 < 2^24
+        const __m256i u = _mm256_sub_epi32(_mm256_sllv_epi32(_mm256_set1_epi32(2), k), s1);
+        const __m256i ge = _mm256_cmpgt_epi32(x, _mm256_sub_epi32(u, _mm256_set1_epi32(1)));                                             // x >= u
+        uint64_t c0, c1; unsigned n0, n1;
+        rlgrl::vl_join8(_mm256_add_epi32(x, _mm256_and_si256(u, ge)), _mm256_sub_epi32(k, ge), c0, n0, c1, n1);
+        if (__builtin_expect(n0 + n1 <= 63, 1)) w.put(n0 + n1, c0 << n1 | c1); else { w.put(n0, c0); w.put(n1, c1); } }
+    return;
+#endif
+    for (int g = 0; g < 16; g += 4) { uint64_t acc = 0; unsigned n = 0;
+        for (int j = g; j < g + 4; ++j) { const uint32_t s1 = uint32_t(S[j]) + 1, k = uint32_t(31 - __builtin_clz(s1)), u = (2u << k) - s1, x = a[j], ge = x >= u;
+            acc = (acc << (k + ge)) | (x + (u & (0u - ge))); n += k + ge; }
+        w.put(n, acc); }
+}
+static void qh_plane_enc(const uint16_t* z, const uint16_t* a, size_t nb, int tw, int off) {
+    rlgrl::LaneW w(*g_sink->raw); const uint32_t pt = g_sink->pid ? 1u : 0u; size_t left = 0;
+    for (size_t i = 0; i < nb; ++i) {
+        if (left) { --left; continue; }
+        const int L = causal_L(z, i, tw, off); w.room();
+        if (!g_sa) { size_t n = 0; while (i + n < nb && blk_zero(z + (i + n) * 16)) ++n;
+            const uint64_t v = n + 1; const int b = int(64 - __builtin_clzll(v)); w.put(unsigned(2 * b - 1), v);
+            if (n) { left = n - 1; continue; } }
+        qh::qh_enc_block_w(w, pt, g_sa, L, z + i * 16);
+        if (a) tb_put16(w, a + i * 16, z + i * 16);
+    }
+    w.sync();
+}
 #define QZ_ENC(z, i, nb) if (qz_enc(zl, z, i, nb)) continue
 #define QZ_DEC(z, i, nb) if (qz_dec(zl, (z) + (i) * 16, i, nb)) continue
 #else
@@ -444,6 +480,9 @@ static void tile_enc(const uint8_t* img, int S, int tw, int th, const Cfg& c, Ou
     zb.need(nb * 16 + 16); uint16_t* z = zb.data(); std::fill(z + n, z + nb * 16 + 16, uint16_t(0));
     resid_row0(img, z, tw);
     for (int y = 1; y < th; ++y) resid_row(img + size_t(y) * S, img + size_t(y - 1) * S, z + size_t(y) * tw, tw);
+#if defined(PLR_QH) && !defined(PLR_DUMP) && !defined(PLR_OLD_ENC)
+    if (!g_sink->pair_mask) { qh_plane_enc(z, nullptr, nb, tw, c.off); return; }
+#endif
     plb.need(nb * 8); uint16_t* pw = plb.data(); size_t hn[8] = {0};
     for (auto& h : hb) h.need(nb * 16);
     size_t zl = 0; (void)zl;
@@ -746,6 +785,9 @@ static void tile_enc_uv(const int16_t* U, const int16_t* V, int tw, int th, cons
                                    resid16_row(V + size_t(y) * tw, V + size_t(y - 1) * tw, b + size_t(y) * tw, tw); }
     for (size_t p = 0; p < n; ++p) S[p] = uint16_t(a[p] + b[p]);
     std::fill(S + n, S + nb * 16 + 16, uint16_t(0)); std::fill(a + n, a + nb * 16 + 16, uint16_t(0));
+#if defined(PLR_QH) && !defined(PLR_DUMP) && !defined(PLR_OLD_ENC)
+    if (!g_sink->pair_mask) { qh_plane_enc(S, a, nb, tw, c.off + PLR_UVOFF); return; }
+#endif
     plb.need(nb * 8); uint16_t* pw = plb.data(); size_t zl = 0; (void)zl;
     for (size_t i = 0; i < nb; ++i) {
         alignas(32) uint16_t hk[16];
@@ -786,16 +828,17 @@ static void tile_dec_uv(int16_t* U, int16_t* V, int tw, int th, const Cfg& c) {
 #endif
 }
 static void rgb_split(const uint8_t* rgb, int W, int tw, int th, std::vector<uint8_t>& Y, std::vector<int16_t>& U, std::vector<int16_t>& V) {
-    Y.resize(size_t(tw) * th); U.resize(Y.size()); V.resize(Y.size());
+    Y.resize(size_t(tw) * th); U.resize(Y.size()); V.resize(Y.size()); int bad = 0;
     for (int y = 0; y < th; ++y) {
-        const uint8_t* p = rgb + size_t(y) * W * 3;
-        for (int x = 0; x < tw; ++x) {
+        const uint8_t* __restrict p = rgb + size_t(y) * W * 3;
+        uint8_t* __restrict py = Y.data() + size_t(y) * tw; int16_t* __restrict pu = U.data() + size_t(y) * tw; int16_t* __restrict pv = V.data() + size_t(y) * tw;
+        for (int x = 0; x < tw; ++x) {                 // no branch in the loop: it vectorises (the range check is after it)
             int r = p[3 * x], g = p[3 * x + 1], b = p[3 * x + 2];
             int u = r - g, v = b - g, yy = g + ((u + v + 2) >> 2); v -= u >> 2;
-            if (unsigned(yy) > 255) throw std::runtime_error("Y out of range");
-            Y[size_t(y) * tw + x] = uint8_t(yy); U[size_t(y) * tw + x] = int16_t(u); V[size_t(y) * tw + x] = int16_t(v);
+            bad |= yy; py[x] = uint8_t(yy); pu[x] = int16_t(u); pv[x] = int16_t(v);
         }
     }
+    if (unsigned(bad) > 255) throw std::runtime_error("Y out of range");
 }
 static void rgb_join(uint8_t* rgb, int W, int tw, int th, const uint8_t* Y, const int16_t* U, const int16_t* V) {
     for (int y = 0; y < th; ++y) for (int x = 0; x < tw; ++x) {

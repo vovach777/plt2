@@ -15,6 +15,9 @@
 #include <algorithm>
 #include <stdexcept>
 #include "rlgr_fast.hpp"
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 namespace rlgrl {
 using rlgrf::MAX_K; using rlgrf::UP_K; using rlgrf::DOWN_K; using rlgrf::UP_K_DIRECT_RL; using rlgrf::DOWN_K_DIRECT_RL;
@@ -33,6 +36,37 @@ struct Lane {                                       // encoder side: zeroed word
     inline void reserve(int) {}                     // nothing is laid ahead
     inline size_t words() const { return size_t((head + 63) >> 6); }
 };
+// Encoder hot path (QH): the same bits as Lane::put64, through a register. acc = the word under the head (bits from
+// the top), fill = bits used in it. put() has no branch: the word is stored every time, the carry moves by a select.
+// Nothing else may write the lane between the constructor / room() and sync().
+struct LaneW {
+    Lane& l; uint64_t* p; uint64_t* lim; uint64_t acc; unsigned fill;
+    explicit LaneW(Lane& l_) : l(l_) { attach(); }
+    inline void attach() { const size_t i = size_t(l.head >> 6); if (l.w.size() < i + 2 * ROOM) l.w.resize(std::max(i + 2 * ROOM, l.w.size() * 2));
+        p = l.w.data() + i; lim = l.w.data() + l.w.size() - ROOM; acc = *p; fill = unsigned(l.head & 63); }
+    static constexpr size_t ROOM = 24;              // words one block may need (room() once per block; a block < 1024 bits)
+    inline void room() { if (__builtin_expect(p > lim, 0)) { sync(); attach(); } }
+    inline void put(unsigned n, uint64_t v) {       // n = 0..63 bits, v < 2^n
+        const uint64_t top = (v << (63 - n)) << 1, rest = (top << (63 - fill)) << 1;   // rest: the bits past this word
+        const unsigned t = fill + n; const uint64_t x = top >> fill, keep = uint64_t(t >> 6) - 1;   // keep: all ones while t < 64
+        *p = acc | x; p += t >> 6;
+        acc = (acc & keep) | ((x & keep) | rest); fill = t & 63;   // rest = 0 unless t > 64; two operations on the acc chain
+    }
+    inline void sync() { *p = acc; l.head = uint64_t(p - l.w.data()) * 64 + fill; }
+};
+#if defined(__AVX2__)
+// 8 variable-length codes (value v, length n: 32-bit lanes, lane 0 first in the stream) -> 2 codes of 4 lanes each:
+// neighbours are joined as (first << n_second) | second, in 64-bit lanes, twice. The joined code must fit 64 bits.
+static inline void vl_join8(__m256i v, __m256i n, uint64_t& c0, unsigned& n0, uint64_t& c1, unsigned& n1) {
+    const __m256i lo = _mm256_set1_epi64x(0xffffffffll), no = _mm256_srli_epi64(n, 32);
+    __m256i c = _mm256_or_si256(_mm256_sllv_epi64(_mm256_and_si256(v, lo), no), _mm256_srli_epi64(v, 32));
+    __m256i m = _mm256_add_epi64(_mm256_and_si256(n, lo), no);
+    const __m256i mh = _mm256_unpackhi_epi64(m, m);
+    c = _mm256_or_si256(_mm256_sllv_epi64(c, mh), _mm256_unpackhi_epi64(c, c)); m = _mm256_add_epi64(m, mh);   // lanes 0 and 2
+    c0 = uint64_t(_mm_cvtsi128_si64(_mm256_castsi256_si128(c))); c1 = uint64_t(_mm_cvtsi128_si64(_mm256_extracti128_si256(c, 1)));
+    n0 = unsigned(_mm_cvtsi128_si32(_mm256_castsi256_si128(m))); n1 = unsigned(_mm_cvtsi128_si32(_mm256_extracti128_si256(m, 1)));
+}
+#endif
 struct LaneR {                                      // decoder side: one sequential reader for the tile
     const uint64_t* w = nullptr; size_t nw = 0; uint64_t head = 0;   // nw includes 2 zero words of padding
     inline uint64_t peek_at(uint64_t pos) const {

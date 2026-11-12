@@ -459,3 +459,11 @@ except where noted):
 
 PLR is 1.0% (colour) / 0.9% (gray) smaller than HALIC 0.7.2 on held-out CLIC and decodes faster; its encoder is
 ~1.8x slower. Full CLIC with PLN2 (the clic-palic2 repo): colour 8.6320, gray 3.9070 bpp.
+
+### Encoder speed-up (Claude Fable review, byte-identical; `../qh_enc/README.md`)
+
+Branchless register writer (`LaneW`), SSE letters, branchless tails while all codes of a block are <= 15 bits, AVX2
+joining of the 16 codes of a block, branchless zU split (`tb_put16`), one loop per plane, vectorisable `rgb_split`.
+In-process encode, AVX2 (decode unchanged): Kodak 146 -> 551, CLIC 117 colour 172 -> 542, gray 188 -> 548 MB/s;
+without AVX2 (x86-64-v2) ~2x. Files identical on every set (clang, gcc, x86-64-v2; PLF too). The front end
+(RCT + MED) is now ~40% of the encoder.
