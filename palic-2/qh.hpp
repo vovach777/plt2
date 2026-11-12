@@ -28,14 +28,17 @@ static inline uint32_t Qsa(uint32_t sa) {
     const uint32_t e = bw(sa); const uint32_t q = 32 + (e - 6) * 4 + ((sa >> (e - 3)) & 3); return q < 67 ? q : 67;
 }
 static void build_tables();
+#if defined(QH_TABLES_ENV)
 static void load_tables(const char* fn) {        // experiments only (env QH_TABLES with -DQH_TABLES_ENV)
     FILE* f = fopen(fn, "rb"); if (!f) { perror(fn); exit(1); }
-    int hd[4]; if (fread(hd, 4, 4, f) != 4) exit(1); K = hd[0]; ML = hd[1]; NQ = hd[2]; QESC = hd[3];
+    int hd[4]; if (fread(hd, 4, 4, f) != 4) exit(1);
+    K = hd[0]; ML = hd[1]; NQ = hd[2]; QESC = hd[3];
     if (fread(ctxmap, 1, 2 * NQ, f) != size_t(2 * NQ)) exit(1);
     for (int k = 0; k < K; ++k) if (fread(lens[k], 1, 256, f) != 256) exit(1);
-    if (fread(rk, 1, K, f) != size_t(K)) exit(1); fclose(f);
-    build_tables();
+    if (fread(rk, 1, K, f) != size_t(K)) exit(1);
+    fclose(f); build_tables();
 }
+#endif
 static void load_builtin() {                       // the tables of the format (qh_tables.h)
     K = qh_tab::K; ML = qh_tab::ML; NQ = qh_tab::NQ; QESC = qh_tab::QESC;
     memcpy(ctxmap, qh_tab::ctxmap, sizeof qh_tab::ctxmap); memcpy(lens, qh_tab::lens, sizeof qh_tab::lens); memcpy(rk, qh_tab::rk, sizeof qh_tab::rk);

@@ -154,7 +154,7 @@ static void fse4_dec(uint16_t* out, size_t n, const uint8_t* src, size_t c) {
     BIT_reloadDStream(&bd); for (size_t k = 0; i < n; ++i, ++k) { uint32_t e = t[st[k]]; out[i] = uint16_t(e >> 20); st[k] = (e & 0xffff) + uint32_t(BIT_readBits(&bd, (e >> 16) & 15)); }
 #undef C4_DEC1
 }
-static void put_stream(Out& o, const uint16_t* s, size_t n, unsigned A, std::vector<uint8_t>& tmp) {
+[[maybe_unused]] static void put_stream(Out& o, const uint16_t* s, size_t n, unsigned A, std::vector<uint8_t>& tmp) {
     o.var(n); if (!n) return;
     static unsigned cnt[512], c4[4][512]; for (auto& r : c4) memset(r, 0, A * sizeof(unsigned));
     unsigned mx = 0; size_t i = 0;
@@ -167,7 +167,7 @@ static void put_stream(Out& o, const uint16_t* s, size_t n, unsigned A, std::vec
     if (!c || c >= n * 2) { o.u8(0); o.raw(s, n * 2); return; }
     o.u8(6); o.var(c); o.raw(tmp.data(), c);
 }
-static size_t get_stream(In& in, UBuf<uint16_t>& dst) {
+[[maybe_unused]] static size_t get_stream(In& in, UBuf<uint16_t>& dst) {
     size_t n = in.var(); dst.need(n + 2); if (!n) return 0;
     uint8_t mode = in.u8();
     if (mode == 1) { uint16_t v = uint16_t(in.var()); std::fill(dst.data(), dst.data() + n, v); }
@@ -519,6 +519,7 @@ static void front_rgb(const uint8_t* rgb, int W, int tw, int th, uint16_t* zy, u
 }
 #endif
 static void tile_enc(const uint8_t* img, int S, int tw, int th, const Cfg& c, Out& o, std::vector<uint8_t>& tmp) {
+    (void)o; (void)tmp;
     const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
     static thread_local UBuf<uint16_t> zb, hb[8], plb;
     zb.need(nb * 16 + 16); uint16_t* z = zb.data();
@@ -551,9 +552,9 @@ static void tile_enc(const uint8_t* img, int S, int tw, int th, const Cfg& c, Ou
     }
 
 }
-static void unzz_row(const uint16_t* __restrict z, int8_t* __restrict e, int w) { for (int x = 0; x < w; ++x) e[x] = int8_t(int(z[x] >> 1) ^ -int(z[x] & 1)); }
-static void recon_row0(uint8_t* __restrict r, const int8_t* __restrict e, int w) { int v = 0; for (int x = 0; x < w; ++x) { v = uint8_t(v + e[x]); r[x] = uint8_t(v); } }
-static void recon_row(uint8_t* __restrict r, const uint8_t* __restrict up, const int8_t* __restrict e, int w) {
+[[maybe_unused]] static void unzz_row(const uint16_t* __restrict z, int8_t* __restrict e, int w) { for (int x = 0; x < w; ++x) e[x] = int8_t(int(z[x] >> 1) ^ -int(z[x] & 1)); }
+[[maybe_unused]] static void recon_row0(uint8_t* __restrict r, const int8_t* __restrict e, int w) { int v = 0; for (int x = 0; x < w; ++x) { v = uint8_t(v + e[x]); r[x] = uint8_t(v); } }
+[[maybe_unused]] static void recon_row(uint8_t* __restrict r, const uint8_t* __restrict up, const int8_t* __restrict e, int w) {
     int a = uint8_t(up[0] + e[0]); r[0] = uint8_t(a);
     for (int x = 1; x < w; ++x) {
         const int b = up[x], c = up[x - 1], mn = a < b ? a : b, mx = a < b ? b : a;
@@ -751,6 +752,7 @@ static void resid16_row(const int16_t* __restrict r, const int16_t* __restrict u
     for (int x = 1; x < w; ++x) z[x] = zz16(wrap9(r[x] - med(r[x - 1], up[x], up[x - 1])));
 }
 static void tile_enc16(const int16_t* img, int tw, int th, const Cfg& c, Out& o, std::vector<uint8_t>& tmp) {
+    (void)o; (void)tmp;
     const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
     static thread_local UBuf<uint16_t> zb, hb[8], plb;
     zb.need(nb * 16 + 16); uint16_t* z = zb.data(); std::fill(z + n, z + nb * 16 + 16, uint16_t(0));
@@ -776,8 +778,8 @@ static void tile_enc16(const int16_t* img, int tw, int th, const Cfg& c, Out& o,
     }
 
 }
-static void recon16_row0(int16_t* r, const int16_t* e, int w) { int v = 0; for (int x = 0; x < w; ++x) { v = fold9(v + e[x]); r[x] = int16_t(v); } }
-static void recon16_row(int16_t* r, const int16_t* up, const int16_t* e, int w) {
+[[maybe_unused]] static void recon16_row0(int16_t* r, const int16_t* e, int w) { int v = 0; for (int x = 0; x < w; ++x) { v = fold9(v + e[x]); r[x] = int16_t(v); } }
+[[maybe_unused]] static void recon16_row(int16_t* r, const int16_t* up, const int16_t* e, int w) {
     int a = fold9(up[0] + e[0]); r[0] = int16_t(a);
     for (int x = 1; x < w; ++x) { a = fold9(med(a, up[x], up[x - 1]) + e[x]); r[x] = int16_t(a); }
 }
@@ -825,11 +827,11 @@ static inline void tb_put(RRawW* w, uint32_t a, uint32_t s2) {
 static inline void tb_get16(rlgrl::LaneR& r, const uint16_t* S, uint16_t* a, uint16_t* b) {
     uint64_t pos = r.head;
 #if defined(__AVX2__)                               // k, u and the values by vectors; the scalar chain only finds the code ends
-    alignas(32) uint32_t kv[16], u2[16], tp[16]; __m256i sv[2], uv[2]; unsigned nh[2];
+    alignas(32) uint32_t kv[16], u2[16], tp[16]; __m256i uv[2]; unsigned nh[2];
     for (int g = 0; g < 2; ++g) { const __m256i s2 = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(S + 8 * g))), s1 = _mm256_add_epi32(s2, _mm256_set1_epi32(1));
         const __m256i k = _mm256_sub_epi32(_mm256_srli_epi32(_mm256_castps_si256(_mm256_cvtepi32_ps(s1)), 23), _mm256_set1_epi32(127));
         const __m256i u = _mm256_sub_epi32(_mm256_sllv_epi32(_mm256_set1_epi32(2), k), s1);
-        _mm256_store_si256((__m256i*)(kv + 8 * g), k); _mm256_store_si256((__m256i*)(u2 + 8 * g), _mm256_add_epi32(u, u)); sv[g] = s2; uv[g] = u;
+        _mm256_store_si256((__m256i*)(kv + 8 * g), k); _mm256_store_si256((__m256i*)(u2 + 8 * g), _mm256_add_epi32(u, u)); uv[g] = u;
         const __m256i q = _mm256_sad_epu8(k, _mm256_setzero_si256()); const __m128i q2 = _mm_add_epi64(_mm256_castsi256_si128(q), _mm256_extracti128_si256(q, 1));
         nh[g] = 8 + unsigned(_mm_cvtsi128_si32(q2)) + unsigned(_mm_extract_epi32(q2, 2)); }
     const int step = nh[0] + nh[1] <= 64 ? 16 : ((nh[0] <= 64) & (nh[1] <= 64)) ? 8 : 4;   // symbols per window, by the most bits they can take
@@ -861,7 +863,7 @@ static inline void tb_get16(rlgrl::LaneR& r, const uint16_t* S, uint16_t* a, uin
     r.head = pos;
 }
 #endif
-static inline uint32_t tb_get(RRawR* r, uint32_t s2) {
+[[maybe_unused]] static inline uint32_t tb_get(RRawR* r, uint32_t s2) {
     const int k = 31 - __builtin_clz(s2 + 1); const uint32_t u = (2u << k) - (s2 + 1); r->reserve(k + 1);
     uint32_t a = k ? RAW_GET(r, k) : 0; if (a >= u) a = ((a << 1) | RAW_GET(r, 1)) - u; return a;
 }
@@ -1014,7 +1016,8 @@ static void write_netpbm(const std::string& fn, const std::vector<uint8_t>& img,
 static std::vector<uint8_t> read_bin(const std::string& fn) {
     FILE* fp = fopen(fn.c_str(), "rb"); if (!fp) return {};
     fseek(fp, 0, SEEK_END); std::vector<uint8_t> b(ftell(fp)); fseek(fp, 0, SEEK_SET);
-    if (fread(b.data(), 1, b.size(), fp) != b.size()) b.clear(); fclose(fp); return b;
+    if (fread(b.data(), 1, b.size(), fp) != b.size()) b.clear();
+    fclose(fp); return b;
 }
 
 int main(int argc, char** argv) {
