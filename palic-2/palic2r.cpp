@@ -487,20 +487,31 @@ static void qh_plane_enc(const uint16_t* z, const uint16_t* a, size_t nb, int tw
 // the previous block in the first row; 64 for block 0), sl = the sum of the previous block; est = max(sa, sl) picks
 // Ls and the table; the runs of zero blocks as in PLR (at sa == 0).
 static inline uint32_t sum16(const uint16_t* b) { uint32_t s = 0; for (int j = 0; j < 16; ++j) s += b[j]; return s; }
-static inline void scr_ctx(const uint16_t* z, size_t i, int tw, uint32_t& sa, uint32_t& est, int& Ls) {
-    if (!i) { sa = est = 64; Ls = 2; return; }
+static inline void scr_ctx(const uint16_t* z, size_t i, int tw, uint32_t& sa, uint32_t& est) {
+    if (!i) { sa = est = 64; return; }
     const size_t px = i * 16; const uint32_t sl = sum16(z + px - 16);
-    sa = (tw >= 16 && px >= size_t(tw)) ? sum16(z + px - tw) : sl; est = std::max(sa, sl); Ls = qhs::Ls_of(est);
+    sa = (tw >= 16 && px >= size_t(tw)) ? sum16(z + px - tw) : sl; est = std::max(sa, sl);
 }
+// encoder: pass 1 = the exact cost of every variant (the run structure and est do not depend on the variant), then the
+// plane: 3 bits variant, blocks (runs, letters / tails / raw, the zU split of the S plane)
 static void qhs_plane_enc(const uint16_t* z, const uint16_t* a, size_t nb, int tw) {
-    rlgrl::LaneW w(*g_sink->raw); const uint32_t pt = g_sink->pid ? 1u : 0u; size_t left = 0;
-    for (size_t i = 0; i < nb; ++i) {
+    const uint32_t pt = g_sink->pid ? 1u : 0u; uint64_t cost[qhs::NVAR] = {};
+    for (size_t i = 0, left = 0; i < nb; ++i) {
         if (left) { --left; continue; }
-        uint32_t sa, est; int Ls; scr_ctx(z, i, tw, sa, est, Ls); w.room();
+        uint32_t sa, est; scr_ctx(z, i, tw, sa, est);
+        if (!sa) { size_t n = 0; while (i + n < nb && blk_zero(z + (i + n) * 16)) ++n; if (n) { left = n - 1; continue; } }
+        if (blk_zero(z + i * 16)) continue;                // the same 4 zero letters in every variant (one table per est)
+        for (int v = 0; v < qhs::NVAR; ++v) cost[v] += qhs::block_bits(pt, est, qhs::Ls_of(est, v, !i), z + i * 16);
+    }
+    int vb = 0; for (int v = 1; v < qhs::NVAR; ++v) if (cost[v] < cost[vb]) vb = v;
+    rlgrl::LaneW w(*g_sink->raw); w.room(); w.put(qhs::VBITS, uint64_t(vb));
+    for (size_t i = 0, left = 0; i < nb; ++i) {
+        if (left) { --left; continue; }
+        uint32_t sa, est; scr_ctx(z, i, tw, sa, est); w.room();
         if (!sa) { size_t n = 0; while (i + n < nb && blk_zero(z + (i + n) * 16)) ++n;
             const uint64_t v = n + 1; const int b = int(64 - __builtin_clzll(v)); w.put(unsigned(2 * b - 1), v);
             if (n) { left = n - 1; continue; } }
-        qhs::enc_block(w, pt, est, Ls, z + i * 16);
+        qhs::enc_block(w, pt, est, qhs::Ls_of(est, vb, !i), z + i * 16);
         if (a) tb_put16(w, a + i * 16, z + i * 16);
     }
     w.sync();
@@ -508,15 +519,15 @@ static void qhs_plane_enc(const uint16_t* z, const uint16_t* a, size_t nb, int t
 static inline void tb_get16(rlgrl::LaneR& r, const uint16_t* S, uint16_t* a, uint16_t* b);
 static void qhs_plane_dec(uint16_t* z, uint16_t* a, uint16_t* b, size_t nb, int tw) {
     rlgrl::LaneR& r = *g_src->raw; const uint32_t pt = g_src->pid ? 1u : 0u; size_t left = 0;
+    const int vb = int(r.window() >> (64 - qhs::VBITS)); r.skip(qhs::VBITS);
     for (size_t i = 0; i < nb; ++i) {
         uint16_t* zb = z + i * 16;
-        if (!left) { uint32_t sa, est; int Ls; scr_ctx(z, i, tw, sa, est, Ls);
-            if (sa) left = 0;
-            else { const uint64_t wd = r.window(); const int zc = wd ? __builtin_clzll(wd) : 64;
+        if (!left) { uint32_t sa, est; scr_ctx(z, i, tw, sa, est);
+            if (!sa) { const uint64_t wd = r.window(); const int zc = wd ? __builtin_clzll(wd) : 64;
                 if (zc > 30) throw std::runtime_error("zero run code");
                 const uint64_t v = wd >> (63 - 2 * zc); r.skip(2 * zc + 1); left = size_t(v - 1);
                 if (left > nb - i) throw std::runtime_error("zero run too long"); }
-            if (!left) { qhs::dec_block(r, pt, est, Ls, zb);
+            if (!left) { qhs::dec_block(r, pt, est, qhs::Ls_of(est, vb, !i), zb);
                 if (a) tb_get16(r, zb, a + i * 16, b + i * 16);
                 continue; } }
         --left; memset(zb, 0, 32); if (a) { memset(a + i * 16, 0, 32); memset(b + i * 16, 0, 32); }

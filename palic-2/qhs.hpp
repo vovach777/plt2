@@ -22,7 +22,14 @@ static inline uint32_t Qsa(uint32_t sa) {           // = qh::Qsa
     if (sa < 32) return sa;
     const uint32_t e = bw(sa); const uint32_t q = 32 + (e - 6) * 4 + ((sa >> (e - 3)) & 3); return q < 67 ? q : 67;
 }
-static inline int Ls_of(uint32_t est) { return std::min(7, std::max(0, int(bw(est >> 4)) - 2)); }
+// Per plane of a tile the encoder picks one of 8 variants (3 bits at the start of the plane, by the exact bit cost):
+// v = 0..3: Ls = clamp(bw(est >> 4) - 2 + v, 0, 7) (block 0 of the plane: 2 + v); v = 4..7: Ls = v - 1 (fixed 3..6).
+// All variants use the same tables (exp_hybrid_tune.py: -1.44% vs v = 0 alone on the 12 screens).
+static constexpr int NVAR = 8, VBITS = 3;
+static inline int Ls_of(uint32_t est, int v, bool first) {
+    if (v >= 4) return v - 1;
+    return first ? 2 + v : std::min(7, std::max(0, int(bw(est >> 4)) - 2 + v));
+}
 static uint16_t enc_code[K][256]; static std::vector<uint16_t> dect; static uint64_t expand[256]; static uint8_t escmask[256];
 static void init() { static const bool done = [] {
     dect.assign(size_t(K) << ML, 0);
@@ -58,6 +65,17 @@ template <class W> static inline void enc_block(W& s, uint32_t pt, uint32_t est,
         for (int j = 0; j < 16; ++j) if (z[j]) { if (n + Ls > 63) { s.put(n, acc); acc = 0; n = 0; }
             acc = (acc << Ls) | ((z[j] - 1u) & mk); n += Ls; }
         if (n) s.put(n, acc); }
+}
+// the exact size of enc_block in bits
+static inline uint32_t block_bits(uint32_t pt, uint32_t est, int Ls, const uint16_t* z) {
+    const int t = qhs_tab::ctxmap[pt * NQ + Qsa(est)]; const uint32_t k = qhs_tab::rk[t]; const uint8_t* ln = qhs_tab::lens[t];
+    uint32_t bits = 0, nz = 0, l = 0;
+    for (int j = 0; j < 16; ++j) { const uint32_t h = z[j] ? ((z[j] - 1u) >> Ls) + 1 : 0; nz += z[j] != 0;
+        l |= std::min<uint32_t>(h, 3) << (2 * (j & 3));
+        if ((j & 3) == 3) { bits += ln[l]; l = 0; }
+        if (h >= 3) { const uint32_t x = h - 3, q = x >> k;
+            bits += q < uint32_t(ESC) ? q + 1 + k : uint32_t(ESC) + 2 * bw(((x - (uint32_t(ESC) << k)) >> 2) + 1) + 1; } }
+    return bits + nz * uint32_t(Ls);
 }
 // decoder: z = the 16 residuals of the block
 static inline void dec_block(rlgrl::LaneR& r, uint32_t pt, uint32_t est, int Ls, uint16_t* z) {

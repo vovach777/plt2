@@ -514,6 +514,12 @@ Real files (bench -r 1, clang, this sandbox):
 | windows95 green as gray | 2.2650 | 1.2084 | |
 Model (exp_hybrid.py, per-tile switch) 1.3173 vs real 1.3155. Checks: edge sizes (1x1 .. 300x577, noise and sparse),
 gcc build, ASan+UBSan, 180 corrupted PLS files: 154 rejected, the rest decode, 0 crashes.
+Variant tuning (in PLS since 0bdbcaa+1): per plane of a tile 3 bits v, by the exact bit cost (encoder pass 1):
+v = 0..3: Ls = clamp(bw(est >> 4) - 2 + v, 0, 7) (block 0: 2 + v), v = 4..7: Ls = v - 1 fixed; all with the same tables.
+exp_hybrid_tune.py on the 12 screens (vs H0): own tables per variant / plane -1.62% (9 table sets), shared tables:
+8 variants / plane -1.44%, / tile -1.15%; {H0, Hm1, Hm2, HF5} / plane -1.34%; positive d (lower Ls) never wins with
+shared tables. Real files: 1.3155 -> 1.2965 bpp (-1.44%, = the model); encoder 910 -> 280 MB/s (8 costings per block,
+scalar), decoder unchanged (~600 MB/s, -r 3).
 Backlog (not done, by decision): automatic choice PLR / PLS (per file or a per-tile flag, encoder-side costing),
-the variant choice per tile (H0..H4, HF; +0.7 pt in the model), escape (8,2) for PLR, screen tables on a larger corpus
+a faster variant costing (SIMD block_bits, 8 variants at once), escape (8,2) for PLR, screen tables on a larger corpus
 (icons, screenshot_game), a faster PLS encoder / decoder (scalar now), PLS for gray screens is trained on Y only.
