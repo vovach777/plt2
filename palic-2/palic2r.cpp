@@ -204,10 +204,16 @@ static void resid_row0(const uint8_t* __restrict r, uint16_t* __restrict z, int 
 #if defined(PLR_PRED) && !defined(PLR_DUMP)
 #error "PLR_PRED is for dump builds only"
 #endif
+#if defined(PLR_TRIPLE) && !defined(PLR_DUMP)
+#error "PLR_TRIPLE is for dump builds only (encoder side of a cost experiment; the decoder is not changed)"
+#endif
 static void resid_row(const uint8_t* __restrict r, const uint8_t* __restrict up, uint16_t* __restrict z, int w) {
     z[0] = zz8(r[0] - up[0]);
 #if defined(PLR_PRED) && PLR_PRED == 1
     for (int x = 1; x < w; ++x) z[x] = zz8(r[x] - r[x - 1]); return;
+#elif defined(PLR_PRED) && PLR_PRED >= 2                // HALIC's other predictors: (2(a+b)-c)/3, (a+b+1)/2, none
+    for (int x = 1; x < w; ++x) { const int a = r[x - 1], b = up[x], c = up[x - 1];
+        const int p = PLR_PRED == 2 ? (2 * (a + b) - c) / 3 : PLR_PRED == 3 ? (a + b + 1) >> 1 : 0; z[x] = zz8(r[x] - p); } return;
 #endif
     for (int x = 1; x < w; ++x) {
         const int a = r[x - 1], b = up[x], c = up[x - 1], mn = a < b ? a : b, mx = a < b ? b : a;
@@ -759,6 +765,9 @@ static void resid16_row(const int16_t* __restrict r, const int16_t* __restrict u
     z[0] = zz16(wrap9(r[0] - up[0]));
 #if defined(PLR_PRED) && PLR_PRED == 1
     for (int x = 1; x < w; ++x) z[x] = zz16(wrap9(r[x] - r[x - 1])); return;
+#elif defined(PLR_PRED) && PLR_PRED >= 2
+    for (int x = 1; x < w; ++x) { const int a = r[x - 1], b = up[x], c = up[x - 1];
+        const int p = PLR_PRED == 2 ? (2 * (a + b) - c) / 3 : PLR_PRED == 3 ? (a + b + 1) >> 1 : 0; z[x] = zz16(wrap9(r[x] - p)); } return;
 #endif
     for (int x = 1; x < w; ++x) z[x] = zz16(wrap9(r[x] - med(r[x - 1], up[x], up[x - 1])));
 }
@@ -941,7 +950,15 @@ static void rgb_split(const uint8_t* rgb, int W, int tw, int th, std::vector<uin
         uint8_t* __restrict py = Y.data() + size_t(y) * tw; int16_t* __restrict pu = U.data() + size_t(y) * tw; int16_t* __restrict pv = V.data() + size_t(y) * tw;
         for (int x = 0; x < tw; ++x) {                 // no branch in the loop: it vectorises (the range check is after it)
             int r = p[3 * x], g = p[3 * x + 1], b = p[3 * x + 2];
+#if defined(PLR_TRIPLE)                                 // research (dump builds only): HALIC-like plane triples
+            const int Co = r - g, Cg = b - g, D = r - b, Yl = g + ((Co + Cg + 2) >> 2);
+            static const int tri[17][3] = {{6,3,4},{0,1,2},{0,1,5},{0,1,4},{0,2,3},{0,2,4},{1,2,3},{1,2,5},{0,3,5},{1,3,5},
+                                           {2,3,5},{0,3,4},{1,3,4},{2,3,4},{0,5,4},{1,5,4},{2,5,4}};   // R G B Co Cg D Y
+            const int val[7] = {r, g, b, Co, Cg, D, Yl};
+            int yy = val[tri[PLR_TRIPLE][0]]; int u = val[tri[PLR_TRIPLE][1]], v = val[tri[PLR_TRIPLE][2]];
+#else
             int u = r - g, v = b - g, yy = g + ((u + v + 2) >> 2); v -= u >> 2;
+#endif
             bad |= yy; py[x] = uint8_t(yy); pu[x] = int16_t(u); pv[x] = int16_t(v);
         }
     }
