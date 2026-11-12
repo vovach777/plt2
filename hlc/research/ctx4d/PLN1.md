@@ -499,3 +499,21 @@ Cost model (qhsim + runs + zU split), screen tables trained on 12 screens of /tm
 - Hybrid = both (Sparse-Raw inside the screen mode, tables retrained for it): H0 (Ls = bw(max(sa,sl)>>4) - 2, no shift)
   1.3173 bpp (-28.4%); best of H0..H4 / HF3..6 per tile 1.3041 (-29.1%); CLIC -0.06 / -0.12%. HALIC 1.554, PALIC-1 1.543.
 Scripts: qh_enc/exp_sparse_raw.py, exp_hybrid.py, fable_l/ (Fable's lspike*.py, REPORT.md, rounds, hybrid results).
+
+### PLS: the screen mode in the codec (palic-2r -s, files PLS1 / PLS2; qhs.hpp, qhs_tables.h)
+The hybrid H0 for the whole file (no per-tile switch yet): tiles, MED, RCT, S = zU + zV with the zU split, runs of
+zero blocks at sa == 0 as PLR; per block est = max(sa, sl) (sa as PLR's causal sum, sl = the sum of the previous block;
+block 0: est = 64, Ls = 2), Ls = clamp(bw(est >> 4) - 2, 0, 7), table = ctxmap[Y/S][Q(est)] of 32 screen tables;
+h = 0 if z == 0 else ((z - 1) >> Ls) + 1; 4 letters min(h, 3); tails h - 3: Rice(k <= 6), q >= 8: 8 ones + EG2 of
+x - (8 << k); then Ls low bits of z - 1 for every z > 0 in pixel order. PLR files are bit-identical to before.
+Real files (bench -r 1, clang, this sandbox):
+| set | PLR bpp | PLS bpp | PLS enc / dec MB/s (PLR) |
+|---|---|---|---|
+| 12 halic-wins screens | 1.8361 | 1.3155 (-28.4%; HALIC 1.554, PALIC-1 1.543) | 910 / 472 (1438 / 509) |
+| CLIC test 39 colour | 8.4105 | 8.6690 (+3.1%: photos keep PLR) | 246 / 236 (676 / 297) |
+| windows95 green as gray | 2.2650 | 1.2084 | |
+Model (exp_hybrid.py, per-tile switch) 1.3173 vs real 1.3155. Checks: edge sizes (1x1 .. 300x577, noise and sparse),
+gcc build, ASan+UBSan, 180 corrupted PLS files: 154 rejected, the rest decode, 0 crashes.
+Backlog (not done, by decision): automatic choice PLR / PLS (per file or a per-tile flag, encoder-side costing),
+the variant choice per tile (H0..H4, HF; +0.7 pt in the model), escape (8,2) for PLR, screen tables on a larger corpus
+(icons, screenshot_game), a faster PLS encoder / decoder (scalar now), PLS for gray screens is trained on Y only.
