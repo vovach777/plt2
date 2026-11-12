@@ -30,6 +30,9 @@
 #include <filesystem>
 #include <cstdio>
 #include <cstdlib>
+#if !defined(PLN_SSE) && (defined(__SSE4_1__) || defined(__AVX2__))
+#define PLN_SSE 1
+#endif
 #if defined(PLN_SSE)
 #include <smmintrin.h>
 #endif
@@ -494,43 +497,158 @@ static inline void scr_ctx(const uint16_t* z, size_t i, int tw, uint32_t& sa, ui
 }
 // encoder: pass 1 = the exact cost of every variant (the run structure and est do not depend on the variant), then the
 // plane: 3 bits variant, blocks (runs, letters / tails / raw, the zU split of the S plane)
+#ifndef PLS_STRIDE
+#define PLS_STRIDE 4                            // subsample every 4th active block after the first 32 active blocks
+#endif
+static inline uint32_t sum16_fast(const uint16_t* b) {
+#if defined(__AVX2__)
+    const __m256i v = _mm256_loadu_si256((const __m256i*)b);
+    if (_mm256_testz_si256(v, v)) return 0;
+    const __m128i s = _mm_add_epi16(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    const __m128i s2 = _mm_add_epi16(s, _mm_srli_si128(s, 8));
+    const __m128i s3 = _mm_add_epi16(s2, _mm_srli_si128(s2, 4));
+    const __m128i s4 = _mm_add_epi16(s3, _mm_srli_si128(s3, 2));
+    return uint32_t(uint16_t(_mm_extract_epi16(s4, 0)));
+#else
+    return sum16(b);
+#endif
+}
+static inline void tb_get16(rlgrl::LaneR& r, const uint16_t* S, uint16_t* a, uint16_t* b);
+static inline bool qz_dec(size_t& left, uint16_t* zb, size_t i, size_t nb);
+
+
+static inline uint32_t qh_block_bits_fast(uint32_t pt, uint32_t sa, bool first, const uint16_t* z) {
+    const int L = first ? 2 : std::min(7, std::max(0, int(bwz(sa >> 4)) - PLR_OFF));
+    const int t = qh::ctxmap[pt * qh::NQ + qh::Qsa(sa)];
+    const uint8_t* ln = qh::lens[t]; const uint32_t k = qh::rk[t];
+#if defined(PLN_SSE)
+    const __m128i a0 = _mm_loadu_si128((const __m128i*)z), a1 = _mm_loadu_si128((const __m128i*)(z + 8)), sh = _mm_cvtsi32_si128(L);
+    const __m128i h0 = _mm_srl_epi16(a0, sh), h1 = _mm_srl_epi16(a1, sh), three = _mm_set1_epi16(3);
+    const __m128i c8 = _mm_packus_epi16(_mm_min_epu16(h0, three), _mm_min_epu16(h1, three));
+    const __m128i l4 = _mm_madd_epi16(_mm_maddubs_epi16(c8, _mm_set1_epi16(0x0401)), _mm_set1_epi32(0x00100001));
+    uint32_t bits = uint32_t(16 * L) + ln[uint32_t(_mm_cvtsi128_si32(l4))] + ln[uint32_t(_mm_extract_epi32(l4, 1))]
+                  + ln[uint32_t(_mm_extract_epi32(l4, 2))] + ln[uint32_t(_mm_extract_epi32(l4, 3))];
+    uint32_t m3 = uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi8(c8, _mm_set1_epi8(3))));
+    if (m3) {
+        alignas(16) uint16_t bh[16]; _mm_store_si128((__m128i*)bh, h0); _mm_store_si128((__m128i*)(bh + 8), h1);
+        do {
+            const int j = __builtin_ctz(m3); m3 &= m3 - 1;
+            const uint32_t q = (uint32_t(bh[j]) - 3u) >> k;
+            bits += (q >= uint32_t(qh::QESC)) ? uint32_t(qh::QESC + 10) : (q + 1u + k);
+        } while (m3);
+    }
+    return bits;
+#else
+    uint32_t bits = uint32_t(16 * L);
+    for (int q = 0; q < 4; ++q) {
+        const uint16_t* zp = z + 4 * q;
+        const uint32_t h0 = zp[0] >> L, h1 = zp[1] >> L, h2 = zp[2] >> L, h3 = zp[3] >> L;
+        const uint32_t l = std::min(h0, 3u) | (std::min(h1, 3u) << 2) | (std::min(h2, 3u) << 4) | (std::min(h3, 3u) << 6);
+        bits += ln[l];
+    }
+    for (int j = 0; j < 16; ++j) {
+        const uint32_t h = z[j] >> L;
+        if (h >= 3) {
+            const uint32_t q = (h - 3u) >> k;
+            bits += (q >= uint32_t(qh::QESC)) ? uint32_t(qh::QESC + 10) : (q + 1u + k);
+        }
+    }
+    return bits;
+#endif
+}
+
 static void qhs_plane_enc(const uint16_t* z, const uint16_t* a, size_t nb, int tw) {
-    const uint32_t pt = g_sink->pid ? 1u : 0u; uint64_t cost[qhs::NVAR] = {};
-    for (size_t i = 0, left = 0; i < nb; ++i) {
-        if (left) { --left; continue; }
-        uint32_t sa, est; scr_ctx(z, i, tw, sa, est);
-        if (!sa) { size_t n = 0; while (i + n < nb && blk_zero(z + (i + n) * 16)) ++n; if (n) { left = n - 1; continue; } }
-        if (blk_zero(z + i * 16)) continue;                // the same 4 zero letters in every variant (one table per est)
-        for (int v = 0; v < qhs::NVAR; ++v) cost[v] += qhs::block_bits(pt, est, qhs::Ls_of(est, v, !i), z + i * 16);
+#if !defined(PLS_NO_SWITCH)
+    const int sp_mode = qhs::screen_plane_mode(z, nb);
+    if (!sp_mode) {
+        { rlgrl::LaneW w(*g_sink->raw); w.room(); w.put(1, 0); w.sync(); }
+        qh_plane_enc(z, a, nb, tw, PLR_OFF);
+        return;
+    }
+#endif
+    const uint32_t pt = g_sink->pid ? 1u : 0u; uint64_t cost[qhs::NVAR] = {}, plr_cost = 0;
+    static thread_local UBuf<uint32_t> sbuf; sbuf.need(nb); uint32_t* bs = sbuf.data();
+    const size_t step = size_t(tw >> 4); size_t act_cnt = 0;
+    for (size_t i = 0; i < nb; ++i) {
+        const uint32_t s = sum16_fast(z + i * 16); bs[i] = s;
+        if (!s) continue;
+        if ((act_cnt <= 32) || ((act_cnt & (PLS_STRIDE - 1)) == 0)) {
+            const uint32_t sl = i ? bs[i - 1] : 64u;
+            const uint32_t sa = i ? ((step && i >= step) ? bs[i - step] : sl) : 64u;
+            qhs::accum_block_bits8(pt, std::max(sa, sl), !i, z + i * 16, cost);
+#if !defined(PLS_NO_SWITCH)
+            if (sp_mode == 1) plr_cost += qh_block_bits_fast(pt, sa, !i, z + i * 16);
+#endif
+        }
+        ++act_cnt;
     }
     int vb = 0; for (int v = 1; v < qhs::NVAR; ++v) if (cost[v] < cost[vb]) vb = v;
-    rlgrl::LaneW w(*g_sink->raw); w.room(); w.put(qhs::VBITS, uint64_t(vb));
+#if !defined(PLS_NO_SWITCH)
+    if (sp_mode == 1 && cost[vb] >= plr_cost) {
+        { rlgrl::LaneW w(*g_sink->raw); w.room(); w.put(1, 0); w.sync(); }
+        qh_plane_enc(z, a, nb, tw, PLR_OFF);
+        return;
+    }
+#endif
+    rlgrl::LaneW w(*g_sink->raw); w.room();
+#if !defined(PLS_NO_SWITCH)
+    w.put(1 + qhs::VBITS, (1ull << qhs::VBITS) | uint64_t(vb));
+#else
+    w.put(qhs::VBITS, uint64_t(vb));
+#endif
+    bool after_run = false;
     for (size_t i = 0, left = 0; i < nb; ++i) {
-        if (left) { --left; continue; }
-        uint32_t sa, est; scr_ctx(z, i, tw, sa, est); w.room();
-        if (!sa) { size_t n = 0; while (i + n < nb && blk_zero(z + (i + n) * 16)) ++n;
+        if (left) { if (--left == 0) after_run = true; continue; }
+        const uint32_t sl = i ? bs[i - 1] : 64u;
+        const uint32_t sa = i ? ((step && i >= step) ? bs[i - step] : sl) : 64u;
+        const uint32_t est = std::max(sa, sl); w.room();
+        if ((!sa || !sl) && !after_run) { size_t n = 0; while (i + n < nb && !bs[i + n]) ++n;
             const uint64_t v = n + 1; const int b = int(64 - __builtin_clzll(v)); w.put(unsigned(2 * b - 1), v);
-            if (n) { left = n - 1; continue; } }
+            if (n) { if (n == 1) after_run = true; else { left = n - 1; after_run = false; } continue; } }
+        after_run = false;
         qhs::enc_block(w, pt, est, qhs::Ls_of(est, vb, !i), z + i * 16);
         if (a) tb_put16(w, a + i * 16, z + i * 16);
     }
     w.sync();
 }
-static inline void tb_get16(rlgrl::LaneR& r, const uint16_t* S, uint16_t* a, uint16_t* b);
 static void qhs_plane_dec(uint16_t* z, uint16_t* a, uint16_t* b, size_t nb, int tw) {
-    rlgrl::LaneR& r = *g_src->raw; const uint32_t pt = g_src->pid ? 1u : 0u; size_t left = 0;
+    rlgrl::LaneR& r = *g_src->raw;
+#if !defined(PLS_NO_SWITCH)
+    const int is_pls = int(r.window() >> 63); r.skip(1);
+    if (!is_pls) {
+        size_t zl = 0;
+        for (size_t i = 0; i < nb; ++i) {
+            const int L = causal_Lt<PLR_OFF>(z, i, tw);
+            if (qz_dec(zl, z + i * 16, i, nb)) {
+                if (a) { memset(a + i * 16, 0, 32); memset(b + i * 16, 0, 32); }
+                continue;
+            }
+            g_src->block(L, z + i * 16);
+            if (a) tb_get16(r, z + i * 16, a + i * 16, b + i * 16);
+        }
+        return;
+    }
+#endif
+    const uint32_t pt = g_src->pid ? 1u : 0u; size_t left = 0;
     const int vb = int(r.window() >> (64 - qhs::VBITS)); r.skip(qhs::VBITS);
+    static thread_local UBuf<uint32_t> sbuf; sbuf.need(nb); uint32_t* bs = sbuf.data();
+    const size_t step = size_t(tw >> 4); bool after_run = false;
     for (size_t i = 0; i < nb; ++i) {
         uint16_t* zb = z + i * 16;
-        if (!left) { uint32_t sa, est; scr_ctx(z, i, tw, sa, est);
-            if (!sa) { const uint64_t wd = r.window(); const int zc = wd ? __builtin_clzll(wd) : 64;
+        if (!left) {
+            const uint32_t sl = i ? bs[i - 1] : 64u;
+            const uint32_t sa = i ? ((step && i >= step) ? bs[i - step] : sl) : 64u;
+            const uint32_t est = std::max(sa, sl);
+            if ((!sa || !sl) && !after_run) { const uint64_t wd = r.window(); const int zc = wd ? __builtin_clzll(wd) : 64;
                 if (zc > 30) throw std::runtime_error("zero run code");
                 const uint64_t v = wd >> (63 - 2 * zc); r.skip(2 * zc + 1); left = size_t(v - 1);
                 if (left > nb - i) throw std::runtime_error("zero run too long"); }
-            if (!left) { qhs::dec_block(r, pt, est, qhs::Ls_of(est, vb, !i), zb);
+            if (!left) { after_run = false; qhs::dec_block(r, pt, est, qhs::Ls_of(est, vb, !i), zb);
+                bs[i] = sum16_fast(zb);
                 if (a) tb_get16(r, zb, a + i * 16, b + i * 16);
                 continue; } }
-        --left; memset(zb, 0, 32); if (a) { memset(a + i * 16, 0, 32); memset(b + i * 16, 0, 32); }
+        if (--left == 0) after_run = true;
+        bs[i] = 0; memset(zb, 0, 32); if (a) { memset(a + i * 16, 0, 32); memset(b + i * 16, 0, 32); }
     }
 }
 #define QZ_ENC(z, i, nb) if (qz_enc(zl, z, i, nb)) continue

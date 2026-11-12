@@ -523,3 +523,17 @@ scalar), decoder unchanged (~600 MB/s, -r 3).
 Backlog (not done, by decision): automatic choice PLR / PLS (per file or a per-tile flag, encoder-side costing),
 a faster variant costing (SIMD block_bits, 8 variants at once), escape (8,2) for PLR, screen tables on a larger corpus
 (icons, screenshot_game), a faster PLS encoder / decoder (scalar now), PLS for gray screens is trained on Y only.
+
+### PLS fast + per-plane PLR/PLS switch (Argon, v2 of 2026-11-12, reviewed by Claude)
+Format of PLS1/PLS2 (changed): every plane of a tile starts with 1 bit: 0 = the plane is coded as PLR (causal L,
+format QH tables, runs as PLR), 1 = PLS, then 3 bits variant. In PLS: sa / sl = sums of the block above (block grid,
+i - tw/16) / the previous block; runs of zero blocks are tried when sa == 0 or sl == 0 and not right after a run.
+Encoder: qhs::screen_plane_mode samples every 8th block (zeros vs 1..7 residuals): 0 -> PLR, 2 -> PLS, 1 (border) ->
+both costed in the variant pass and the cheaper taken; the 8 variants costed by AVX2 accum_block_bits8 on every
+PLS_STRIDE-th (4) active block after the first 32; AVX2 enc_block / dec_block. Scalar paths give identical files.
+Real files (clang -O2 -march=native, bench -r 3), bpp: 12 screens PLR 1.8361 -> PLS 1.2914 (-29.7%; HALIC 1.554);
+CLIC 117 colour 8.6639 -> 8.6627, gray 3.8826 -> 3.8816; Kodak 9.9588 -> 9.9587; document render + phone screenshot
+-3.0%. Never worse than PLR on any set. Encoder on screens 1210 MB/s (was 285), photos 584-670 (PLR 600-700).
+Checks: ASan+UBSan on all sets, 300 corrupted files (245 rejected, 0 crashes), clang/gcc AVX2 and gcc x86-64-v2
+byte-identical on 133 images; PLR files unchanged.
+Backlog: escape (8,2) for PLR, screen tables on a larger corpus, decoder speed without AVX2 (~80 MB/s, also PLR).
