@@ -46,17 +46,17 @@ export function loadNetpbm(path) {
   return { magic, width, height, channels, data, file: buf };
 }
 
-export function encodeImage(image) {
+export function encodeImage(image, fast = 0) {
   fit(arena, image.data.length + 65536);
   new Uint8Array(memory.buffer).set(image.data, Number(arena));
-  const n = api.encode(arena, image.width, image.height);
+  const n = api.encode(arena, image.width, image.height, image.channels, fast ? 1 : 0);
   if (n < 0) throw new Error("encode failed");
   const out = Buffer.from(new Uint8Array(memory.buffer, Number(api.outPtr()), n));
   if (image.file && out.length >= image.file.length) return Buffer.from(image.file);
   return out;
 }
 
-export function encodeFile(path) { return encodeImage(loadNetpbm(path)); }
+export function encodeFile(path, fast = 0) { return encodeImage(loadNetpbm(path), fast); }
 
 export function decodeFile(file) {
   const text = file.toString("latin1", 0, Math.min(file.length, 64));
@@ -64,7 +64,8 @@ export function decodeFile(file) {
   const nl = text.indexOf("\n");
   const nl2 = text.indexOf("\n", nl + 1);
   const [width, height] = text.slice(nl + 1, nl2).split(" ").map(Number);
-  const pixels = width * height * 3;
+  const channels = text[3] === "1" ? 1 : 3;          // PLR1 = gray (P5), PLR2 = RGB (P6)
+  const pixels = width * height * channels;
   fit(arena, file.length + pixels + 65536);
   const bytes = new Uint8Array(memory.buffer);
   const src = Number(arena);
@@ -73,12 +74,12 @@ export function decodeFile(file) {
   const rc = api.decode(src, file.length, dst);
   if (rc < 0) throw new Error("decode failed");
   const data = Buffer.from(new Uint8Array(memory.buffer, dst, pixels));
-  return Buffer.concat([Buffer.from(`P6\n${width} ${height}\n255\n`), data]);
+  return Buffer.concat([Buffer.from(`P${channels === 1 ? 5 : 6}\n${width} ${height}\n255\n`), data]);
 }
 
 const args = process.argv.slice(2);
-if (args[0] === "c" && args.length === 3) {
-  writeFileSync(args[2], encodeFile(args[1]));
+if (args[0] === "c" && (args.length === 3 || (args.length === 4 && args[3] === "-f"))) {   // -f: fast mode (PLF)
+  writeFileSync(args[2], encodeFile(args[1], args[3] === "-f"));
 } else if (args[0] === "d" && args.length === 3) {
   writeFileSync(args[2], decodeFile(readFileSync(args[1])));
 }

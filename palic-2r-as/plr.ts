@@ -293,6 +293,9 @@ let gsa: i32 = 0;
 let err: i32 = 0;
 let ow: i32 = 0;
 let oh: i32 = 0;
+let ofast: i32 = 0;                         // 1 = PLF (fast mode: RLGR pairs), 0 = PLR (QH)
+let CS: usize = 0;                          // the 24 RLGR coder states (3 planes x 8 bins of L), 48 bytes each
+let och: i32 = 3;                          // channels: 1 = PLR1 (gray, P5), 3 = PLR2 (RGB, P6)
 let inP: usize = 0;
 let inE: usize = 0;
 
@@ -404,7 +407,8 @@ export function init(): i32 {
   VB = UB + <usize>(288 * 288 << 1);
   ENC = VB + <usize>(288 * 288 << 1);
   DECT = ENC + <usize>(KTAB * 256 * 2);
-  OUT = (DECT + <usize>((KTAB << ML) * 2) + 4096) & ~<usize>15;
+  CS = (DECT + <usize>((KTAB << ML) * 2) + 63) & ~<usize>63;
+  OUT = (CS + <usize>(24 * 48) + 4096) & ~<usize>15;
   ARENA = OUT + <usize>(32 << 20);
   if (!built) { buildCodes(); built = 1; }
   return <i32>ARENA;
@@ -412,11 +416,17 @@ export function init(): i32 {
 export function outPtr(): usize { return OUT; }
 export function width(): i32 { return ow; }
 export function height(): i32 { return oh; }
+export function channels(): i32 { return och; }
+export function fast(): i32 { return ofast; }
 
 function wordPtr(i: i32): usize { return WORDS + (<usize>i << 3); }
 function putBits(n: i32, v: u64): void {
   if (n <= 0) return;
-  const pos = head;
+  atBits(head, n, v);
+  head += <u64>n;
+}
+// OR n (1..64) bits at bit position pos of the lane (the bits there are 0): the RLGR run headers are filled in later
+function atBits(pos: u64, n: i32, v: u64): void {
   const i = <i32>(pos >> 6);
   const off = <i32>(pos & 63);
   if (i + 1 >= WORDN) { err = 1; return; }
@@ -430,15 +440,15 @@ function putBits(n: i32, v: u64): void {
     const q = p + 8;
     store<u64>(q, load<u64>(q) | (v << (64 - r)));
   }
-  head = pos + <u64>n;
 }
 function wordAt(i: i32): u64 {
   if (<u32>i >= <u32>WORDN) return 0;
   return load<u64>(wordPtr(i));
 }
-function peek(): u64 {
-  const i = <i32>(rhead >> 6);
-  const off = <i32>(rhead & 63);
+function peek(): u64 { return peekAt(rhead); }
+function peekAt(pos: u64): u64 {
+  const i = <i32>(pos >> 6);
+  const off = <i32>(pos & 63);
   const w0 = wordAt(i);
   if (off == 0) return w0;
   return (w0 << off) | (wordAt(i + 1) >> (64 - off));
@@ -634,6 +644,209 @@ function decPlane(base: usize, n: i32, tw: i32, pt: i32): void {
   }
 }
 
+// ---------------------------------------------------------------- PLF: fast mode (palic2r -f, files PLF1 / PLF2)
+// RLGR as in llrice (adaptive k for runs of zeros, kr for the Rice codes; constants of rlgr_fast.hpp), one bit lane
+// per tile shared by every coder and the raw bits (rlgr_lane.hpp). A run header (flag 0 = full window, or 1 + rl in
+// k bits) is written later than the codes after it: when a run starts the coder leaves a hole of 1 + k bits at the
+// head and fills it at the end of the run; the decoder reads the hole by position when the run starts. A full window
+// needs only its 0 flag: if nothing was written after its hole, the k unused bits are given back (head = hole + 1).
+// The block: the high parts h = z >> L of neighbours 2j, 2j+1 as one RLGR symbol s = a + b, then a in truncated
+// binary over s + 1 values (tbPut), then the L low bit planes raw. L from the 16 z above with off 1. No zero runs.
+const MAX_K: u32 = 240;
+const UP_K: u32 = 5;
+const DOWN_K: u32 = 9;
+const UP_K_DIRECT_RL: u32 = 2;
+const DOWN_K_DIRECT_RL: u32 = 3;
+const DOWN_K_RICE: u32 = 2;
+// coder state at CS + 48 * c: rl u32 @0, k u32 @4, kr u32 @8, in run u32 @12, full window u32 @16, hole u64 @24, hole end u64 @32
+function coder(c: i32): usize { return CS + <usize>(c * 48); }
+function rlgrReset(): void {
+  for (let c = 0; c < 24; c++) {
+    const p = coder(c);
+    store<u32>(p, 0); store<u32>(p + 4, 8); store<u32>(p + 8, 8); store<u32>(p + 12, 0); store<u32>(p + 16, 0);
+    store<u64>(p + 24, 0); store<u64>(p + 32, 0);
+  }
+}
+function adaptKr(p: usize, v: u32, kr_: u32): void {
+  const vk = v >> kr_;
+  let kr = load<u32>(p + 8);
+  if (vk == 0) kr -= kr > DOWN_K_RICE ? DOWN_K_RICE : kr;
+  else if (vk != 1) { kr += vk; if (kr > MAX_K) kr = MAX_K; }
+  store<u32>(p + 8, kr);
+}
+function ricePutL(x: u32, m: u32): void {
+  const q = x >> m;
+  if (q >= 32) { putBits(64, (<u64>0xffffffff << 32) | <u64>x); return; }
+  putBits(<i32>(q + 1 + m), (((<u64>2 << <u64>q) - 2) << <u64>m) | (<u64>x & ((<u64>1 << <u64>m) - 1)));
+}
+function riceGetL(m: u32): u32 {
+  const win = peek();
+  const q = win == 0xffffffffffffffff ? 64 : <i32>clz<u64>(~win);
+  if (q >= 32) { rhead += 32; return <u32>getBits(32); }
+  const low: u32 = m ? <u32>((win << <u64>(q + 1)) >> <u64>(64 - m)) : 0;
+  rhead += <u64>(q + 1 + <i32>m);
+  return (<u32>q << m) | low;
+}
+function encHole(p: usize, k_: u32): void {
+  store<u64>(p + 24, head);
+  head += <u64>(1 + k_);
+  store<u64>(p + 32, head);
+}
+function rlgrPut(p: usize, v: u32): void {
+  let k = load<u32>(p + 4);
+  let k_ = k >> 3;
+  const kr_ = load<u32>(p + 8) >> 3;
+  if (k_ > 0) {
+    if (!load<u32>(p + 12)) { encHole(p, k_); store<u32>(p + 12, 1); }
+    if (v == 0) {
+      let rl = load<u32>(p) + 1;
+      if (rl == (<u32>1 << k_)) {                // full window: flag 0 = the hole's first bit stays 0
+        if (head == load<u64>(p + 32)) head = load<u64>(p + 24) + 1;
+        rl = 0;
+        k += UP_K; if (k > MAX_K) k = MAX_K;
+        store<u32>(p + 4, k);
+        k_ = k >> 3;
+        encHole(p, k_);
+      }
+      store<u32>(p, rl);
+    } else {
+      store<u32>(p + 12, 0);
+      atBits(load<u64>(p + 24), <i32>(1 + k_), (<u64>1 << <u64>k_) | <u64>load<u32>(p));
+      k -= k > DOWN_K ? DOWN_K : k;
+      store<u32>(p + 4, k);
+      v--;
+      store<u32>(p, 0);
+      ricePutL(v, kr_);
+      adaptKr(p, v, kr_);
+    }
+  } else {
+    store<u32>(p, 0);
+    ricePutL(v, kr_);
+    adaptKr(p, v, kr_);
+    if (v == 0) { k += UP_K_DIRECT_RL; if (k > MAX_K) k = MAX_K; } else k -= k > DOWN_K_DIRECT_RL ? DOWN_K_DIRECT_RL : k;
+    store<u32>(p + 4, k);
+  }
+}
+function rlgrFlush(p: usize): void {             // an open run with rl > 0 gets its header
+  const rl = load<u32>(p);
+  if (load<u32>(p + 12) && rl > 0) {
+    const k_ = load<u32>(p + 4) >> 3;
+    atBits(load<u64>(p + 24), <i32>(1 + k_), (<u64>1 << <u64>k_) | <u64>rl);
+    store<u32>(p, 0);
+  }
+}
+function decHole(p: usize, k_: u32): void {
+  store<u64>(p + 24, rhead);
+  rhead += <u64>(1 + k_);
+  store<u64>(p + 32, rhead);
+}
+function readRice(p: usize): u32 {
+  const kr_ = load<u32>(p + 8) >> 3;
+  const v = riceGetL(kr_);
+  adaptKr(p, v, kr_);
+  return v;
+}
+function finishPartialRun(p: usize): u32 {
+  const k = load<u32>(p + 4);
+  store<u32>(p + 4, k - (k > DOWN_K ? DOWN_K : k));
+  store<u32>(p + 12, 0);
+  return readRice(p) + 1;
+}
+function processRun(p: usize): u32 {
+  let rl = load<u32>(p);
+  if (load<u32>(p + 16)) {
+    rl--;
+    store<u32>(p, rl);
+    if (rl == 0) {                               // end of a full window: the same give-back rule as the encoder
+      if (rhead == load<u64>(p + 32)) rhead = load<u64>(p + 24) + 1;
+      let k = load<u32>(p + 4) + UP_K; if (k > MAX_K) k = MAX_K;
+      store<u32>(p + 4, k);
+      decHole(p, k >> 3);
+      store<u32>(p + 12, 0);
+    }
+    return 0;
+  }
+  if (rl == 0) return finishPartialRun(p);
+  store<u32>(p, rl - 1);
+  return 0;
+}
+function rlgrGet(p: usize): u32 {
+  if (load<u32>(p + 12)) return processRun(p);
+  let k = load<u32>(p + 4);
+  const k_ = k >> 3;
+  if (k_ > 0) {
+    if (!load<u32>(p + 16)) decHole(p, k_);      // a run starts (after a full window the hole is already open)
+    const h = peekAt(load<u64>(p + 24));
+    store<u32>(p + 12, 1);
+    const full: u32 = (h >> 63) == 0 ? 1 : 0;
+    store<u32>(p + 16, full);
+    if (full) store<u32>(p, <u32>1 << k_);
+    else {
+      const rl = <u32>((h << 1) >> <u64>(64 - k_));
+      store<u32>(p, rl);
+      if (rl == 0) return finishPartialRun(p);
+    }
+    return processRun(p);
+  }
+  const v = readRice(p);
+  if (v == 0) { k += UP_K_DIRECT_RL; if (k > MAX_K) k = MAX_K; } else k -= k > DOWN_K_DIRECT_RL ? DOWN_K_DIRECT_RL : k;
+  store<u32>(p + 4, k);
+  return v;
+}
+function causalOff(base: usize, i: i32, tw: i32, off: i32): i32 {
+  const px = i * 16;
+  let s = 0;
+  if (tw >= 16 && px >= tw) s = sum16(base, px - tw);
+  else if (i == 0) return 2;
+  else s = sum16(base, px - 16);
+  const q = <u32>s >> 4;
+  let L = (q ? 32 - <i32>clz<u32>(q) : 0) - off;
+  if (L < 0) L = 0;
+  if (L > 7) L = 7;
+  return L;
+}
+function fastPlaneEnc(base: usize, n: i32, tw: i32, c0: i32): void {
+  const nb = (n + 15) >> 4;
+  for (let i = n; i < nb * 16; i++) set16(base, i, 0);
+  for (let i = 0; i < nb; i++) {
+    const L = causalOff(base, i, tw, 1);
+    const p = coder(c0 + L);
+    const p0 = base + (<usize>(i * 16) << 1);
+    for (let j = 0; j < 16; j += 2) {
+      const a = <i32>load<u16>(p0 + (<usize>j << 1)) >> L;
+      const s2 = a + (<i32>load<u16>(p0 + (<usize>(j + 1) << 1)) >> L);
+      rlgrPut(p, <u32>s2);
+      tbPut(a, s2);
+    }
+    for (let b = 0; b < L; b++) {
+      let m = 0;
+      for (let j = 0; j < 16; j++) m |= ((<i32>load<u16>(p0 + (<usize>j << 1)) >> b) & 1) << j;
+      putBits(16, <u64>m);
+    }
+  }
+}
+function fastPlaneDec(base: usize, n: i32, tw: i32, c0: i32): void {
+  const nb = (n + 15) >> 4;
+  for (let i = 0; i < nb; i++) {
+    const L = causalOff(base, i, tw, 1);
+    const p = coder(c0 + L);
+    const p0 = base + (<usize>(i * 16) << 1);
+    for (let j = 0; j < 16; j += 2) {
+      const s2 = <i32>rlgrGet(p);
+      const a = tbGet(s2);
+      store<u16>(HS + (<usize>j << 1), <u16>a);
+      store<u16>(HS + (<usize>(j + 1) << 1), <u16>(s2 - a));
+    }
+    for (let b = 0; b < L; b++) store<u16>(MS + (<usize>b << 1), <u16>getBits(16));
+    for (let j = 0; j < 16; j++) {
+      let v = <i32>load<u16>(HS + (<usize>j << 1)) << L;
+      for (let b = 0; b < L; b++) if ((<i32>load<u16>(MS + (<usize>b << 1)) >> j) & 1) v |= 1 << b;
+      store<u16>(p0 + (<usize>j << 1), <u16>v);
+    }
+  }
+}
+function rlgrFlushAll(): void { for (let c = 0; c < 24; c++) rlgrFlush(coder(c)); }
+
 function tbPut(a: i32, s2: i32): void {
   if (s2 == 0) return;
   const s1 = <u32>(s2 + 1);
@@ -822,29 +1035,72 @@ function encodeTile(src: usize, W: i32, tx: i32, ty: i32, tw: i32, th: i32, used
   if (err) return used;
   const n = tw * th;
   residY(tw, th);
-  codePlane(ZB, n, tw, 0);
-  encUV(tw, th);
+  if (ofast) {                                   // PLF2: Y, U, V as three planes of RLGR pairs, coders 0..7, 8..15, 16..23
+    rlgrReset();
+    fastPlaneEnc(ZB, n, tw, 0);
+    resid9(UB, ZU, tw, th);
+    fastPlaneEnc(ZU, n, tw, 8);
+    resid9(VB, ZV, tw, th);
+    fastPlaneEnc(ZV, n, tw, 16);
+    rlgrFlushAll();
+  } else {
+    codePlane(ZB, n, tw, 0);
+    encUV(tw, th);
+  }
   flushLane();
   const nw = <i32>((head + 63) >> 6);
   if (nw > wused) wused = nw;
   return nw;
 }
+// PLR1 (gray): the tile is the Y plane alone (MED, zz8, QH with plane type 0), one lane, as palic2r's compress()
+function encodeTileGray(src: usize, W: i32, tx: i32, ty: i32, tw: i32, th: i32, used: i32): i32 {
+  clearWords(used > wused ? used : wused);
+  head = 0;
+  for (let y = 0; y < th; y++) memory.copy(YB + <usize>(y * tw), src + <usize>((ty + y) * W + tx), <usize>tw);
+  residY(tw, th);
+  if (ofast) { rlgrReset(); fastPlaneEnc(ZB, tw * th, tw, 0); rlgrFlushAll(); }
+  else codePlane(ZB, tw * th, tw, 0);
+  flushLane();
+  const nw = <i32>((head + 63) >> 6);
+  if (nw > wused) wused = nw;
+  return nw;
+}
+function decodeTileGray(dst: usize, W: i32, tx: i32, ty: i32, tw: i32, th: i32): void {
+  loadLane();
+  if (ofast) { rlgrReset(); fastPlaneDec(ZB, tw * th, tw, 0); } else decPlane(ZB, tw * th, tw, 0);
+  reconY(tw, th);
+  for (let y = 0; y < th; y++) memory.copy(dst + <usize>((ty + y) * W + tx), YB + <usize>(y * tw), <usize>tw);
+}
 function decodeTile(dst: usize, W: i32, tx: i32, ty: i32, tw: i32, th: i32): void {
   loadLane();
   const n = tw * th;
-  decPlane(ZB, n, tw, 0);
-  reconY(tw, th);
-  decUV(tw, th);
+  if (ofast) {
+    rlgrReset();
+    fastPlaneDec(ZB, n, tw, 0);
+    reconY(tw, th);
+    fastPlaneDec(ZU, n, tw, 8);
+    recon9(UB, ZU, tw, th);
+    fastPlaneDec(ZV, n, tw, 16);
+    recon9(VB, ZV, tw, th);
+  } else {
+    decPlane(ZB, n, tw, 0);
+    reconY(tw, th);
+    decUV(tw, th);
+  }
   joinTile(dst, W, tx, ty, tw, th);
 }
 
-export function encode(src: usize, W: i32, H: i32): i32 {
-  if (W <= 0 || H <= 0) return -1;
+// ch: 1 = gray (P5 data, W*H bytes) -> PLR1 / PLF1, 3 = RGB (P6 data) -> PLR2 / PLF2; anything else is refused.
+// fastMode: 0 = PLR (QH), 1 = PLF (RLGR pairs, palic2r -f)
+export function encode(src: usize, W: i32, H: i32, ch: i32, fastMode: i32): i32 {
+  if (W <= 0 || H <= 0 || (ch != 1 && ch != 3)) return -1;
+  ofast = fastMode ? 1 : 0;
   OUTN = 0;
   err = 0;
   ow = W;
   oh = H;
-  w8(80); w8(76); w8(82); w8(50); w8(10);
+  och = ch;
+  w8(80); w8(76); w8(ofast ? 70 : 82); w8(ch == 1 ? 49 : 50); w8(10);
   wdec(W); w8(32); wdec(H); w8(10);
   const nx = (W + TILE - 1) / TILE;
   const ny = (H + TILE - 1) / TILE;
@@ -858,7 +1114,7 @@ export function encode(src: usize, W: i32, H: i32): i32 {
     const tw = W - tx < TILE ? W - tx : TILE;
     const th = H - ty < TILE ? H - ty : TILE;
     const start = OUTN;
-    used = encodeTile(src, W, tx, ty, tw, th, used);
+    used = ch == 1 ? encodeTileGray(src, W, tx, ty, tw, th, used) : encodeTile(src, W, tx, ty, tw, th, used);
     if (err) return -1;
     const len = OUTN - start;
     store<u32>(OUT + <usize>(lensAt + i * 4), <u32>len);
@@ -867,7 +1123,14 @@ export function encode(src: usize, W: i32, H: i32): i32 {
 }
 
 function readHeader(): bool {
-  if (b8() != 80 || b8() != 76 || b8() != 82 || b8() != 50 || b8() != 10) return false;
+  if (b8() != 80 || b8() != 76) return false;
+  const f = b8();
+  if (f != 82 && f != 70) return false;
+  ofast = f == 70 ? 1 : 0;
+  const m = b8();
+  if (m != 49 && m != 50) return false;
+  och = m == 49 ? 1 : 3;
+  if (b8() != 10) return false;
   ow = readDec();
   if (b8() != 32) return false;
   oh = readDec();
@@ -898,7 +1161,7 @@ export function decode(src: usize, n: i32, dst: usize): i32 {
     const tileEnd = end;
     const saveE = inE;
     inE = tileEnd;
-    decodeTile(dst, W, tx, ty, tw, th);
+    if (och == 1) decodeTileGray(dst, W, tx, ty, tw, th); else decodeTile(dst, W, tx, ty, tw, th);
     if (inP != tileEnd || err) return -1;
     inE = saveE;
   }
