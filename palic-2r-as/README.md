@@ -14,13 +14,13 @@ Why AssemblyScript and not plain JS: the codec needs exact 64-bit words (`u64`) 
 ## Build and run
 
 ```bash
-npx asc plr.ts -o palic2r.wasm -O3 --runtime stub          # AssemblyScript 0.28
+npx --yes -p assemblyscript@0.28 asc plr.ts -o palic2r.wasm -O3 --runtime stub   # checked: asc 0.28.20, node 24 -> 18448 bytes
 node run.mjs c in.ppm|pgm out.plr [-f]                      # -f: PLF
 node run.mjs d in.plr out.ppm|pgm
 ./test.sh /path/to/palic-2r img...                         # byte identity with the C++ codec, both modes
 ```
 
-**The committed `palic2r.wasm` is from the previous version** (RGB PLR only, `encode(src, W, H)`): rebuild it after pulling.
+The wasm is not kept in the repo: build it with the line above. Checked build (asc 0.28.20): `test.sh` against the C++ `palic-2r`, 216 checks (25 colour + 39 gray CLIC, screenshots, edge sizes, PLR and PLF), 0 mismatches; Node 24 on 10 CLIC photos: PLR 73 / 63 MB/s, PLF 62 / 56 MB/s (encode / decode).
 
 ## Testing without the AS compiler
 
