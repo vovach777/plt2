@@ -72,6 +72,7 @@ using REnc = RLGR::Encoder; using RDec = RLGR::Decoder; using RRawW = BitStream:
 #if defined(PLR_QH)
 #include "qh.hpp"
 #include "qhs.hpp"
+#include "qhk.hpp"
 #endif
 using REnc = rlgrl::Encoder; using RDec = rlgrl::Decoder; using RRawW = rlgrl::Lane; using RRawR = rlgrl::LaneR;
 #undef RAW_PUT
@@ -195,7 +196,7 @@ static inline int med(int a, int b, int c) { int mn = std::min(a, b), mx = std::
 #define PLR_OFF 1
 #endif
 #endif
-struct Cfg { int off = PLR_OFF; bool fast = false; bool screen = false; };   // screen: PLS1 / PLS2 (qhs.hpp)
+struct Cfg { int off = PLR_OFF; bool fast = false; bool screen = false; bool rlk = false; };   // screen: PLS1 / PLS2 (qhs.hpp)
 static constexpr int TILE = 288;
 
 static inline uint16_t zz8(int e) { e = int8_t(e); return uint16_t(uint8_t((unsigned(e) << 1) ^ unsigned(e >> 7))); }
@@ -654,6 +655,126 @@ static void qhs_plane_dec(uint16_t* z, uint16_t* a, uint16_t* b, size_t nb, int 
         bs[i] = 0; memset(zb, 0, 32); if (a) { memset(a + i * 16, 0, 32); memset(b + i * 16, 0, 32); }
     }
 }
+static int g_plk_force = 0;                     // 0 auto (zq per plane), 1 rlk, 2 plr, 3 v2 (per-plane probe), 4 center (v3)
+static thread_local int g_plk_cur_mode = 0;     // 1 = rlk, 2 = plr, 3 = v2 per-plane probe, 4 = probe central Y and set 1 or 2, 5 = zq per plane
+static thread_local UBuf<uint16_t> g_rlk_zy;    // current tile Y residual plane for RLK S-plane context
+static void qhk_plane_enc(const uint16_t* z, const uint16_t* zy, const uint16_t* a, size_t nb, int n, int tw, int off) {
+    rlgrl::Lane& lane = *g_sink->raw;
+    int mode = g_plk_cur_mode;
+    if (mode == 5) {
+        // auto: one pass per plane, no double coding. RLK if >= 32.5% of the 4-px quads of the plane are all zero
+        // (hlc/research/plk_probe: +0.1..0.3% vs the per-plane oracle on screens and photos, +0.8% on web pages with
+        // photo banners, where the central-tile rule of -k=center loses 4.3%)
+        int zq = 0; const int nq = n >> 2;
+        for (int i = 0; i < nq; ++i) { uint64_t w; memcpy(&w, z + 4 * i, 8); zq += (w == 0); }
+        mode = zq * 1000 >= nq * 325 ? 1 : 2;
+    }
+    if (mode == 1) {
+        { rlgrl::LaneW w(lane); w.room(); w.put(1, 1); w.sync(); }
+        if (!a) qhk::enc_core<0>(z, nullptr, nullptr, n, tw, lane);
+        else    qhk::enc_core<1>(z, zy, a, n, tw, lane);
+        return;
+    }
+    if (mode == 2) {
+        { rlgrl::LaneW w(lane); w.room(); w.put(1, 0); w.sync(); }
+        qh_plane_enc(z, a, nb, tw, off);
+        return;
+    }
+    if (g_plk_cur_mode == 4) {
+        // v3 auto: encode central tile Y plane with both RLK and PLR, keep winner in lane, set g_plk_cur_mode for the rest of the image
+        const uint64_t p0 = lane.head;
+        { rlgrl::LaneW w(lane); w.room(); w.put(1, 1); w.sync(); }
+        qhk::enc_core<0>(z, nullptr, nullptr, n, tw, lane);
+        const uint64_t rlk_head = lane.head;
+        const int rb = int(rlk_head - p0 - 1);
+
+        static thread_local std::vector<uint64_t> rlk_save;
+        const size_t i0 = size_t(p0 >> 6);
+        const size_t i1 = size_t((rlk_head + 63) >> 6);
+        const size_t nw_save = i1 - i0 + 1;
+        rlk_save.resize(nw_save);
+        std::memcpy(rlk_save.data(), lane.w.data() + i0, nw_save * sizeof(uint64_t));
+
+        qhk::rewind_lane(lane, p0);
+        { rlgrl::LaneW w(lane); w.room(); w.put(1, 0); w.sync(); }
+        qh_plane_enc(z, nullptr, nb, tw, off);
+        const int plr = int(lane.head - p0 - 1);
+        if (rb < plr) {
+            const size_t i2 = size_t((lane.head + 63) >> 6);
+            std::memcpy(lane.w.data() + i0, rlk_save.data(), nw_save * sizeof(uint64_t));
+            for (size_t i = i0 + nw_save; i <= i2 && i < lane.w.size(); ++i) lane.w[i] = 0;
+            lane.head = rlk_head;
+            g_plk_cur_mode = 1;
+        } else {
+            g_plk_cur_mode = 2;
+        }
+        return;
+    }
+    // g_plk_cur_mode == 3 (-k=v2): legacy per-plane probe with pr == 3 double pass
+    const int pr = qhk::probe(z, n);
+    if (pr == 0) {
+        { rlgrl::LaneW w(lane); w.room(); w.put(1, 0); w.sync(); }
+        qh_plane_enc(z, a, nb, tw, off);
+        return;
+    }
+    if (pr == 1) {
+        { rlgrl::LaneW w(lane); w.room(); w.put(1, 1); w.sync(); }
+        if (!a) qhk::enc_core<0>(z, nullptr, nullptr, n, tw, lane);
+        else    qhk::enc_core<1>(z, zy, a, n, tw, lane);
+        return;
+    }
+    const uint64_t p0 = lane.head;
+    { rlgrl::LaneW w(lane); w.room(); w.put(1, 1); w.sync(); }
+    if (!a) qhk::enc_core<0>(z, nullptr, nullptr, n, tw, lane);
+    else    qhk::enc_core<1>(z, zy, a, n, tw, lane);
+    const uint64_t rlk_head = lane.head;
+    const int rb = int(rlk_head - p0 - 1);
+    if (rb * 2 <= n) return;
+
+    static thread_local std::vector<uint64_t> rlk_save;
+    const size_t i0 = size_t(p0 >> 6);
+    const size_t i1 = size_t((rlk_head + 63) >> 6);
+    const size_t nw_save = i1 - i0 + 1;
+    rlk_save.resize(nw_save);
+    std::memcpy(rlk_save.data(), lane.w.data() + i0, nw_save * sizeof(uint64_t));
+
+    qhk::rewind_lane(lane, p0);
+    { rlgrl::LaneW w(lane); w.room(); w.put(1, 0); w.sync(); }
+    qh_plane_enc(z, a, nb, tw, off);
+    const int plr = int(lane.head - p0 - 1);
+    if (rb < plr) {
+        const size_t i2 = size_t((lane.head + 63) >> 6);
+        std::memcpy(lane.w.data() + i0, rlk_save.data(), nw_save * sizeof(uint64_t));
+        for (size_t i = i0 + nw_save; i <= i2 && i < lane.w.size(); ++i) lane.w[i] = 0;
+        lane.head = rlk_head;
+    }
+}
+static void qhk_plane_dec(uint16_t* z, const uint16_t* zy, uint16_t* a, uint16_t* b, size_t nb, int n, int tw, int off) {
+    rlgrl::LaneR& r = *g_src->raw;
+    const int is_rlk = int(r.window() >> 63); r.skip(1);
+    if (!is_rlk) {
+        size_t zl = 0;
+        for (size_t i = 0; i < nb; ++i) {
+            const int L = (off == PLR_OFF) ? causal_Lt<PLR_OFF>(z, i, tw) : causal_L(z, i, tw, off);
+            if (qz_dec(zl, z + i * 16, i, nb)) {
+                if (a) { memset(a + i * 16, 0, 32); memset(b + i * 16, 0, 32); }
+                continue;
+            }
+            g_src->block(L, z + i * 16);
+            if (a) tb_get16(r, z + i * 16, a + i * 16, b + i * 16);
+        }
+        if (!a) std::fill(z + n, z + nb * 16 + 32, uint16_t(0));
+        return;
+    }
+    std::memset(z, 0, (nb * 16 + 32) * sizeof(uint16_t));
+    if (!a) {
+        qhk::dec_core<0>(z, nullptr, nullptr, nullptr, n, tw, r);
+    } else {
+        std::memset(a, 0, (nb * 16 + 16) * sizeof(uint16_t));
+        std::memset(b, 0, (nb * 16 + 16) * sizeof(uint16_t));
+        qhk::dec_core<1>(z, zy, a, b, n, tw, r);
+    }
+}
 #define QZ_ENC(z, i, nb) if (qz_enc(zl, z, i, nb)) continue
 #define QZ_DEC(z, i, nb) if (qz_dec(zl, (z) + (i) * 16, i, nb)) continue
 #else
@@ -708,16 +829,19 @@ static void tile_enc(const uint8_t* img, int S, int tw, int th, const Cfg& c, Ou
     (void)o; (void)tmp;
     const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
     static thread_local UBuf<uint16_t> zb, hb[8], plb;
-    zb.need(nb * 16 + 16); uint16_t* z = zb.data();
+    zb.need(nb * 16 + 32); uint16_t* z = zb.data();
 #if defined(PLR_FRONT)
-    if (!g_sink->pair_mask) { front_gray(img, S, tw, th, z); std::fill(z + n, z + nb * 16 + 16, uint16_t(0));
-        if (c.screen) qhs_plane_enc(z, nullptr, nb, tw); else qh_plane_enc(z, nullptr, nb, tw, c.off); return; }
+    if (!g_sink->pair_mask) { front_gray(img, S, tw, th, z); std::fill(z + n, z + nb * 16 + 32, uint16_t(0));
+        if (c.rlk) { g_rlk_zy.need(nb * 16 + 32); memcpy(g_rlk_zy.data(), z, (nb * 16 + 32) * 2); qhk_plane_enc(z, nullptr, nullptr, nb, int(n), tw, c.off); }
+        else if (c.screen) qhs_plane_enc(z, nullptr, nb, tw); else qh_plane_enc(z, nullptr, nb, tw, c.off); return; }
 #endif
-    std::fill(z + n, z + nb * 16 + 16, uint16_t(0));
+    std::fill(z + n, z + nb * 16 + 32, uint16_t(0));
     resid_row0(img, z, tw);
     for (int y = 1; y < th; ++y) resid_row(img + size_t(y) * S, img + size_t(y - 1) * S, z + size_t(y) * tw, tw);
 #if defined(PLR_QH) && !defined(PLR_DUMP) && !defined(PLR_OLD_ENC)
-    if (!g_sink->pair_mask) { if (c.screen) qhs_plane_enc(z, nullptr, nb, tw); else qh_plane_enc(z, nullptr, nb, tw, c.off); return; }
+    if (!g_sink->pair_mask) {
+        if (c.rlk) { g_rlk_zy.need(nb * 16 + 32); memcpy(g_rlk_zy.data(), z, (nb * 16 + 32) * 2); qhk_plane_enc(z, nullptr, nullptr, nb, int(n), tw, c.off); }
+        else if (c.screen) qhs_plane_enc(z, nullptr, nb, tw); else qh_plane_enc(z, nullptr, nb, tw, c.off); return; }
 #endif
     plb.need(nb * 8); uint16_t* pw = plb.data(); size_t hn[8] = {0};
     for (auto& h : hb) h.need(nb * 16);
@@ -752,10 +876,12 @@ static void tile_enc(const uint8_t* img, int S, int tw, int th, const Cfg& c, Ou
 static void tile_dec(In& in, uint8_t* img, int S, int tw, int th, const Cfg& c) {
     const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
     static thread_local UBuf<uint16_t> zb, hb[8]; static thread_local std::vector<int8_t> e;
-    zb.need(nb * 16 + 16); uint16_t* z = zb.data(); if (e.size() < size_t(tw)) e.resize(tw);
+    g_rlk_zy.need(nb * 16 + 32); zb.need(nb * 16 + 32);
+    uint16_t* z = c.rlk ? g_rlk_zy.data() : zb.data(); if (e.size() < size_t(tw)) e.resize(tw);
     (void)in; (void)hb; size_t zl = 0; (void)zl;
 #if defined(PLR_QH)
-    if (c.screen) qhs_plane_dec(z, nullptr, nullptr, nb, tw); else
+    if (c.rlk) qhk_plane_dec(z, nullptr, nullptr, nullptr, nb, int(n), tw, c.off);
+    else if (c.screen) qhs_plane_dec(z, nullptr, nullptr, nb, tw); else
 #endif
     if (c.off == 2) {
         for (size_t i = 0; i < nb; ++i) {
@@ -790,14 +916,14 @@ static void put_text_header(Out& o, const char* magic, int W, int H) {
     o.raw(buf, size_t(n));
 }
 // "PLN1\n" / "PLN2\n" then "W H\n". Returns the byte offset of the tile-length list.
-static size_t read_text_header(const std::vector<uint8_t>& d, bool& rgb, int& W, int& H, bool& fast, bool& screen) {
+static size_t read_text_header(const std::vector<uint8_t>& d, bool& rgb, int& W, int& H, bool& fast, bool& screen, bool& rlk) {
     auto nl = std::find(d.begin(), d.end(), '\n');
     if (nl == d.end()) throw std::runtime_error("bad header");
     std::string magic(d.begin(), nl);
-    if (magic != "PLR1" && magic != "PLR2" && magic != "PLF1" && magic != "PLF2" && magic != "PLS1" && magic != "PLS2") throw std::runtime_error("not PLR1/2, PLF1/2, PLS1/2");
-    rgb = magic[3] == '2'; fast = magic[2] == 'F'; screen = magic[2] == 'S';
+    if (magic != "PLR1" && magic != "PLR2" && magic != "PLF1" && magic != "PLF2" && magic != "PLS1" && magic != "PLS2" && magic != "PLK1" && magic != "PLK2") throw std::runtime_error("not PLR1/2, PLF1/2, PLS1/2, PLK1/2");
+    rgb = magic[3] == '2'; fast = magic[2] == 'F'; screen = magic[2] == 'S'; rlk = magic[2] == 'K';
 #if !defined(PLR_QH)
-    if (screen) throw std::runtime_error("PLS needs the QH build");
+    if (screen || rlk) throw std::runtime_error("PLS/PLK needs the QH build");
 #endif
     auto nl2 = std::find(nl + 1, d.end(), '\n');
     if (nl2 == d.end()) throw std::runtime_error("bad header");
@@ -837,7 +963,7 @@ struct TileEnc {                                // one bit lane per tile for eve
 };
 struct TileDec {
     std::vector<uint64_t> words; rlgrl::LaneR lr; std::vector<RDec> d; Source sr[3];
-    TileDec(In& in, int planes) { const size_t n = size_t(in.var()); words.assign(n + 2, 0); memcpy(words.data(), in.take(n * 8), n * 8);
+    TileDec(In& in, int planes) { const size_t n = size_t(in.var()); words.assign(n + 16, 0); memcpy(words.data(), in.take(n * 8), n * 8);
         lr.w = words.data(); lr.nw = n + 2; d.reserve(24);
         for (int i = 0; i < planes * 8; ++i) d.emplace_back(&lr);
         for (int p = 0; p < planes; ++p) { sr[p].raw = &lr; for (int L = 0; L < 8; ++L) sr[p].d[L] = &d[size_t(p) * 8 + L]; } }
@@ -907,18 +1033,31 @@ struct TileDec {
 std::vector<uint8_t> compress(const uint8_t* img, int W, int H, const Cfg& c) {
     Grid g = grid(W, H); const int nt = g.nx * g.ny; static thread_local std::vector<uint8_t> tmp;
     Out o; o.b.reserve(size_t(W) * H + size_t(nt) * 4 + 4096);
-    put_text_header(o, c.fast ? "PLF1" : c.screen ? "PLS1" : "PLR1", W, H);
+    put_text_header(o, c.fast ? "PLF1" : c.rlk ? "PLK1" : c.screen ? "PLS1" : "PLR1", W, H);
     const size_t lens = o.b.size(); o.b.resize(lens + size_t(nt) * 4);
-    for (int i = 0; i < nt; ++i) {
-        const size_t b = o.b.size(); const uint8_t* ti = img + size_t(g.ty(i)) * W + g.tx(i);
+    auto enc_one = [&](int i, Out& dst) {
+        const uint8_t* ti = img + size_t(g.ty(i)) * W + g.tx(i);
         TileEnc te(1, size_t(g.tw(i)) * g.th(i)); te.sk[0].pair_mask = c.fast ? PLR_FAST_MASK : 0; g_sink = &te.sk[0];
-        tile_enc(ti, W, g.tw(i), g.th(i), c, o, tmp); te.finish(o);
+        tile_enc(ti, W, g.tw(i), g.th(i), c, dst, tmp); te.finish(dst);
+    };
+    const int ic = (g.ny / 2) * g.nx + (g.nx / 2);
+    static thread_local Out o_ic;
+    if (c.rlk && g_plk_force == 4) {
+        g_plk_cur_mode = 4;
+        if (ic > 0) { o_ic.b.clear(); enc_one(ic, o_ic); }
+    } else {
+        g_plk_cur_mode = g_plk_force ? g_plk_force : 5;
+    }
+    for (int i = 0; i < nt; ++i) {
+        const size_t b = o.b.size();
+        if (c.rlk && g_plk_force == 4 && i == ic && ic > 0) o.raw(o_ic.b.data(), o_ic.b.size());
+        else enc_one(i, o);
         const uint32_t l = uint32_t(o.b.size() - b); memcpy(&o.b[lens + size_t(i) * 4], &l, 4);
     }
     return std::move(o.b);
 }
 void decompress(const std::vector<uint8_t>& d, std::vector<uint8_t>& img, int& W, int& H) {
-    Cfg c; bool rgb = false; size_t pos = read_text_header(d, rgb, W, H, c.fast, c.screen); if (c.fast) c.off = PLR_FAST_OFF;
+    Cfg c; bool rgb = false; size_t pos = read_text_header(d, rgb, W, H, c.fast, c.screen, c.rlk); if (c.fast) c.off = PLR_FAST_OFF;
     if (rgb) throw std::runtime_error("not PLR1/PLF1");
     Grid g = grid(W, H); const int nt = g.nx * g.ny; std::vector<uint32_t> len(nt);
     if (d.size() < pos + size_t(nt) * 4) throw std::runtime_error("truncated");
@@ -1075,9 +1214,13 @@ static void tile_enc_uv(const int16_t* U, const int16_t* V, int tw, int th, cons
     for (int y = 1; y < th; ++y) { resid16_row(U + size_t(y) * tw, U + size_t(y - 1) * tw, a + size_t(y) * tw, tw);
                                    resid16_row(V + size_t(y) * tw, V + size_t(y - 1) * tw, b + size_t(y) * tw, tw); }
     for (size_t p = 0; p < n; ++p) S[p] = uint16_t(a[p] + b[p]);
-    std::fill(S + n, S + nb * 16 + 16, uint16_t(0)); std::fill(a + n, a + nb * 16 + 16, uint16_t(0));
+    zu.need(nb * 16 + 32); zv.need(nb * 16 + 32); sb.need(nb * 16 + 32);
+    a = zu.data(); b = zv.data(); S = sb.data();
+    std::fill(S + n, S + nb * 16 + 32, uint16_t(0)); std::fill(a + n, a + nb * 16 + 32, uint16_t(0));
 #if defined(PLR_QH) && !defined(PLR_DUMP) && !defined(PLR_OLD_ENC)
-    if (!g_sink->pair_mask) { if (c.screen) qhs_plane_enc(S, a, nb, tw); else qh_plane_enc(S, a, nb, tw, c.off + PLR_UVOFF); return; }
+    if (!g_sink->pair_mask) {
+        if (c.rlk) qhk_plane_enc(S, g_rlk_zy.data(), a, nb, int(n), tw, c.off + PLR_UVOFF);
+        else if (c.screen) qhs_plane_enc(S, a, nb, tw); else qh_plane_enc(S, a, nb, tw, c.off + PLR_UVOFF); return; }
 #endif
     plb.need(nb * 8); uint16_t* pw = plb.data(); size_t zl = 0; (void)zl;
     for (size_t i = 0; i < nb; ++i) {
@@ -1099,10 +1242,11 @@ static inline bool qz_dec_uv(size_t&, uint16_t*, uint16_t*, uint16_t*, size_t, s
 static void tile_dec_uv(int16_t* U, int16_t* V, int tw, int th, const Cfg& c) {
     const size_t n = size_t(tw) * th, nb = (n + 15) / 16;
     static thread_local UBuf<uint16_t> zu, zv, sb;
-    zu.need(nb * 16 + 16); zv.need(nb * 16 + 16); sb.need(nb * 16 + 16);
+    zu.need(nb * 16 + 32); zv.need(nb * 16 + 32); sb.need(nb * 16 + 32);
     uint16_t* a = zu.data(); uint16_t* b = zv.data(); uint16_t* S = sb.data(); size_t zl = 0; (void)zl;
 #if defined(PLR_QH)
-    if (c.screen) qhs_plane_dec(S, a, b, nb, tw); else
+    if (c.rlk) qhk_plane_dec(S, g_rlk_zy.data(), a, b, nb, int(n), tw, c.off + PLR_UVOFF);
+    else if (c.screen) qhs_plane_dec(S, a, b, nb, tw); else
 #endif
     for (size_t i = 0; i < nb; ++i) {
         const int L = causal_L(S, i, tw, c.off + PLR_UVOFF);
@@ -1157,38 +1301,50 @@ static void rgb_join(uint8_t* rgb, int W, int tw, int th, const uint8_t* Y, cons
 std::vector<uint8_t> compress_rgb(const uint8_t* rgb, int W, int H, const Cfg& c) {
     Grid g = grid(W, H); const int nt = g.nx * g.ny; static thread_local std::vector<uint8_t> tmp, Y; static thread_local std::vector<int16_t> U, V;
     Out o; o.b.reserve(size_t(W) * H * 3);
-    put_text_header(o, c.fast ? "PLF2" : c.screen ? "PLS2" : "PLR2", W, H);
+    put_text_header(o, c.fast ? "PLF2" : c.rlk ? "PLK2" : c.screen ? "PLS2" : "PLR2", W, H);
     const size_t lens = o.b.size(); o.b.resize(lens + size_t(nt) * 4);
-    for (int i = 0; i < nt; ++i) {
-        const size_t b = o.b.size();
+    auto enc_one = [&](int i, Out& dst) {
 #if defined(PLR_FRONT)
         if (!c.fast) {                                 // PLR: one pass over the tile's rows, then the two planes
-            static thread_local UBuf<uint16_t> zy, zu, zs; const int tw = g.tw(i), th = g.th(i); const size_t n = size_t(tw) * th, nb = (n + 15) / 16, m = nb * 16 + 16;
+            static thread_local UBuf<uint16_t> zy, zu, zs; const int tw = g.tw(i), th = g.th(i); const size_t n = size_t(tw) * th, nb = (n + 15) / 16, m = nb * 16 + 32;
             zy.need(m); zu.need(m); zs.need(m);
             front_rgb(rgb + (size_t(g.ty(i)) * W + g.tx(i)) * 3, W, tw, th, zy.data(), zu.data(), zs.data());
             std::fill(zy.data() + n, zy.data() + m, uint16_t(0)); std::fill(zu.data() + n, zu.data() + m, uint16_t(0)); std::fill(zs.data() + n, zs.data() + m, uint16_t(0));
             TileEnc te(3, n * 3); for (auto& k : te.sk) k.pair_mask = 0;
             te.sk[1].pid = 1; te.sk[2].pid = 2; g_sink = &te.sk[0];
-            if (c.screen) { qhs_plane_enc(zy.data(), nullptr, nb, tw); g_sink = &te.sk[1]; qhs_plane_enc(zs.data(), zu.data(), nb, tw); }
+            if (c.rlk) { qhk_plane_enc(zy.data(), nullptr, nullptr, nb, int(n), tw, c.off); g_sink = &te.sk[1]; qhk_plane_enc(zs.data(), zy.data(), zu.data(), nb, int(n), tw, c.off + PLR_UVOFF); }
+            else if (c.screen) { qhs_plane_enc(zy.data(), nullptr, nb, tw); g_sink = &te.sk[1]; qhs_plane_enc(zs.data(), zu.data(), nb, tw); }
             else { qh_plane_enc(zy.data(), nullptr, nb, tw, c.off); g_sink = &te.sk[1]; qh_plane_enc(zs.data(), zu.data(), nb, tw, c.off + PLR_UVOFF); }
-            te.finish(o);
-            const uint32_t l = uint32_t(o.b.size() - b); memcpy(&o.b[lens + size_t(i) * 4], &l, 4); continue;
+            te.finish(dst); return;
         }
 #endif
         rgb_split(rgb + (size_t(g.ty(i)) * W + g.tx(i)) * 3, W, g.tw(i), g.th(i), Y, U, V);
         TileEnc te(3, size_t(g.tw(i)) * g.th(i) * 3); for (auto& k : te.sk) k.pair_mask = c.fast ? PLR_FAST_MASK : 0;
-        te.sk[1].pid = 1; te.sk[2].pid = 2; g_sink = &te.sk[0]; tile_enc(Y.data(), g.tw(i), g.tw(i), g.th(i), c, o, tmp);
+        te.sk[1].pid = 1; te.sk[2].pid = 2; g_sink = &te.sk[0]; tile_enc(Y.data(), g.tw(i), g.tw(i), g.th(i), c, dst, tmp);
         if (!c.fast) { g_sink = &te.sk[1]; tile_enc_uv(U.data(), V.data(), g.tw(i), g.th(i), c); }
         else {
-        g_sink = &te.sk[1]; tile_enc16(U.data(), g.tw(i), g.th(i), c, o, tmp);
-        g_sink = &te.sk[2]; tile_enc16(V.data(), g.tw(i), g.th(i), c, o, tmp); }
-        te.finish(o);
+        g_sink = &te.sk[1]; tile_enc16(U.data(), g.tw(i), g.th(i), c, dst, tmp);
+        g_sink = &te.sk[2]; tile_enc16(V.data(), g.tw(i), g.th(i), c, dst, tmp); }
+        te.finish(dst);
+    };
+    const int ic = (g.ny / 2) * g.nx + (g.nx / 2);
+    static thread_local Out o_ic;
+    if (c.rlk && g_plk_force == 4) {
+        g_plk_cur_mode = 4;
+        if (ic > 0) { o_ic.b.clear(); enc_one(ic, o_ic); }
+    } else {
+        g_plk_cur_mode = g_plk_force ? g_plk_force : 5;
+    }
+    for (int i = 0; i < nt; ++i) {
+        const size_t b = o.b.size();
+        if (c.rlk && g_plk_force == 4 && i == ic && ic > 0) o.raw(o_ic.b.data(), o_ic.b.size());
+        else enc_one(i, o);
         const uint32_t l = uint32_t(o.b.size() - b); memcpy(&o.b[lens + size_t(i) * 4], &l, 4);
     }
     return std::move(o.b);
 }
 void decompress_rgb(const std::vector<uint8_t>& d, std::vector<uint8_t>& rgb, int& W, int& H) {
-    Cfg c; bool rgb_file = false; size_t pos = read_text_header(d, rgb_file, W, H, c.fast, c.screen); if (c.fast) c.off = PLR_FAST_OFF;
+    Cfg c; bool rgb_file = false; size_t pos = read_text_header(d, rgb_file, W, H, c.fast, c.screen, c.rlk); if (c.fast) c.off = PLR_FAST_OFF;
     if (!rgb_file) throw std::runtime_error("not PLR2/PLF2");
     Grid g = grid(W, H); const int nt = g.nx * g.ny; std::vector<uint32_t> len(nt);
     if (d.size() < pos + size_t(nt) * 4) throw std::runtime_error("truncated");
@@ -1234,23 +1390,28 @@ static std::vector<uint8_t> read_bin(const std::string& fn) {
 int main(int argc, char** argv) {
     using namespace palic2;
 #if defined(PLR_QH)
-    qh::init(); qhs::init();
+    qh::init(); qhs::init(); qhk::init();
 #endif
-    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.plr [-f] (the input itself if it does not shrink) | d in.plr|pgm|ppm out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N] [-f]  (-f: fast mode, pairs, files PLF1/PLF2; -s or -s=auto: screen mode PLS1/PLS2, PLR or PLS per plane by a detector; -s=screen: every plane PLS; -s=photo: every plane PLR coding)\n", argv[0]); return 1; }
+    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.plr [-f] (the input itself if it does not shrink) | d in.plr|pgm|ppm out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N] [-f]  (-f: fast mode, pairs, files PLF1/PLF2; -s or -s=auto: screen mode PLS1/PLS2, PLR or PLS per plane by a detector; -s=screen: every plane PLS; -s=photo: every plane PLR coding; -k or -k=auto: RLK v9 or PLR per plane by the zero-quad share, files PLK1/PLK2; -k=center: one choice per image by the central tile; -k=v2: per-plane probe with a double pass; -k=rlk / -k=plr: forced)\n", argv[0]); return 1; }
     std::string cmd = argv[1]; Cfg c; int reps = 3; std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i) { std::string a = argv[i];
         if (a == "-r" && i + 1 < argc) reps = atoi(argv[++i]);
-        else if (a == "-f") { c.fast = true; c.off = PLR_FAST_OFF; c.screen = false; }
-        else if (a == "-s" || a == "-s=auto") { c.screen = !c.fast; g_pls_force = 0; }
-        else if (a == "-s=screen") { c.screen = !c.fast; g_pls_force = 1; }
-        else if (a == "-s=photo") { c.screen = !c.fast; g_pls_force = 2; }
+        else if (a == "-f") { c.fast = true; c.off = PLR_FAST_OFF; c.screen = false; c.rlk = false; }
+        else if (a == "-s" || a == "-s=auto") { c.screen = !c.fast; c.rlk = false; g_pls_force = 0; }
+        else if (a == "-s=screen") { c.screen = !c.fast; c.rlk = false; g_pls_force = 1; }
+        else if (a == "-s=photo") { c.screen = !c.fast; c.rlk = false; g_pls_force = 2; }
+        else if (a == "-k" || a == "-k=auto") { c.rlk = !c.fast; c.screen = false; g_plk_force = 0; }
+        else if (a == "-k=rlk") { c.rlk = !c.fast; c.screen = false; g_plk_force = 1; }
+        else if (a == "-k=plr") { c.rlk = !c.fast; c.screen = false; g_plk_force = 2; }
+        else if (a == "-k=v2") { c.rlk = !c.fast; c.screen = false; g_plk_force = 3; }
+        else if (a == "-k=center") { c.rlk = !c.fast; c.screen = false; g_plk_force = 4; }
         else if (cmd == "bench" && std::filesystem::is_directory(a)) { std::vector<std::string> v;
             for (auto& e : std::filesystem::directory_iterator(a)) { auto x = e.path().extension();
                 if (x == ".pgm" || x == ".ppm" || x == ".pnm") v.push_back(e.path().string()); }
             std::sort(v.begin(), v.end()); pos.insert(pos.end(), v.begin(), v.end()); }
         else pos.push_back(a); }
 #if !defined(PLR_QH) || defined(PLR_DUMP) || defined(PLR_OLD_ENC)
-    if (c.screen) { fprintf(stderr, "-s: the screen mode needs the QH build (not PLR_NO_QH, PLR_DUMP, PLR_OLD_ENC)\n"); return 1; }
+    if (c.screen || c.rlk) { fprintf(stderr, "-s/-k: screen/rlk mode needs the QH build (not PLR_NO_QH, PLR_DUMP, PLR_OLD_ENC)\n"); return 1; }
 #endif
     try {
         if (cmd == "c" && pos.size() == 2) {

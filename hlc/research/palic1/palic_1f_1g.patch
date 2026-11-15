@@ -1,0 +1,321 @@
+diff --git a/src/palic.cpp b/src/palic.cpp
+index e85b3d6..dda5e14 100644
+--- a/src/palic.cpp
++++ b/src/palic.cpp
+@@ -542,6 +542,47 @@ static void predict_row(const int16_t* __restrict cur, const int16_t* __restrict
+     }
+ }
+ 
++// "1g": fNBLI's gradient-adjusted predictor (no bias correction, no contexts) instead of MED.
++// Neighbours: a left, b up, c up-left, d up-right, e left-left, f up-up, g up-up-right.
++// Band row 0: left (as MED). Row 1: f = b, g = d. x = 0: a = c = e = b; x = 1: e = a; last column: d = b, g = f.
++// LO..HI: the sample range (Y 0..255, U/V -256..255); fNBLI works on offset samples, the shift is exact here.
++template <bool NINE>
++static inline int16_t gap_pred(int16_t a, int16_t b, int16_t c, int16_t d, int16_t e, int16_t f, int16_t g) {
++    constexpr int16_t LO = NINE ? -256 : 0, HI = 255;
++    auto ab_ = [](int16_t v) { return int16_t(v < 0 ? -v : v); };
++    const int16_t dh = int16_t(ab_(int16_t(a - e)) + ab_(int16_t(b - c)) + ab_(int16_t(b - d)));
++    const int16_t dv = int16_t(ab_(int16_t(a - c)) + ab_(int16_t(b - f)) + ab_(int16_t(d - g)));
++    int16_t dvh = int16_t(dv - dh);
++    const int16_t ab = dvh > 0 ? a : b;
++    dvh = ab_(dvh);
++    int16_t px = int16_t((a + b) * 9 + (d << 1) - (c << 1) - e - f);
++    px = px < int16_t(16 * LO) ? int16_t(16 * LO) : px;
++    px = px > int16_t(16 * HI) ? int16_t(16 * HI) : px;
++    const int16_t pa = int16_t((px + (ab << 4) + 16) >> 5), pb = int16_t((3 * px + (ab << 4) + 32) >> 6), p0 = int16_t((px + 8) >> 4);
++    int16_t p = p0;
++    p = dvh > 8 ? pb : p;
++    p = dvh > 32 ? pa : p;
++    p = dvh > 80 ? ab : p;
++    return p;
++}
++template <bool NINE>
++static void predict_row_gap(const int16_t* __restrict cur, const int16_t* __restrict up, const int16_t* __restrict up2,
++                            int y, int width, uint16_t* __restrict z) {
++    if (y == 0) {
++        z[0] = wrap_zigzag<NINE>(cur[0]);
++        for (int x = 1; x < width; ++x) z[x] = wrap_zigzag<NINE>(int16_t(cur[x] - cur[x - 1]));
++        return;
++    }
++    for (int x = 0; x < width; ++x) {
++        const int16_t b = up[x];
++        const int16_t a = x ? cur[x - 1] : b, c = x ? up[x - 1] : b, e = x >= 2 ? cur[x - 2] : a;
++        const int16_t d = x + 1 < width ? up[x + 1] : b;
++        const int16_t f = y >= 2 ? up2[x] : b;
++        const int16_t g = y >= 2 ? (x + 1 < width ? up2[x + 1] : f) : d;
++        z[x] = wrap_zigzag<NINE>(int16_t(cur[x] - gap_pred<NINE>(a, b, c, d, e, f, g)));
++    }
++}
++
+ // ============================================================================================
+ // Image
+ // ============================================================================================
+@@ -626,15 +667,17 @@ static void put_u32(std::vector<uint8_t>& o, uint32_t v) {
+ // ============================================================================================
+ 
+ // One band: rows y0 .. y0 + bh - 1 -> its chroma and luma streams.
+-static void compress_band(const Image& im, int y0, int bh, std::vector<uint32_t>& chroma,
+-                          std::vector<uint32_t>& luma) {
++static bool g_free = false;  // "1f": U, V, Y as three planes, no joint chroma, no truncated zU
++static bool g_gap = false;   // "1g": fNBLI's GAP predictor instead of MED
++// magic "LRN" + '2' + free + 2 * gap: LRN2 1s, LRN3 1f, LRN4 1g (joint chroma), LRN5 1f + 1g
++static void compress_band(const Image& im, int y0, int bh, std::vector<uint32_t>* st) {
+     const int width = im.width;
+     const size_t n = size_t(width) * bh;
+ 
+     // 1. RCT + prediction, row by row; the residuals of each row go straight to their places in
+     //    tile order: S = zU + zV and zU for the chroma plane, zY for the luma plane.
+     std::vector<uint16_t> S(n), zU(n), zY(n);
+-    std::vector<int16_t> rows[3][2];  // per plane: the current row and the one above
++    std::vector<int16_t> rows[3][3];  // per plane: the current row and the two above
+     for (auto& plane : rows)
+         for (auto& r : plane) r.assign(width, 0);
+     std::vector<uint16_t> zu(width), zv(width), zl(width);
+@@ -642,24 +685,33 @@ static void compress_band(const Image& im, int y0, int bh, std::vector<uint32_t>
+     for (int y = 0; y < bh; ++y) {
+         int16_t* cur[3];
+         const int16_t* up[3];
++        const int16_t* up2[3];
+         for (int c = 0; c < 3; ++c) {
+-            cur[c] = rows[c][y & 1].data();
+-            up[c] = rows[c][(y + 1) & 1].data();
++            cur[c] = rows[c][y % 3].data();
++            up[c] = rows[c][(y + 2) % 3].data();
++            up2[c] = rows[c][(y + 1) % 3].data();
+         }
+         rct_row(im.rgb.data() + size_t(y0 + y) * width * 3, width, cur[0], cur[1], cur[2]);
+-        predict_row<true>(cur[0], up[0], y == 0, width, zu.data());   // U, 9 bits
+-        predict_row<true>(cur[1], up[1], y == 0, width, zv.data());   // V, 9 bits
+-        predict_row<false>(cur[2], up[2], y == 0, width, zl.data());  // Y, 8 bits
++        if (g_gap) {
++            predict_row_gap<true>(cur[0], up[0], up2[0], y, width, zu.data());
++            predict_row_gap<true>(cur[1], up[1], up2[1], y, width, zv.data());
++            predict_row_gap<false>(cur[2], up[2], up2[2], y, width, zl.data());
++        } else {
++            predict_row<true>(cur[0], up[0], y == 0, width, zu.data());   // U, 9 bits
++            predict_row<true>(cur[1], up[1], y == 0, width, zv.data());   // V, 9 bits
++            predict_row<false>(cur[2], up[2], y == 0, width, zl.data());  // Y, 8 bits
++        }
+         for_each_segment(y, width, bh, [&](int x0, int len, size_t pos) {
+-            for (int i = 0; i < len; ++i) S[pos + i] = uint16_t(zu[x0 + i] + zv[x0 + i]);
++            if (g_free) std::memcpy(&S[pos], &zv[x0], size_t(len) * 2);   // 1f: S holds zV
++            else for (int i = 0; i < len; ++i) S[pos + i] = uint16_t(zu[x0 + i] + zv[x0 + i]);
+             std::memcpy(&zU[pos], &zu[x0], size_t(len) * 2);
+             std::memcpy(&zY[pos], &zl[x0], size_t(len) * 2);
+         });
+     }
+ 
+     // 2. Entropy-code the two planes.
+-    chroma = encode_plane(S.data(), n, zU.data());
+-    luma = encode_plane(zY.data(), n, nullptr);
++    if (g_free) { st[0] = encode_plane(zU.data(), n, nullptr); st[1] = encode_plane(S.data(), n, nullptr); st[2] = encode_plane(zY.data(), n, nullptr); }
++    else { st[0] = encode_plane(S.data(), n, zU.data()); st[1] = encode_plane(zY.data(), n, nullptr); }
+ }
+ 
+ std::vector<uint8_t> compress(const Image& im, int threads) {
+@@ -668,14 +720,15 @@ std::vector<uint8_t> compress(const Image& im, int threads) {
+         throw std::runtime_error("image size must be 1..65535");
+     const int nb = (height + kBand - 1) / kBand;
+ 
+-    std::vector<std::vector<uint32_t>> streams(2 * size_t(nb));  // band b: chroma 2b, luma 2b + 1
++    const size_t np = g_free ? 3 : 2;  // streams per band: chroma, luma (LRN2) or U, V, Y (LRN3)
++    std::vector<std::vector<uint32_t>> streams(np * size_t(nb));
+     parallel_for(nb, threads, [&](int b) {
+         const int y0 = b * kBand;
+-        compress_band(im, y0, std::min(kBand, height - y0), streams[2 * size_t(b)], streams[2 * size_t(b) + 1]);
++        compress_band(im, y0, std::min(kBand, height - y0), &streams[np * size_t(b)]);
+     });
+ 
+     // Header + index + streams.
+-    std::vector<uint8_t> out = {'L', 'R', 'N', '2',
++    std::vector<uint8_t> out = {'L', 'R', 'N', uint8_t('2' + (g_free ? 1 : 0) + (g_gap ? 2 : 0)),
+                                 uint8_t(width), uint8_t(width >> 8),
+                                 uint8_t(height), uint8_t(height >> 8)};
+     for (auto& s : streams) put_u32(out, uint32_t(s.size()));
+@@ -759,18 +812,97 @@ static void recon_wave(int16_t* img, int tw, int th, const uint16_t* z) {
+         for (int k = 0; k < R; ++k) std::memcpy(img + size_t(y0 + k) * tw, Ob.data() + size_t(k) * RS + 32, size_t(tw) * 2);
+     }
+ }
++// GAP wave: skew 2 (d and g sit one column right of the rows above). Lane k = row y0 + k at x = t - 2k.
++// History H1..H4 = values of steps t-1..t-4: a = H1, e = H2 (own lane); d = H1, b = H2, c = H3 (lane k-1);
++// g = H3, f = H4 (lane k-2). Lanes 0 and 1 take the missing rows from the two rows above the group (T1, T2).
++template <bool NINE>
++static void recon_wave_gap(int16_t* img, int tw, int th, const uint16_t* z) {
++    constexpr int PAD = 48;
++    static thread_local std::vector<int16_t> Eb, Ob, T1b, T2b; const int RS = tw + 2 * PAD;
++    Eb.assign(size_t(RS) * 16, 0); Ob.resize(size_t(RS) * 16); T1b.assign(size_t(tw) + 2 * PAD, 0); T2b.assign(size_t(tw) + 2 * PAD, 0);
++    const v16s K = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
++    constexpr int16_t LO = NINE ? -256 : 0, HI = 255;
++    for (int y0 = 0; y0 < th; y0 += 16) {
++        const int R = std::min(16, th - y0), steps = tw + 2 * (R - 1);
++        for (int k = 0; k < R; ++k) { const uint16_t* zr = z + size_t(y0 + k) * tw; int16_t* e = Eb.data() + size_t(k) * RS + PAD;
++            for (int x = 0; x < tw; ++x) e[x] = int16_t(int(zr[x] >> 1) ^ -int(zr[x] & 1)); }
++        for (int k = R; k < 16; ++k) std::fill(Eb.data() + size_t(k) * RS, Eb.data() + size_t(k + 1) * RS, int16_t(0));
++        int16_t* T1 = T1b.data() + PAD; int16_t* T2 = T2b.data() + PAD;
++        if (y0 >= 1) std::memcpy(T1, img + size_t(y0 - 1) * tw, size_t(tw) * 2);
++        if (y0 >= 2) std::memcpy(T2, img + size_t(y0 - 2) * tw, size_t(tw) * 2);
++        const v16s Y = K + (int16_t)y0;
++        v16s H1 = {}, H2 = {}, H3 = {}, H4 = {};
++        for (int t0 = 0; t0 < steps; t0 += 16) {
++            v16s m[16];
++            for (int k = 0; k < 16; ++k) std::memcpy(&m[k], Eb.data() + size_t(k) * RS + PAD + t0 - 2 * k, 32);
++            tr16s(m);                                                             // m[j] = residuals of step t0 + j
++            for (int j = 0; j < 16; ++j) {
++                const int t = t0 + j;
++                const v16s X = (int16_t)t - K - K;
++                auto tv = [&](const int16_t* T, int x) { return T[std::min(std::max(x, -PAD), tw + PAD - 1)]; };
++                // lane k-1 values (shift up one lane), lane 0 from T1
++                v16s d = SV(H1, VSPL(v16s, tv(T1, t + 1)), 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
++                v16s b = SV(H2, VSPL(v16s, tv(T1, t)), 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
++                v16s c = SV(H3, VSPL(v16s, tv(T1, t - 1)), 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
++                // lane k-2 values (shift two lanes), lane 0 from T2, lane 1 from T1
++                v16s g0 = SV(H3, VSPL(v16s, tv(T2, t + 1)), 16, 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13);
++                v16s f0 = SV(H4, VSPL(v16s, tv(T2, t)), 16, 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13);
++                const v16s lane1 = K == 1;
++                v16s g = lane1 ? VSPL(v16s, tv(T1, t - 1)) : g0;                  // lane 1: row y0 - 1 at x + 1 = t - 1
++                v16s f = lane1 ? VSPL(v16s, tv(T1, t - 2)) : f0;                  // lane 1: row y0 - 1 at x = t - 2
++                v16s a = H1, e = H2;
++                // borders
++                const v16s x0 = X == 0, x1 = X == 1, xl = X == (int16_t)(tw - 1), y1 = Y == 1, ybig = Y >= 2;
++                a = x0 ? b : a; c = x0 ? b : c; e = x0 ? b : e; e = x1 ? a : e;
++                d = xl ? b : d;
++                f = ybig ? f : b;
++                g = ybig ? (xl ? f : g) : d;
++                (void)y1;
++                // GAP
++                auto absv = [](v16s v) { return v < 0 ? -v : v; };
++                const v16s dh = absv(a - e) + absv(b - c) + absv(b - d);
++                const v16s dv = absv(a - c) + absv(b - f) + absv(d - g);
++                v16s dvh = dv - dh;
++                const v16s ab = dvh > 0 ? a : b;
++                dvh = absv(dvh);
++                v16s px = (a + b) * (int16_t)9 + (d << 1) - (c << 1) - e - f;
++                px = px < (int16_t)(16 * LO) ? VSPL(v16s, 16 * LO) : px;
++                px = px > (int16_t)(16 * HI) ? VSPL(v16s, 16 * HI) : px;
++                const v16s pa = (px + (ab << 4) + (int16_t)16) >> 5, pb = (px * (int16_t)3 + (ab << 4) + (int16_t)32) >> 6;
++                v16s p = (px + (int16_t)8) >> 4;
++                p = dvh > (int16_t)8 ? pb : p;
++                p = dvh > (int16_t)32 ? pa : p;
++                p = dvh > (int16_t)80 ? ab : p;
++                // band row 0: left neighbour, 0 at x = 0
++                const v16s y0m = Y == 0;
++                p = y0m ? (x0 ? VSPL(v16s, 0) : H1) : p;
++                v16s v = p + m[j];
++                if (NINE) v = ((v + (int16_t)256) & (int16_t)511) - (int16_t)256;
++                else v = v & (int16_t)255;
++                H4 = H3; H3 = H2; H2 = H1; H1 = v; m[j] = v;
++            }
++            tr16s(m);                                                             // m[k] = row k at x = t0 - 2k ..
++            for (int k = 0; k < 16; ++k) std::memcpy(Ob.data() + size_t(k) * RS + PAD + t0 - 2 * k, &m[k], 32);
++        }
++        for (int k = 0; k < R; ++k) std::memcpy(img + size_t(y0 + k) * tw, Ob.data() + size_t(k) * RS + PAD, size_t(tw) * 2);
++    }
++}
+ #undef SV
+ #endif
+ 
+-static void decompress_band(const uint32_t* chroma, const uint32_t* luma, int y0, int bh, Image& im) {
++static void decompress_band(const uint32_t* const* st, bool fr, bool gp, int y0, int bh, Image& im) {
+     const int width = im.width;
+     const size_t n = size_t(width) * bh;
+ 
+     // 1. Entropy-decode the two planes (tile order, room for the padded last window).
+     const size_t padded = n + kWindow;
+     std::vector<uint16_t> S(padded), zU(padded), zY(padded);
+-    decode_plane<true>(chroma, n, S.data(), zU.data());
+-    decode_plane<false>(luma, n, zY.data(), nullptr);
++    if (fr) {  // 1f: zU, zV (in S), zY; S = zU + zV keeps the rest of the decoder unchanged
++        decode_plane<false>(st[0], n, zU.data(), nullptr); decode_plane<false>(st[1], n, S.data(), nullptr); decode_plane<false>(st[2], n, zY.data(), nullptr);
++    } else {
++        decode_plane<true>(st[0], n, S.data(), zU.data());
++        decode_plane<false>(st[1], n, zY.data(), nullptr);
++    }
+ 
+ #if defined(PALIC_WAVE)
+     // 2. Residuals from tile order to raster order, then MED as a wave per plane, then the inverse RCT by rows.
+@@ -778,19 +910,28 @@ static void decompress_band(const uint32_t* chroma, const uint32_t* luma, int y0
+     for (int y = 0; y < bh; ++y)
+         for_each_segment(y, width, bh, [&](int x0, int len, size_t pos) {
+             const size_t o = size_t(y) * width + x0;
+-            for (int i = 0; i < len; ++i) { ru[o + i] = zU[pos + i]; rv[o + i] = uint16_t(S[pos + i] - zU[pos + i]); }
++            std::memcpy(&ru[o], &zU[pos], size_t(len) * 2);
++            if (fr) std::memcpy(&rv[o], &S[pos], size_t(len) * 2);     // 1f: S is zV
++            else for (int i = 0; i < len; ++i) rv[o + i] = uint16_t(S[pos + i] - zU[pos + i]);
+             std::memcpy(&rl[o], &zY[pos], size_t(len) * 2);
+         });
+     std::vector<int16_t> pu(n), pv(n), pl(n);
+-    recon_wave<true>(pu.data(), width, bh, ru.data());
+-    recon_wave<true>(pv.data(), width, bh, rv.data());
+-    recon_wave<false>(pl.data(), width, bh, rl.data());
++    if (gp) {
++        recon_wave_gap<true>(pu.data(), width, bh, ru.data());
++        recon_wave_gap<true>(pv.data(), width, bh, rv.data());
++        recon_wave_gap<false>(pl.data(), width, bh, rl.data());
++    } else {
++        recon_wave<true>(pu.data(), width, bh, ru.data());
++        recon_wave<true>(pv.data(), width, bh, rv.data());
++        recon_wave<false>(pl.data(), width, bh, rl.data());
++    }
+     for (int y = 0; y < bh; ++y) {
+         const size_t o = size_t(y) * width;
+         irct_row(pu.data() + o, pv.data() + o, pl.data() + o, width, im.rgb.data() + size_t(y0 + y) * width * 3);
+     }
+ }
+ #else
++    if (gp) throw std::runtime_error("LRN4/LRN5 (GAP) needs the vector decoder (clang or gcc >= 12)");
+     // 2. Undo the prediction and the RCT, row by row. Along a row every pixel needs its left
+     //    neighbour, so each plane is a serial chain; the three planes run in the same loop to
+     //    keep three independent chains in flight.
+@@ -808,7 +949,7 @@ static void decompress_band(const uint32_t* chroma, const uint32_t* luma, int y0
+         for_each_segment(y, width, bh, [&](int x0, int len, size_t pos) {
+             for (int i = 0; i < len; ++i) {
+                 zu[x0 + i] = zU[pos + i];
+-                zv[x0 + i] = uint16_t(S[pos + i] - zU[pos + i]);
++                zv[x0 + i] = fr ? S[pos + i] : uint16_t(S[pos + i] - zU[pos + i]);
+             }
+             std::memcpy(&zl[x0], &zY[pos], size_t(len) * 2);
+         });
+@@ -861,8 +1002,9 @@ static void decompress_band(const uint32_t* chroma, const uint32_t* luma, int y0
+ 
+ Image decompress(const std::vector<uint8_t>& d, int threads) {
+     constexpr size_t kFixedHeader = 8;
+-    if (d.size() < kFixedHeader || std::memcmp(d.data(), "LRN2", 4) != 0)
+-        throw std::runtime_error("not an LRN2 file");
++    if (d.size() < kFixedHeader || std::memcmp(d.data(), "LRN", 3) != 0 || d[3] < '2' || d[3] > '5')
++        throw std::runtime_error("not an LRN2..LRN5 file");
++    const bool fr = (d[3] - '2') & 1, gp = (d[3] - '2') & 2;
+ 
+     Image im;
+     im.width = d[4] | d[5] << 8;
+@@ -870,7 +1012,7 @@ Image decompress(const std::vector<uint8_t>& d, int threads) {
+     const int width = im.width, height = im.height;
+     if (width < 1 || height < 1) throw std::runtime_error("bad image size");
+     const int nb = (height + kBand - 1) / kBand;
+-    const size_t ns = 2 * size_t(nb);  // streams
++    const size_t np = fr ? 3 : 2, ns = np * size_t(nb);  // streams
+     if (d.size() < kFixedHeader + 4 * ns) throw std::runtime_error("truncated file");
+ 
+     // Index -> one copy of every stream, each followed by 8 spare zero words (the decoder
+@@ -889,8 +1031,9 @@ Image decompress(const std::vector<uint8_t>& d, int threads) {
+     im.rgb.resize(size_t(width) * height * 3);
+     parallel_for(nb, threads, [&](int b) {
+         const int y0 = b * kBand;
+-        decompress_band(streams[2 * size_t(b)].data(), streams[2 * size_t(b) + 1].data(), y0,
+-                        std::min(kBand, height - y0), im);
++        const uint32_t* st[3];
++        for (size_t k = 0; k < np; ++k) st[k] = streams[np * size_t(b) + k].data();
++        decompress_band(st, fr, gp, y0, std::min(kBand, height - y0), im);
+     });
+     return im;
+ }
+@@ -973,6 +1116,10 @@ int main(int argc, char** argv) {
+         const std::string a = argv[i];
+         if (a == "-t" && i + 1 < argc)
+             threads = std::atoi(argv[++i]);
++        else if (a == "-f")
++            palic::g_free = true;
++        else if (a == "-g")
++            palic::g_gap = true;
+         else
+             files.push_back(argv[i]);
+     }
