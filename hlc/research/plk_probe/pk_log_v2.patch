@@ -1,0 +1,44 @@
+--- /tmp/av2/t/palic-2/palic2r.cpp	2026-11-15 18:04:12.667566067 +0300
++++ /tmp/av2/t/palic-2/pk_log.cpp	2026-11-15 18:30:41.965200026 +0300
+@@ -656,10 +656,24 @@
+     }
+ }
+ static int g_plk_force = 0;                     // 0 auto, 1 rlk, 2 plr
++static double g_feat_zq, g_feat_b8, g_feat_nz, g_feat_bw;
+ static thread_local UBuf<uint16_t> g_rlk_zy;    // current tile Y residual plane for RLK S-plane context
+ static void qhk_plane_enc(const uint16_t* z, const uint16_t* zy, const uint16_t* a, size_t nb, int n, int tw, int off) {
+     rlgrl::Lane& lane = *g_sink->raw;
+-    const int pr = g_plk_force == 1 ? 1 : g_plk_force == 2 ? 0 : qhk::probe(z, n);
++    const int pr_probe = qhk::probe(z, n);
++    // LOG: every plane gets both encoders (oracle choice), features + sizes to stderr
++    int pr = 3;
++    {   // features over the whole plane: zero quads, all-zero 8x8 blocks, nonzero px, mean bit width
++        int zq = 0, nq = 0, nzp = 0; long sbw = 0;
++        for (int i = 0; i + 4 <= n; i += 4) { uint64_t w; memcpy(&w, z + i, 8); zq += (w == 0); nq++; }
++        for (int i = 0; i < n; ++i) { nzp += z[i] != 0; sbw += z[i] ? 32 - __builtin_clz(z[i]) : 0; }
++        const int th = n / tw; int b8 = 0, n8 = 0;
++        for (int by = 0; by + 8 <= th; by += 8) for (int bx = 0; bx + 8 <= tw; bx += 8) { bool zz = true;
++            for (int y = 0; y < 8 && zz; ++y) for (int x = 0; x < 8; ++x) if (z[(by + y) * tw + bx + x]) { zz = false; break; }
++            b8 += zz; n8++; }
++        g_feat_zq = double(zq) / std::max(nq, 1); g_feat_b8 = double(b8) / std::max(n8, 1);
++        g_feat_nz = double(nzp) / n; g_feat_bw = double(sbw) / n;
++    }
+     if (pr == 0) {
+         { rlgrl::LaneW w(lane); w.room(); w.put(1, 0); w.sync(); }
+         qh_plane_enc(z, a, nb, tw, off);
+@@ -678,7 +692,6 @@
+     else    qhk::enc_core<1>(z, zy, a, n, tw, lane);
+     const uint64_t rlk_head = lane.head;
+     const int rb = int(rlk_head - p0 - 1);
+-    if (rb * 2 <= n) return;
+ 
+     // Borderline with rb > n/2: save RLK words, rewind to p0, run PLR, restore RLK if rb < plr
+     static thread_local std::vector<uint64_t> rlk_save;
+@@ -692,6 +705,7 @@
+     { rlgrl::LaneW w(lane); w.room(); w.put(1, 0); w.sync(); }
+     qh_plane_enc(z, a, nb, tw, off);
+     const int plr = int(lane.head - p0 - 1);
++    fprintf(stderr, "PL %d %d %d %d %d %.5f %.5f %.5f %.5f\n", a ? 1 : 0, n, pr_probe, rb, plr, g_feat_zq, g_feat_b8, g_feat_nz, g_feat_bw);
+     if (rb < plr) {
+         const size_t i2 = size_t((lane.head + 63) >> 6);
+         std::memcpy(lane.w.data() + i0, rlk_save.data(), nw_save * sizeof(uint64_t));
