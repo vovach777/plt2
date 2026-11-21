@@ -1,0 +1,4 @@
+check (llrice rule) model vs real file: d_c3_full 1.6013 / 1.6013  d_c3_clic16 8.4150 / 8.4151  d_c3_crop 2.0154 / 2.0156
+screens  UP=3 DOWN=6 UPD=8 DOWND=8 DR=2 KG=1 | RLGR bpp: d_c3_full 1.4363  d_c3_clic16 8.6103  d_c3_crop 1.7852
+photos   UP=4 DOWN=9 UPD=2 DOWND=2 DR=2 KG=1 | RLGR bpp: d_c3_full 1.5994  d_c3_clic16 8.4100  d_c3_crop 2.0091
+both     UP=3 DOWN=4 UPD=4 DOWND=1 DR=2 KG=1 | RLGR bpp: d_c3_full 1.4665  d_c3_clic16 8.5056  d_c3_crop 1.8296
