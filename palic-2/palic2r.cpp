@@ -560,10 +560,22 @@ static inline uint32_t qh_block_bits_fast(uint32_t pt, uint32_t sa, bool first, 
 
 // PLS encoder choice per plane (-s / -s=auto: the detector; -s=screen: always PLS; -s=photo: always the PLR coding of
 // the plane). Encoder only: the file format (1 bit per plane) is the same for all three.
-static int g_pls_force = 0;                     // 0 auto, 1 screen, 2 photo
+static int g_pls_force = 0;                     // 0 auto, 1 screen, 2 photo, 3 zthr (PLS-probe-1), 4 zthrc (per component)
+static thread_local uint32_t g_pz_y = 0, g_pz_u = 0, g_pz_v = 0, g_pz_s = 0, g_pz_n = 0;   // PLS-probe-1, last tile: zeros, pixels
+#ifndef PLS_ZTHR
+#define PLS_ZTHR 65                              // R8F5 (llrice RLH9_ZTHR)
+#endif
+static thread_local int g_pz_plane = 0;         // PLS-probe-1: 0 = Y plane, 1 = chroma S plane of the current tile
+static inline int probe1_mode() {               // 2 = PLS, 0 = PLR; no borderline costing
+    if (g_pls_force == 3) {                     // R8F5 rule: zeros of Y + zU + zV >= 65% of 3 * pixels, one choice per tile
+        const uint64_t z = uint64_t(g_pz_y) + g_pz_u + g_pz_v, n = uint64_t(g_pz_u + g_pz_v ? 3 : 1) * g_pz_n;
+        return z * 100 >= uint64_t(PLS_ZTHR) * n ? 2 : 0; }
+    const uint64_t z = g_pz_plane ? g_pz_s : g_pz_y;                  // 4: per component, zeros of the coded plane
+    return z * 100 >= uint64_t(PLS_ZTHR) * g_pz_n ? 2 : 0;
+}
 static void qhs_plane_enc(const uint16_t* z, const uint16_t* a, size_t nb, int tw) {
 #if !defined(PLS_NO_SWITCH)
-    const int sp_mode = g_pls_force == 1 ? 2 : g_pls_force == 2 ? 0 : qhs::screen_plane_mode(z, nb);
+    const int sp_mode = g_pls_force == 1 ? 2 : g_pls_force == 2 ? 0 : g_pls_force >= 3 ? probe1_mode() : qhs::screen_plane_mode(z, nb);
     if (!sp_mode) {
         { rlgrl::LaneW w(*g_sink->raw); w.room(); w.put(1, 0); w.sync(); }
         qh_plane_enc(z, a, nb, tw, PLR_OFF);
@@ -796,17 +808,37 @@ template <int BITS> static inline void med_row16(const int16_t* r, const int16_t
         const v16u zz = ((v16u)e << 1) ^ (v16u)(e >> 15); memcpy(z + x, &zz, 32);
     }
 }
+// PLS-probe-1 (experiment, encoder only): the zero count of R8F5 (llrice) in the same vector loop. zc -= (zz == 0)
+// per lane; lanes x >= w (the 15 samples past the row) are masked. A 16-bit lane holds <= 3 * 288 * 288 / 16 per tile.
+static inline v16u zero_lanes(const v16u zz, int x, int w) {
+    static const v16u idx = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    const v16u in = idx < (v16u)(uint16_t(w - x) + (v16u){}); return (v16u)(zz == 0) & in;   // -1 in counted lanes
+}
+template <int BITS> static inline void med_row16_zc(const int16_t* r, const int16_t* up, uint16_t* z, int w, v16u& zc) {
+    for (int x = 0; x < w; x += 16) {
+        v16s a, b, c, v; memcpy(&a, r + x - 1, 32); memcpy(&v, r + x, 32); memcpy(&b, up + x, 32); memcpy(&c, up + x - 1, 32);
+        const v16s mn = a < b ? a : b, mx = a < b ? b : a; v16s p = a + b - c; p = p < mn ? mn : p; p = p > mx ? mx : p;
+        const v16s e = (v16s)((v16u)(v - p) << (16 - BITS)) >> (16 - BITS);
+        const v16u zz = ((v16u)e << 1) ^ (v16u)(e >> 15); memcpy(z + x, &zz, 32);
+        zc += zero_lanes(zz, x, w);                                                          // += -1 per zero: count = -sum
+    }
+}
+static inline uint32_t lanes_neg_sum(const v16u zc) { uint32_t s = 0; for (int i = 0; i < 16; ++i) s += uint16_t(-zc[i]); return s; }
+
 struct FrontLines { UBuf<int16_t> b; int16_t* l[6];                                         // 3 planes x (cur, up)
     void init(int tw) { const size_t n = size_t(tw) + 48; b.need(6 * n); std::fill(b.data(), b.data() + 6 * n, int16_t(0)); for (int i = 0; i < 6; ++i) l[i] = b.data() + size_t(i) * n + 16; } };
 static void front_gray(const uint8_t* img, int S, int tw, int th, uint16_t* z) {
-    static thread_local FrontLines f; f.init(tw); int16_t* cur = f.l[0]; int16_t* up = f.l[1];
+    static thread_local FrontLines f; f.init(tw); int16_t* cur = f.l[0]; int16_t* up = f.l[1]; v16u cy{};
     for (int y = 0; y < th; ++y) { const uint8_t* __restrict r = img + size_t(y) * S; int16_t* __restrict q = cur;
         if (y + PF < th) for (int x = 0; x < tw; x += 64) __builtin_prefetch(r + size_t(PF) * S + x);
         for (int x = 0; x < tw; ++x) q[x] = r[x];
-        med_row16<8>(cur, up, z + size_t(y) * tw, tw); std::swap(cur, up); }
+        if (g_pls_force >= 3) med_row16_zc<8>(cur, up, z + size_t(y) * tw, tw, cy); else med_row16<8>(cur, up, z + size_t(y) * tw, tw);
+        std::swap(cur, up); }
+    if (g_pls_force >= 3) { g_pz_y = g_pz_s = lanes_neg_sum(cy); g_pz_u = g_pz_v = 0; g_pz_n = uint32_t(tw) * uint32_t(th); g_pz_plane = 0; }
 }
 // colour: RCT + the three residual planes + S = zU + zV in one pass over the rows (zy, zu, S: nb * 16 + 16 samples)
 static void front_rgb(const uint8_t* rgb, int W, int tw, int th, uint16_t* zy, uint16_t* zu, uint16_t* S) {
+    const bool probe = g_pls_force >= 3; v16u cy{}, cu{}, cv{}, cs{};
     static thread_local FrontLines f; static thread_local UBuf<uint16_t> zvb; f.init(tw); zvb.need(size_t(tw) + 32); uint16_t* zv = zvb.data();
     int16_t* yc = f.l[0]; int16_t* yu = f.l[1]; int16_t* uc = f.l[2]; int16_t* uu = f.l[3]; int16_t* vc = f.l[4]; int16_t* vu = f.l[5]; int bad = 0;
     for (int y = 0; y < th; ++y) {
@@ -818,11 +850,19 @@ static void front_rgb(const uint8_t* rgb, int W, int tw, int th, uint16_t* zy, u
             bad |= yy; py[x] = int16_t(yy); pu[x] = int16_t(u); pv[x] = int16_t(v);
         }
         const size_t o = size_t(y) * tw;
-        med_row16<8>(yc, yu, zy + o, tw); med_row16<9>(uc, uu, zu + o, tw); med_row16<9>(vc, vu, zv, tw);
-        for (int x = 0; x < tw; x += 16) { v16u a, b; memcpy(&a, zu + o + x, 32); memcpy(&b, zv + x, 32); a += b; memcpy(S + o + x, &a, 32); }
+        if (probe) {
+            med_row16_zc<8>(yc, yu, zy + o, tw, cy); med_row16_zc<9>(uc, uu, zu + o, tw, cu); med_row16_zc<9>(vc, vu, zv, tw, cv);
+            for (int x = 0; x < tw; x += 16) { v16u a, b; memcpy(&a, zu + o + x, 32); memcpy(&b, zv + x, 32); a += b; memcpy(S + o + x, &a, 32);
+                                               cs += zero_lanes(a, x, tw); }
+        } else {
+            med_row16<8>(yc, yu, zy + o, tw); med_row16<9>(uc, uu, zu + o, tw); med_row16<9>(vc, vu, zv, tw);
+            for (int x = 0; x < tw; x += 16) { v16u a, b; memcpy(&a, zu + o + x, 32); memcpy(&b, zv + x, 32); a += b; memcpy(S + o + x, &a, 32); }
+        }
         std::swap(yc, yu); std::swap(uc, uu); std::swap(vc, vu);
     }
     if (unsigned(bad) > 255) throw std::runtime_error("Y out of range");
+    if (probe) { g_pz_y = lanes_neg_sum(cy); g_pz_u = lanes_neg_sum(cu); g_pz_v = lanes_neg_sum(cv); g_pz_s = lanes_neg_sum(cs);
+                 g_pz_n = uint32_t(tw) * uint32_t(th); }
 }
 #endif
 static void tile_enc(const uint8_t* img, int S, int tw, int th, const Cfg& c, Out& o, std::vector<uint8_t>& tmp) {
@@ -1313,7 +1353,7 @@ std::vector<uint8_t> compress_rgb(const uint8_t* rgb, int W, int H, const Cfg& c
             TileEnc te(3, n * 3); for (auto& k : te.sk) k.pair_mask = 0;
             te.sk[1].pid = 1; te.sk[2].pid = 2; g_sink = &te.sk[0];
             if (c.rlk) { qhk_plane_enc(zy.data(), nullptr, nullptr, nb, int(n), tw, c.off); g_sink = &te.sk[1]; qhk_plane_enc(zs.data(), zy.data(), zu.data(), nb, int(n), tw, c.off + PLR_UVOFF); }
-            else if (c.screen) { qhs_plane_enc(zy.data(), nullptr, nb, tw); g_sink = &te.sk[1]; qhs_plane_enc(zs.data(), zu.data(), nb, tw); }
+            else if (c.screen) { g_pz_plane = 0; qhs_plane_enc(zy.data(), nullptr, nb, tw); g_sink = &te.sk[1]; g_pz_plane = 1; qhs_plane_enc(zs.data(), zu.data(), nb, tw); }
             else { qh_plane_enc(zy.data(), nullptr, nb, tw, c.off); g_sink = &te.sk[1]; qh_plane_enc(zs.data(), zu.data(), nb, tw, c.off + PLR_UVOFF); }
             te.finish(dst); return;
         }
@@ -1392,7 +1432,7 @@ int main(int argc, char** argv) {
 #if defined(PLR_QH)
     qh::init(); qhs::init(); qhk::init();
 #endif
-    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.plr [-f] (the input itself if it does not shrink) | d in.plr|pgm|ppm out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N] [-f]  (-f: fast mode, pairs, files PLF1/PLF2; -s or -s=auto: screen mode PLS1/PLS2, PLR or PLS per plane by a detector; -s=screen: every plane PLS; -s=photo: every plane PLR coding; -k or -k=auto: RLK v9 or PLR per plane by the zero-quad share, files PLK1/PLK2; -k=center: one choice per image by the central tile; -k=v2: per-plane probe with a double pass; -k=rlk / -k=plr: forced)\n", argv[0]); return 1; }
+    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.plr [-f] (the input itself if it does not shrink) | d in.plr|pgm|ppm out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N] [-f]  (-f: fast mode, pairs, files PLF1/PLF2; -s or -s=auto: screen mode PLS1/PLS2, PLR or PLS per plane by a detector; -s=screen: every plane PLS; -s=photo: every plane PLR coding; -s=zthr: PLS-probe-1, the R8F5 zero rule (>= 65% zeros of Y+zU+zV) per tile, -s=zthrc: per component; -k or -k=auto: RLK v9 or PLR per plane by the zero-quad share, files PLK1/PLK2; -k=center: one choice per image by the central tile; -k=v2: per-plane probe with a double pass; -k=rlk / -k=plr: forced)\n", argv[0]); return 1; }
     std::string cmd = argv[1]; Cfg c; int reps = 3; std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i) { std::string a = argv[i];
         if (a == "-r" && i + 1 < argc) reps = atoi(argv[++i]);
@@ -1400,6 +1440,8 @@ int main(int argc, char** argv) {
         else if (a == "-s" || a == "-s=auto") { c.screen = !c.fast; c.rlk = false; g_pls_force = 0; }
         else if (a == "-s=screen") { c.screen = !c.fast; c.rlk = false; g_pls_force = 1; }
         else if (a == "-s=photo") { c.screen = !c.fast; c.rlk = false; g_pls_force = 2; }
+        else if (a == "-s=zthr") { c.screen = !c.fast; c.rlk = false; g_pls_force = 3; }     // PLS-probe-1: R8F5 zero rule per tile
+        else if (a == "-s=zthrc") { c.screen = !c.fast; c.rlk = false; g_pls_force = 4; }    // PLS-probe-1: per component (Y, S)
         else if (a == "-k" || a == "-k=auto") { c.rlk = !c.fast; c.screen = false; g_plk_force = 0; }
         else if (a == "-k=rlk") { c.rlk = !c.fast; c.screen = false; g_plk_force = 1; }
         else if (a == "-k=plr") { c.rlk = !c.fast; c.screen = false; g_plk_force = 2; }
