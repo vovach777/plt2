@@ -1,0 +1,9 @@
+light_ios_test imgs=  8 tiles=  168 | Y PLS    168/   168 = 100.00% | S PLS    153/   168 =  91.07%
+light_desktop_test imgs=  8 tiles=  652 | Y PLS    552/   652 =  84.66% | S PLS    544/   652 =  83.44%
+light_websight_test imgs=  8 tiles=  224 | Y PLS    224/   224 = 100.00% | S PLS    224/   224 = 100.00%
+light_docs_test imgs=  8 tiles=  128 | Y PLS    123/   128 =  96.09% | S PLS    121/   128 =  94.53%
+light_scans_test imgs=  6 tiles=  140 | Y PLS     17/   140 =  12.14% | S PLS     86/   140 =  61.43%
+light_full12   imgs=  6 tiles=  328 | Y PLS    325/   328 =  99.09% | S PLS    316/   328 =  96.34%
+light_web8     imgs=  4 tiles=  425 | Y PLS    376/   425 =  88.47% | S PLS    394/   425 =  92.71%
+light_valid    imgs=  7 tiles=  195 | Y PLS      3/   195 =   1.54% | S PLS      4/   195 =   2.05%
+light_kodak    imgs=  6 tiles=   36 | Y PLS      0/    36 =   0.00% | S PLS      0/    36 =   0.00%

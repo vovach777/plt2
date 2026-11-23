@@ -1,0 +1,55 @@
+=== ios_test ===
+probe1-zthr-old  TOTAL 8 files 1.2559 bpp  enc 1372.5 dec 634.9 MB/s  (tile 288)  all ok
+probe2-65/65     TOTAL 8 files 1.2383 bpp  enc 1634.4 dec 701.6 MB/s  (tile 288)  all ok
+probe2-50/50     TOTAL 8 files 1.2379 bpp  enc 1594.7 dec 689.9 MB/s  (tile 288)  all ok
+probe2-55/55     TOTAL 8 files 1.2358 bpp  enc 1611.8 dec 690.4 MB/s  (tile 288)  all ok
+r8f5-e9          TOTAL 8 files 1.1619 bpp  enc 1309.2 dec 1122.6 MB/s  all ok
+=== desktop_test ===
+probe1-zthr-old  TOTAL 8 files 2.1933 bpp  enc 1405.2 dec 583.8 MB/s  (tile 288)  all ok
+probe2-65/65     TOTAL 8 files 2.1910 bpp  enc 1647.3 dec 624.2 MB/s  (tile 288)  all ok
+probe2-50/50     TOTAL 8 files 2.1882 bpp  enc 1548.4 dec 612.6 MB/s  (tile 288)  all ok
+probe2-55/55     TOTAL 8 files 2.1894 bpp  enc 1559.0 dec 619.3 MB/s  (tile 288)  all ok
+r8f5-e9          TOTAL 8 files 2.1274 bpp  enc 1074.1 dec 880.0 MB/s  all ok
+=== websight_test ===
+probe1-zthr-old  TOTAL 8 files 0.2080 bpp  enc 2716.5 dec 901.2 MB/s  (tile 288)  all ok
+probe2-65/65     TOTAL 8 files 0.2067 bpp  enc 3874.8 dec 1053.8 MB/s  (tile 288)  all ok
+probe2-50/50     TOTAL 8 files 0.2067 bpp  enc 3460.7 dec 959.4 MB/s  (tile 288)  all ok
+probe2-55/55     TOTAL 8 files 0.2067 bpp  enc 3652.4 dec 1006.9 MB/s  (tile 288)  all ok
+r8f5-e9          TOTAL 8 files 0.2041 bpp  enc 2580.5 dec 1774.1 MB/s  all ok
+=== docs_test ===
+probe1-zthr-old  TOTAL 8 files 1.3307 bpp  enc 1676.7 dec 702.7 MB/s  (tile 288)  all ok
+probe2-65/65     TOTAL 8 files 1.3233 bpp  enc 1959.0 dec 773.3 MB/s  (tile 288)  all ok
+probe2-50/50     TOTAL 8 files 1.3158 bpp  enc 1932.3 dec 756.8 MB/s  (tile 288)  all ok
+probe2-55/55     TOTAL 8 files 1.3212 bpp  enc 1961.6 dec 766.1 MB/s  (tile 288)  all ok
+r8f5-e9          TOTAL 8 files 1.2851 bpp  enc 1311.9 dec 1176.4 MB/s  all ok
+=== scans_test ===
+probe1-zthr-old  TOTAL 6 files 5.5125 bpp  enc 749.8 dec 349.6 MB/s  (tile 288)  all ok
+probe2-65/65     TOTAL 6 files 5.4393 bpp  enc 878.5 dec 367.3 MB/s  (tile 288)  all ok
+probe2-50/50     TOTAL 6 files 5.4541 bpp  enc 857.9 dec 358.7 MB/s  (tile 288)  all ok
+probe2-55/55     TOTAL 6 files 5.4497 bpp  enc 855.5 dec 357.3 MB/s  (tile 288)  all ok
+r8f5-e9          TOTAL 6 files 5.5169 bpp  enc 417.6 dec 458.7 MB/s  all ok
+=== full12 ===
+probe1-zthr-old  TOTAL 6 files 0.9867 bpp  enc 1605.4 dec 673.1 MB/s  (tile 288)  all ok
+probe2-65/65     TOTAL 6 files 0.9788 bpp  enc 1970.6 dec 743.5 MB/s  (tile 288)  all ok
+probe2-50/50     TOTAL 6 files 0.9742 bpp  enc 1899.6 dec 709.0 MB/s  (tile 288)  all ok
+probe2-55/55     TOTAL 6 files 0.9742 bpp  enc 1885.8 dec 729.9 MB/s  (tile 288)  all ok
+r8f5-e9          TOTAL 6 files 0.9497 bpp  enc 1729.1 dec 1212.6 MB/s  all ok
+=== web8 ===
+probe1-zthr-old  TOTAL 4 files 1.8454 bpp  enc 1394.5 dec 577.5 MB/s  (tile 288)  all ok
+probe2-65/65     TOTAL 4 files 1.8691 bpp  enc 1590.1 dec 622.6 MB/s  (tile 288)  all ok
+probe2-50/50     TOTAL 4 files 1.8641 bpp  enc 1558.2 dec 625.2 MB/s  (tile 288)  all ok
+probe2-55/55     TOTAL 4 files 1.8633 bpp  enc 1577.6 dec 621.9 MB/s  (tile 288)  all ok
+r8f5-e9          TOTAL 4 files 1.8026 bpp  enc 1244.0 dec 936.2 MB/s  all ok
+=== valid ===
+probe1-zthr-old  TOTAL 7 files 9.1653 bpp  enc 675.4 dec 297.7 MB/s  (tile 288)  all ok
+probe2-65/65     TOTAL 7 files 9.1643 bpp  enc 759.2 dec 298.0 MB/s  (tile 288)  all ok
+probe2-50/50     TOTAL 7 files 9.1720 bpp  enc 725.9 dec 290.1 MB/s  (tile 288)  all ok
+probe2-55/55     TOTAL 7 files 9.1689 bpp  enc 745.7 dec 291.7 MB/s  (tile 288)  all ok
+r8f5-e9          TOTAL 7 files 9.1873 bpp  enc 300.1 dec 303.7 MB/s  all ok
+=== kodak ===
+probe1-zthr-old  TOTAL 6 files 10.5644 bpp  enc 679.6 dec 293.5 MB/s  (tile 288)  all ok
+probe2-65/65     TOTAL 6 files 10.5644 bpp  enc 739.3 dec 298.3 MB/s  (tile 288)  all ok
+probe2-50/50     TOTAL 6 files 10.5644 bpp  enc 728.2 dec 290.5 MB/s  (tile 288)  all ok
+probe2-55/55     TOTAL 6 files 10.5644 bpp  enc 735.9 dec 289.3 MB/s  (tile 288)  all ok
+r8f5-e9          TOTAL 6 files 10.8313 bpp  enc 259.5 dec 322.2 MB/s  all ok
+BENCH_DONE

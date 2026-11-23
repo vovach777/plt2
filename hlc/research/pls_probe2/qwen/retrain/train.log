@@ -1,0 +1,50 @@
+GROUP ios       train=700 hold=100
+GROUP desktop   train=1109 hold=159
+GROUP websight  train=560 hold=80
+GROUP docs      train=563 hold=81
+GROUP scans     train=42 hold=6
+GROUP web       train=11 hold=1
+WEIGHT ios       px=1038643200 w_group=1.513070
+WEIGHT desktop   px=6511353184 w_group=0.241354
+WEIGHT websight  px=1161216000 w_group=1.353357
+WEIGHT docs      px=591501875 w_group=2.656864
+WEIGHT scans     px=65094465 w_group=24.142455
+WEIGHT web       px=61432571 w_group=25.581547
+PROGRESS 100 img 14.7s blocks=2328623
+PROGRESS 200 img 30.2s blocks=6187359
+PROGRESS 300 img 45.1s blocks=8878962
+PROGRESS 400 img 59.9s blocks=11110530
+PROGRESS 500 img 75.3s blocks=14619780
+PROGRESS 600 img 90.1s blocks=17105941
+PROGRESS 700 img 105.5s blocks=20390531
+PROGRESS 800 img 154.6s blocks=36962318
+PROGRESS 900 img 213.2s blocks=59926658
+PROGRESS 1000 img 269.6s blocks=74996385
+PROGRESS 1100 img 310.4s blocks=86808181
+PROGRESS 1200 img 349.1s blocks=101298527
+PROGRESS 1300 img 387.7s blocks=106279495
+PROGRESS 1400 img 421.8s blocks=114173614
+PROGRESS 1500 img 487.0s blocks=132033397
+PROGRESS 1600 img 515.8s blocks=140007953
+PROGRESS 1700 img 561.0s blocks=159239279
+PROGRESS 1800 img 600.8s blocks=180654877
+PROGRESS 1900 img 618.5s blocks=181905953
+PROGRESS 2000 img 635.1s blocks=182401503
+PROGRESS 2100 img 651.7s blocks=183026007
+PROGRESS 2200 img 668.3s blocks=183553616
+PROGRESS 2300 img 684.8s blocks=184121861
+PROGRESS 2400 img 700.0s blocks=185094739
+PROGRESS 2500 img 712.0s blocks=187061507
+PROGRESS 2600 img 723.9s blocks=188975819
+PROGRESS 2700 img 736.0s blocks=191130992
+PROGRESS 2800 img 748.1s blocks=193221390
+PROGRESS 2900 img 760.1s blocks=195191795
+DONE /tmp/r8f5/qhs_p2_45_50.pkl imgs=2985 time=774.9s blocks=198941881 planes_y_pls=115663 planes_s_pls=110552 tiles=124344
+STAT ios       imgs=700 blocks=20390531
+STAT desktop   imgs=1109 blocks=161083363
+STAT websight  imgs=559 blocks=3043416
+STAT docs      imgs=563 blocks=11410626
+STAT scans     imgs=35 blocks=1869829
+STAT web       imgs=11 blocks=1144116
+TABLES lens_max=11 ks=[5, 4, 4, 1, 1, 0, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1] ctxmap_hash=2078
+EXIT=0

@@ -565,17 +565,31 @@ static thread_local uint32_t g_pz_y = 0, g_pz_u = 0, g_pz_v = 0, g_pz_s = 0, g_p
 #ifndef PLS_ZTHR
 #define PLS_ZTHR 65                              // R8F5 (llrice RLH9_ZTHR)
 #endif
+#ifndef PLS_ZTHR_Y2
+#define PLS_ZTHR_Y2 45                           // PLS-probe-2 thresholds, % zeros of the Y / S plane (held-out sweep, WorkBuddy)
+#endif
+#ifndef PLS_HYB_W
+#define PLS_HYB_W 15                             // PLS hybrid probe: half-width of the bit-costing band, % zeros
+#endif
+#ifndef PLS_ZTHR_S2
+#define PLS_ZTHR_S2 50
+#endif
 static thread_local int g_pz_plane = 0;         // PLS-probe-1: 0 = Y plane, 1 = chroma S plane of the current tile
 static inline int probe1_mode() {               // 2 = PLS, 0 = PLR; no borderline costing
     if (g_pls_force == 3) {                     // R8F5 rule: zeros of Y + zU + zV >= 65% of 3 * pixels, one choice per tile
         const uint64_t z = uint64_t(g_pz_y) + g_pz_u + g_pz_v, n = uint64_t(g_pz_u + g_pz_v ? 3 : 1) * g_pz_n;
         return z * 100 >= uint64_t(PLS_ZTHR) * n ? 2 : 0; }
-    const uint64_t z = g_pz_plane ? g_pz_s : g_pz_y;                  // 4: per component, zeros of the coded plane
-    return z * 100 >= uint64_t(PLS_ZTHR) * g_pz_n ? 2 : 0;
+    const uint64_t z = g_pz_plane ? g_pz_s : g_pz_y;                  // 4: PLS-probe-2, per plane, zeros of the coded plane
+    const uint64_t t = g_pz_plane ? PLS_ZTHR_S2 : PLS_ZTHR_Y2;
+    if (g_pls_force == 6) {                     // 6: hybrid, zeros decide clear planes, bit costing (mode 1) only within +-PLS_HYB_W
+        if (z * 100 >= (t + PLS_HYB_W) * g_pz_n) return 2;
+        if (z * 100 + uint64_t(PLS_HYB_W) * g_pz_n < t * g_pz_n) return 0;
+        return 1; }
+    return z * 100 >= t * g_pz_n ? 2 : 0;
 }
 static void qhs_plane_enc(const uint16_t* z, const uint16_t* a, size_t nb, int tw) {
 #if !defined(PLS_NO_SWITCH)
-    const int sp_mode = g_pls_force == 1 ? 2 : g_pls_force == 2 ? 0 : g_pls_force >= 3 ? probe1_mode() : qhs::screen_plane_mode(z, nb);
+    const int sp_mode = g_pls_force == 1 ? 2 : g_pls_force == 2 ? 0 : (g_pls_force == 3 || g_pls_force == 4 || g_pls_force == 6) ? probe1_mode() : qhs::screen_plane_mode(z, nb);
     if (!sp_mode) {
         { rlgrl::LaneW w(*g_sink->raw); w.room(); w.put(1, 0); w.sync(); }
         qh_plane_enc(z, a, nb, tw, PLR_OFF);
@@ -850,10 +864,13 @@ static void front_rgb(const uint8_t* rgb, int W, int tw, int th, uint16_t* zy, u
             bad |= yy; py[x] = int16_t(yy); pu[x] = int16_t(u); pv[x] = int16_t(v);
         }
         const size_t o = size_t(y) * tw;
-        if (probe) {
-            med_row16_zc<8>(yc, yu, zy + o, tw, cy); med_row16_zc<9>(uc, uu, zu + o, tw, cu); med_row16_zc<9>(vc, vu, zv, tw, cv);
+        if (probe && g_pls_force >= 4) {        // PLS-probe-2, per plane: zeros of the two coded planes, Y and S (S = 0 iff zU = zV = 0)
+            med_row16_zc<8>(yc, yu, zy + o, tw, cy); med_row16<9>(uc, uu, zu + o, tw); med_row16<9>(vc, vu, zv, tw);
             for (int x = 0; x < tw; x += 16) { v16u a, b; memcpy(&a, zu + o + x, 32); memcpy(&b, zv + x, 32); a += b; memcpy(S + o + x, &a, 32);
                                                cs += zero_lanes(a, x, tw); }
+        } else if (probe) {                     // PLS-probe-1, per tile: zeros of Y, zU, zV (the R8F5 rule)
+            med_row16_zc<8>(yc, yu, zy + o, tw, cy); med_row16_zc<9>(uc, uu, zu + o, tw, cu); med_row16_zc<9>(vc, vu, zv, tw, cv);
+            for (int x = 0; x < tw; x += 16) { v16u a, b; memcpy(&a, zu + o + x, 32); memcpy(&b, zv + x, 32); a += b; memcpy(S + o + x, &a, 32); }
         } else {
             med_row16<8>(yc, yu, zy + o, tw); med_row16<9>(uc, uu, zu + o, tw); med_row16<9>(vc, vu, zv, tw);
             for (int x = 0; x < tw; x += 16) { v16u a, b; memcpy(&a, zu + o + x, 32); memcpy(&b, zv + x, 32); a += b; memcpy(S + o + x, &a, 32); }
@@ -1432,7 +1449,7 @@ int main(int argc, char** argv) {
 #if defined(PLR_QH)
     qh::init(); qhs::init(); qhk::init();
 #endif
-    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.plr [-f] (the input itself if it does not shrink) | d in.plr|pgm|ppm out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N] [-f]  (-f: fast mode, pairs, files PLF1/PLF2; -s or -s=auto: screen mode PLS1/PLS2, PLR or PLS per plane by a detector; -s=screen: every plane PLS; -s=photo: every plane PLR coding; -s=zthr: PLS-probe-1, the R8F5 zero rule (>= 65% zeros of Y+zU+zV) per tile, -s=zthrc: per component; -k or -k=auto: RLK v9 or PLR per plane by the zero-quad share, files PLK1/PLK2; -k=center: one choice per image by the central tile; -k=v2: per-plane probe with a double pass; -k=rlk / -k=plr: forced)\n", argv[0]); return 1; }
+    if (argc < 3) { fprintf(stderr, "usage: %s c in.pgm|ppm out.plr [-f] (the input itself if it does not shrink) | d in.plr|pgm|ppm out.pgm|ppm | bench a.pgm|ppm|dir ... [-r N] [-f]  (-f: fast mode, pairs, files PLF1/PLF2; -s or -s=auto: screen mode PLS1/PLS2, PLR or PLS per plane by a detector; -s=screen: every plane PLS; -s=photo: every plane PLR coding; -s=zthr: PLS-probe-1, the R8F5 zero rule (>= 65% zeros of Y+zU+zV) per tile, -s=probe2 (= -s=zthrc): PLS-probe-2, the same rule per plane, Y by zY zeros, S by S zeros; -k or -k=auto: RLK v9 or PLR per plane by the zero-quad share, files PLK1/PLK2; -k=center: one choice per image by the central tile; -k=v2: per-plane probe with a double pass; -k=rlk / -k=plr: forced)\n", argv[0]); return 1; }
     std::string cmd = argv[1]; Cfg c; int reps = 3; std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i) { std::string a = argv[i];
         if (a == "-r" && i + 1 < argc) reps = atoi(argv[++i]);
@@ -1441,7 +1458,9 @@ int main(int argc, char** argv) {
         else if (a == "-s=screen") { c.screen = !c.fast; c.rlk = false; g_pls_force = 1; }
         else if (a == "-s=photo") { c.screen = !c.fast; c.rlk = false; g_pls_force = 2; }
         else if (a == "-s=zthr") { c.screen = !c.fast; c.rlk = false; g_pls_force = 3; }     // PLS-probe-1: R8F5 zero rule per tile
-        else if (a == "-s=zthrc") { c.screen = !c.fast; c.rlk = false; g_pls_force = 4; }    // PLS-probe-1: per component (Y, S)
+        else if (a == "-s=zthrc" || a == "-s=probe2") { c.screen = !c.fast; c.rlk = false; g_pls_force = 4; }  // PLS-probe-2: per plane (Y, S)
+        else if (a == "-s=hybrid") { c.screen = !c.fast; c.rlk = false; g_pls_force = 6; }   // zeros per plane + bit costing in the band
+        else if (a == "-s=autocnt") { c.screen = !c.fast; c.rlk = false; g_pls_force = 5; }  // speed test: probe-2 zero count in the front, old -s decision
         else if (a == "-k" || a == "-k=auto") { c.rlk = !c.fast; c.screen = false; g_plk_force = 0; }
         else if (a == "-k=rlk") { c.rlk = !c.fast; c.screen = false; g_plk_force = 1; }
         else if (a == "-k=plr") { c.rlk = !c.fast; c.screen = false; g_plk_force = 2; }

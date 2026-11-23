@@ -1,0 +1,25 @@
+=== holdout: probe-1 (ae3dbaf tables, -s=zthr) vs probe-2 (new tables, -s=probe2) ===
+=== ios_hold (sample 8) ===
+probe1-zthr-old  TOTAL 8 files 2.2993 bpp  enc 787.5 dec 345.0 MB/s  (tile 288)  all ok
+probe2-65/65     TOTAL 8 files 2.2973 bpp  enc 818.4 dec 368.6 MB/s  (tile 288)  all ok
+=== desktop_hold (sample 8) ===
+probe1-zthr-old  TOTAL 8 files 2.3148 bpp  enc 998.4 dec 416.4 MB/s  (tile 288)  all ok
+probe2-65/65     TOTAL 8 files 2.3131 bpp  enc 1011.7 dec 426.7 MB/s  (tile 288)  all ok
+=== websight_hold (sample 8) ===
+probe1-zthr-old  TOTAL 8 files 0.2806 bpp  enc 1958.4 dec 533.1 MB/s  (tile 288)  all ok
+probe2-65/65     TOTAL 8 files 0.2805 bpp  enc 2027.8 dec 597.0 MB/s  (tile 288)  all ok
+=== docs_hold (sample 8) ===
+probe1-zthr-old  TOTAL 8 files 1.7856 bpp  enc 1030.9 dec 421.0 MB/s  (tile 288)  all ok
+probe2-65/65     TOTAL 8 files 1.8797 bpp  enc 1077.9 dec 444.0 MB/s  (tile 288)  all ok
+=== scans_hold (sample 6) ===
+probe1-zthr-old  TOTAL 6 files 8.1760 bpp  enc 513.0 dec 223.3 MB/s  (tile 288)  all ok
+probe2-65/65     TOTAL 6 files 8.1625 bpp  enc 516.3 dec 220.4 MB/s  (tile 288)  all ok
+=== web_hold (sample 1) ===
+probe1-zthr-old  TOTAL 1 files 2.9315 bpp  enc 704.0 dec 333.2 MB/s  (tile 288)  all ok
+probe2-65/65     TOTAL 1 files 2.9483 bpp  enc 730.7 dec 340.5 MB/s  (tile 288)  all ok
+=== threshold sweep on holdout (new tables, -s=probe2): Y x S ===
+thr Y\S                S=55      S=65      S=75
+Y=55                                           
+Y=65                              bpp          
+Y=75                                           
+SWEEP_DONE

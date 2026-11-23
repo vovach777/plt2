@@ -1,0 +1,56 @@
+CPU: AMD Ryzen 9 9900X 12-Core Processor
+=== ios_test ===
+ios_test       ctx5-auto      TOTAL 200 files 1.3008 bpp  enc 2674.9 dec 1181.3 MB/s  (tile 288)  all ok
+ios_test       probe1-zthr    TOTAL 200 files 1.2998 bpp  enc 2624.0 dec 1196.6 MB/s  (tile 288)  all ok
+ios_test       p2-arc-50-50   TOTAL 200 files 1.2968 bpp  enc 2643.9 dec 1192.3 MB/s  (tile 288)  all ok
+ios_test       p2-new-45-50   TOTAL 200 files 1.2978 bpp  enc 2617.1 dec 1183.0 MB/s  (tile 288)  all ok
+ios_test       r8f5-0448cfb   TOTAL 200 files 1.2521 bpp  enc 2481.0 dec 2064.7 MB/s  all ok
+=== desktop_test ===
+desktop_test   ctx5-auto      TOTAL 317 files 2.2562 bpp  enc 2275.5 dec 1015.9 MB/s  (tile 288)  all ok
+desktop_test   probe1-zthr    TOTAL 317 files 2.2552 bpp  enc 2236.1 dec 1018.1 MB/s  (tile 288)  all ok
+desktop_test   p2-arc-50-50   TOTAL 317 files 2.2566 bpp  enc 2245.3 dec 1010.0 MB/s  (tile 288)  all ok
+desktop_test   p2-new-45-50   TOTAL 317 files 2.2499 bpp  enc 2192.4 dec 1005.6 MB/s  (tile 288)  all ok
+desktop_test   r8f5-0448cfb   TOTAL 317 files 2.1963 bpp  enc 1660.5 dec 1551.6 MB/s  all ok
+=== websight_test ===
+websight_test  ctx5-auto      TOTAL 160 files 0.2153 bpp  enc 6345.5 dec 1893.9 MB/s  (tile 288)  all ok
+websight_test  probe1-zthr    TOTAL 160 files 0.2143 bpp  enc 5544.6 dec 1898.8 MB/s  (tile 288)  all ok
+websight_test  p2-arc-50-50   TOTAL 160 files 0.2140 bpp  enc 5825.0 dec 1891.5 MB/s  (tile 288)  all ok
+websight_test  p2-new-45-50   TOTAL 160 files 0.2144 bpp  enc 5854.3 dec 1901.2 MB/s  (tile 288)  all ok
+websight_test  r8f5-0448cfb   TOTAL 160 files 0.2098 bpp  enc 6360.3 dec 3689.0 MB/s  all ok
+=== docs_test ===
+docs_test      ctx5-auto      TOTAL 160 files 1.7189 bpp  enc 2515.4 dec 1118.4 MB/s  (tile 288)  all ok
+docs_test      probe1-zthr    TOTAL 160 files 1.7135 bpp  enc 2481.6 dec 1142.2 MB/s  (tile 288)  all ok
+docs_test      p2-arc-50-50   TOTAL 160 files 1.7146 bpp  enc 2504.6 dec 1136.6 MB/s  (tile 288)  all ok
+docs_test      p2-new-45-50   TOTAL 160 files 1.7109 bpp  enc 2495.0 dec 1135.7 MB/s  (tile 288)  all ok
+docs_test      r8f5-0448cfb   TOTAL 160 files 1.6632 bpp  enc 2550.3 dec 1954.6 MB/s  all ok
+=== scans_test ===
+scans_test     ctx5-auto      TOTAL 12 files 5.7842 bpp  enc 1195.8 dec 566.4 MB/s  (tile 288)  all ok
+scans_test     probe1-zthr    TOTAL 12 files 5.8330 bpp  enc 1244.8 dec 557.4 MB/s  (tile 288)  all ok
+scans_test     p2-arc-50-50   TOTAL 12 files 5.7564 bpp  enc 1216.8 dec 563.9 MB/s  (tile 288)  all ok
+scans_test     p2-new-45-50   TOTAL 12 files 5.7540 bpp  enc 1208.9 dec 558.5 MB/s  (tile 288)  all ok
+scans_test     r8f5-0448cfb   TOTAL 12 files 5.8674 bpp  enc 709.3 dec 756.3 MB/s  all ok
+=== full12 ===
+full12         ctx5-auto      TOTAL 12 files 1.2914 bpp  enc 2258.5 dec 1115.5 MB/s  (tile 288)  all ok
+full12         probe1-zthr    TOTAL 12 files 1.2828 bpp  enc 2187.6 dec 1112.0 MB/s  (tile 288)  all ok
+full12         p2-arc-50-50   TOTAL 12 files 1.2777 bpp  enc 2218.8 dec 1113.3 MB/s  (tile 288)  all ok
+full12         p2-new-45-50   TOTAL 12 files 1.2819 bpp  enc 2218.5 dec 1112.2 MB/s  (tile 288)  all ok
+full12         r8f5-0448cfb   TOTAL 12 files 1.2510 bpp  enc 2830.1 dec 1977.5 MB/s  all ok
+=== web8 ===
+web8           ctx5-auto      TOTAL 8 files 1.9455 bpp  enc 2243.7 dec 1018.2 MB/s  (tile 288)  all ok
+web8           probe1-zthr    TOTAL 8 files 1.9630 bpp  enc 2278.7 dec 1039.9 MB/s  (tile 288)  all ok
+web8           p2-arc-50-50   TOTAL 8 files 1.9683 bpp  enc 2271.8 dec 1025.5 MB/s  (tile 288)  all ok
+web8           p2-new-45-50   TOTAL 8 files 1.9587 bpp  enc 2265.7 dec 1022.2 MB/s  (tile 288)  all ok
+web8           r8f5-0448cfb   TOTAL 8 files 1.9012 bpp  enc 1976.6 dec 1724.8 MB/s  all ok
+=== valid41 ===
+valid41        ctx5-auto      TOTAL 41 files 8.7226 bpp  enc 1175.2 dec 485.1 MB/s  (tile 288)  all ok
+valid41        probe1-zthr    TOTAL 41 files 8.7273 bpp  enc 1168.6 dec 485.0 MB/s  (tile 288)  all ok
+valid41        p2-arc-50-50   TOTAL 41 files 8.7343 bpp  enc 1166.4 dec 485.8 MB/s  (tile 288)  all ok
+valid41        p2-new-45-50   TOTAL 41 files 8.7329 bpp  enc 1154.7 dec 480.7 MB/s  (tile 288)  all ok
+valid41        r8f5-0448cfb   TOTAL 41 files 8.7447 bpp  enc 526.1 dec 533.3 MB/s  all ok
+=== kodak24 ===
+kodak24        ctx5-auto      TOTAL 24 files 9.9587 bpp  enc 1209.5 dec 467.8 MB/s  (tile 288)  all ok
+kodak24        probe1-zthr    TOTAL 24 files 9.9588 bpp  enc 1165.7 dec 467.6 MB/s  (tile 288)  all ok
+kodak24        p2-arc-50-50   TOTAL 24 files 9.9588 bpp  enc 1190.1 dec 467.5 MB/s  (tile 288)  all ok
+kodak24        p2-new-45-50   TOTAL 24 files 9.9607 bpp  enc 1191.2 dec 467.8 MB/s  (tile 288)  all ok
+kodak24        r8f5-0448cfb   TOTAL 24 files 10.1920 bpp  enc 504.5 dec 519.3 MB/s  all ok
+BENCH-DONE

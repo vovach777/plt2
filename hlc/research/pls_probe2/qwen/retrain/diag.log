@@ -1,0 +1,29 @@
+images: 4846
+done 250 tiles 5250
+done 500 tiles 10500
+done 750 tiles 15750
+done 1000 tiles 21000
+done 1250 tiles 43171
+done 1500 tiles 64761
+done 1750 tiles 80811
+done 2000 tiles 98265
+done 2250 tiles 119970
+done 2500 tiles 136030
+done 2750 tiles 144484
+done 3000 tiles 151484
+done 3250 tiles 158484
+done 3500 tiles 164104
+done 3750 tiles 168104
+done 4000 tiles 172104
+done 4250 tiles 176758
+done 4500 tiles 185799
+done 4750 tiles 194057
+DIAG-DONE images=4846 tiles=197379 fails=0
+holdout_ios.txt tiles=2100
+holdout_desktop.txt tiles=11903
+holdout_websight.txt tiles=2240
+holdout_docs.txt tiles=1296
+holdout_scans.txt tiles=238
+holdout_web.txt tiles=110
+holdout_photo.txt tiles=1884
+EXIT=0
