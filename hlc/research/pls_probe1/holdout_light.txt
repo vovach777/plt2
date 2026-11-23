@@ -1,0 +1,19 @@
+=== ios_hold (sample 8/100) ===
+old        TOTAL 8 files 2.3053 bpp  enc 1025.5 dec 487.2 MB/s  (tile 288)  all ok
+new        TOTAL 8 files 2.2973 bpp  enc 1021.6 dec 486.1 MB/s  (tile 288)  all ok
+=== desktop_hold (sample 8/159) ===
+old        TOTAL 8 files 2.3156 bpp  enc 1263.2 dec 552.0 MB/s  (tile 288)  all ok
+new        TOTAL 8 files 2.3154 bpp  enc 1302.9 dec 565.2 MB/s  (tile 288)  all ok
+=== websight_hold (sample 8/80) ===
+old        TOTAL 8 files 0.2820 bpp  enc 2596.9 dec 809.4 MB/s  (tile 288)  all ok
+new        TOTAL 8 files 0.2815 bpp  enc 2615.0 dec 836.5 MB/s  (tile 288)  all ok
+=== docs_hold (sample 8/81) ===
+old        TOTAL 8 files 1.7893 bpp  enc 1340.0 dec 596.1 MB/s  (tile 288)  all ok
+new        TOTAL 8 files 1.7862 bpp  enc 1378.6 dec 624.2 MB/s  (tile 288)  all ok
+=== scans_hold (sample 6/6) ===
+old        TOTAL 6 files 8.1882 bpp  enc 708.5 dec 310.8 MB/s  (tile 288)  all ok
+new        TOTAL 6 files 8.1794 bpp  enc 696.2 dec 307.1 MB/s  (tile 288)  all ok
+=== web_hold (sample 1/1) ===
+old        TOTAL 1 files 2.9037 bpp  enc 898.9 dec 447.5 MB/s  (tile 288)  all ok
+new        TOTAL 1 files 2.9393 bpp  enc 917.7 dec 463.6 MB/s  (tile 288)  all ok
+HOLDOUT_DONE
