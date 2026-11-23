@@ -1,0 +1,55 @@
+=== ios_test (sample 8/200) ===
+ctx5-auto    TOTAL 8 files 1.2546 bpp  enc 1374.3 dec 588.2 MB/s  (tile 288)  all ok
+zthr-old     TOTAL 8 files 1.2559 bpp  enc 1370.5 dec 622.8 MB/s  (tile 288)  all ok
+zthr-100     TOTAL 8 files 1.2383 bpp  enc 1513.8 dec 666.0 MB/s  (tile 288)  all ok
+zthrc-100    TOTAL 8 files 1.2455 bpp  enc 1537.4 dec 663.1 MB/s  (tile 288)  all ok
+r8f5-e9      TOTAL 8 files 1.1619 bpp  enc 1270.3 dec 1111.2 MB/s  all ok
+=== desktop_test (sample 8/317) ===
+ctx5-auto    TOTAL 8 files 2.1852 bpp  enc 1372.8 dec 565.9 MB/s  (tile 288)  all ok
+zthr-old     TOTAL 8 files 2.1933 bpp  enc 1359.8 dec 552.8 MB/s  (tile 288)  all ok
+zthr-100     TOTAL 8 files 2.1925 bpp  enc 1550.1 dec 623.8 MB/s  (tile 288)  all ok
+zthrc-100    TOTAL 8 files 2.1911 bpp  enc 1563.6 dec 625.0 MB/s  (tile 288)  all ok
+r8f5-e9      TOTAL 8 files 2.1274 bpp  enc 1081.2 dec 849.5 MB/s  all ok
+=== websight_test (sample 8/160) ===
+ctx5-auto    TOTAL 8 files 0.2081 bpp  enc 3013.1 dec 825.7 MB/s  (tile 288)  all ok
+zthr-old     TOTAL 8 files 0.2080 bpp  enc 2846.6 dec 896.0 MB/s  (tile 288)  all ok
+zthr-100     TOTAL 8 files 0.2066 bpp  enc 3472.1 dec 1043.9 MB/s  (tile 288)  all ok
+zthrc-100    TOTAL 8 files 0.2066 bpp  enc 3543.2 dec 1006.3 MB/s  (tile 288)  all ok
+r8f5-e9      TOTAL 8 files 0.2041 bpp  enc 2708.6 dec 1852.6 MB/s  all ok
+=== docs_test (sample 8/160) ===
+ctx5-auto    TOTAL 8 files 1.3248 bpp  enc 1657.3 dec 640.8 MB/s  (tile 288)  all ok
+zthr-old     TOTAL 8 files 1.3307 bpp  enc 1507.0 dec 639.9 MB/s  (tile 288)  all ok
+zthr-100     TOTAL 8 files 1.3235 bpp  enc 1848.4 dec 758.2 MB/s  (tile 288)  all ok
+zthrc-100    TOTAL 8 files 1.3256 bpp  enc 1831.9 dec 750.3 MB/s  (tile 288)  all ok
+r8f5-e9      TOTAL 8 files 1.2851 bpp  enc 1333.1 dec 1141.8 MB/s  all ok
+=== scans_test (sample 6/12) ===
+ctx5-auto    TOTAL 6 files 5.4615 bpp  enc 734.2 dec 337.8 MB/s  (tile 288)  all ok
+zthr-old     TOTAL 6 files 5.5125 bpp  enc 735.9 dec 343.9 MB/s  (tile 288)  all ok
+zthr-100     TOTAL 6 files 5.4790 bpp  enc 805.3 dec 337.2 MB/s  (tile 288)  all ok
+zthrc-100    TOTAL 6 files 5.4570 bpp  enc 874.6 dec 360.3 MB/s  (tile 288)  all ok
+r8f5-e9      TOTAL 6 files 5.5169 bpp  enc 418.1 dec 444.9 MB/s  all ok
+=== full12 (sample 6/12) ===
+ctx5-auto    TOTAL 6 files 0.9856 bpp  enc 1638.1 dec 619.6 MB/s  (tile 288)  all ok
+zthr-old     TOTAL 6 files 0.9867 bpp  enc 1604.1 dec 665.8 MB/s  (tile 288)  all ok
+zthr-100     TOTAL 6 files 0.9768 bpp  enc 1831.2 dec 722.8 MB/s  (tile 288)  all ok
+zthrc-100    TOTAL 6 files 0.9812 bpp  enc 1887.2 dec 742.5 MB/s  (tile 288)  all ok
+r8f5-e9      TOTAL 6 files 0.9497 bpp  enc 1712.7 dec 1192.7 MB/s  all ok
+=== web8 (sample 4/8) ===
+ctx5-auto    TOTAL 4 files 1.8411 bpp  enc 1329.9 dec 538.6 MB/s  (tile 288)  all ok
+zthr-old     TOTAL 4 files 1.8454 bpp  enc 1375.6 dec 572.3 MB/s  (tile 288)  all ok
+zthr-100     TOTAL 4 files 1.8563 bpp  enc 1508.6 dec 613.2 MB/s  (tile 288)  all ok
+zthrc-100    TOTAL 4 files 1.8674 bpp  enc 1542.2 dec 618.2 MB/s  (tile 288)  all ok
+r8f5-e9      TOTAL 4 files 1.8026 bpp  enc 1231.7 dec 899.3 MB/s  all ok
+=== valid (sample 7/41) ===
+ctx5-auto    TOTAL 7 files 9.1636 bpp  enc 686.8 dec 291.4 MB/s  (tile 288)  all ok
+zthr-old     TOTAL 7 files 9.1653 bpp  enc 649.4 dec 289.6 MB/s  (tile 288)  all ok
+zthr-100     TOTAL 7 files 9.1648 bpp  enc 741.8 dec 286.3 MB/s  (tile 288)  all ok
+zthrc-100    TOTAL 7 files 9.1638 bpp  enc 742.7 dec 289.5 MB/s  (tile 288)  all ok
+r8f5-e9      TOTAL 7 files 9.1873 bpp  enc 296.7 dec 303.2 MB/s  all ok
+=== kodak (sample 6/24) ===
+ctx5-auto    TOTAL 6 files 10.5644 bpp  enc 686.1 dec 288.6 MB/s  (tile 288)  all ok
+zthr-old     TOTAL 6 files 10.5644 bpp  enc 657.2 dec 286.7 MB/s  (tile 288)  all ok
+zthr-100     TOTAL 6 files 10.5644 bpp  enc 702.4 dec 286.1 MB/s  (tile 288)  all ok
+zthrc-100    TOTAL 6 files 10.5644 bpp  enc 690.6 dec 279.9 MB/s  (tile 288)  all ok
+r8f5-e9      TOTAL 6 files 10.8313 bpp  enc 253.8 dec 318.7 MB/s  all ok
+LIGHT_DONE

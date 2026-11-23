@@ -1,0 +1,25 @@
+=== ios_hold (sample 8/100) ===
+old-ctx5tbl  TOTAL 8 files 2.3053 bpp  enc 1051.0 dec 509.1 MB/s  (tile 288)  all ok
+new20pct     TOTAL 8 files 2.2973 bpp  enc 1044.6 dec 510.7 MB/s  (tile 288)  all ok
+new100pct    TOTAL 8 files 2.2993 bpp  enc 1117.7 dec 533.8 MB/s  (tile 288)  all ok
+=== desktop_hold (sample 8/159) ===
+old-ctx5tbl  TOTAL 8 files 2.3156 bpp  enc 1307.0 dec 563.2 MB/s  (tile 288)  all ok
+new20pct     TOTAL 8 files 2.3154 bpp  enc 1283.3 dec 564.1 MB/s  (tile 288)  all ok
+new100pct    TOTAL 8 files 2.3148 bpp  enc 1464.9 dec 610.3 MB/s  (tile 288)  all ok
+=== websight_hold (sample 8/80) ===
+old-ctx5tbl  TOTAL 8 files 0.2820 bpp  enc 2485.5 dec 820.2 MB/s  (tile 288)  all ok
+new20pct     TOTAL 8 files 0.2815 bpp  enc 2610.0 dec 849.9 MB/s  (tile 288)  all ok
+new100pct    TOTAL 8 files 0.2806 bpp  enc 3324.1 dec 992.4 MB/s  (tile 288)  all ok
+=== docs_hold (sample 8/81) ===
+old-ctx5tbl  TOTAL 8 files 1.7893 bpp  enc 1292.2 dec 576.3 MB/s  (tile 288)  all ok
+new20pct     TOTAL 8 files 1.7862 bpp  enc 1308.9 dec 614.1 MB/s  (tile 288)  all ok
+new100pct    TOTAL 8 files 1.7856 bpp  enc 1523.4 dec 685.0 MB/s  (tile 288)  all ok
+=== scans_hold (sample 6/6) ===
+old-ctx5tbl  TOTAL 6 files 8.1882 bpp  enc 711.3 dec 313.9 MB/s  (tile 288)  all ok
+new20pct     TOTAL 6 files 8.1794 bpp  enc 705.3 dec 311.5 MB/s  (tile 288)  all ok
+new100pct    TOTAL 6 files 8.1760 bpp  enc 765.0 dec 308.0 MB/s  (tile 288)  all ok
+=== web_hold (sample 1/1) ===
+old-ctx5tbl  TOTAL 1 files 2.9037 bpp  enc 940.6 dec 467.0 MB/s  (tile 288)  all ok
+new20pct     TOTAL 1 files 2.9393 bpp  enc 936.1 dec 468.2 MB/s  (tile 288)  all ok
+new100pct    TOTAL 1 files 2.9315 bpp  enc 1007.0 dec 458.9 MB/s  (tile 288)  all ok
+HOLDOUT_DONE

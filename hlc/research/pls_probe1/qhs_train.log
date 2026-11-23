@@ -1,0 +1,44 @@
+GROUP ios       train=700 used=140 hold=100
+GROUP desktop   train=1109 used=222 hold=159
+GROUP websight  train=560 used=112 hold=80
+GROUP docs      train=563 used=113 hold=81
+GROUP scans     train=42 used=9 hold=6
+GROUP web       train=11 used=3 hold=1
+WEIGHT ios       px=1038643200 w_group=1.513070 w_img=7.565352
+WEIGHT desktop   px=6511353184 w_group=0.241354 w_img=1.205682
+WEIGHT websight  px=1161216000 w_group=1.353357 w_img=6.766787
+WEIGHT docs      px=591501875 w_group=2.656864 w_img=13.237297
+WEIGHT scans     px=65094465 w_group=24.142455 w_img=112.664792
+WEIGHT web       px=61432571 w_group=25.581547 w_img=93.799006
+PROGRESS 25 img 6.8s blocks=506824
+PROGRESS 50 img 13.5s blocks=1195832
+PROGRESS 75 img 20.6s blocks=1790971
+PROGRESS 100 img 27.3s blocks=2522774
+PROGRESS 125 img 33.9s blocks=3026237
+PROGRESS 150 img 52.2s blocks=5120545
+PROGRESS 175 img 81.4s blocks=8930744
+PROGRESS 200 img 115.0s blocks=12056512
+PROGRESS 225 img 138.3s blocks=14811038
+PROGRESS 250 img 158.4s blocks=17539017
+PROGRESS 275 img 183.9s blocks=19435756
+PROGRESS 300 img 221.2s blocks=23002028
+PROGRESS 325 img 240.1s blocks=25220387
+PROGRESS 350 img 262.7s blocks=30115874
+PROGRESS 375 img 274.8s blocks=31152905
+PROGRESS 400 img 283.5s blocks=31280901
+PROGRESS 425 img 292.3s blocks=31449339
+PROGRESS 450 img 301.3s blocks=31586719
+PROGRESS 475 img 309.9s blocks=31729960
+PROGRESS 500 img 314.7s blocks=32288394
+PROGRESS 525 img 319.7s blocks=32807001
+PROGRESS 550 img 324.4s blocks=33376275
+PROGRESS 575 img 329.1s blocks=33774262
+DONE /tmp/r8f5/qhs_zthr_tables.pkl imgs=599 time=337.4s blocks=34553204 tiles_pls=21982/25118 (87.51%)
+STAT ios       imgs=140 blocks=3729721
+STAT desktop   imgs=222 blocks=27363599
+STAT websight  imgs=112 blocks=618742
+STAT docs      imgs=112 blocks=2245845
+STAT scans     imgs=5 blocks=250940
+STAT web       imgs=3 blocks=344357
+TABLES lens_max=11 ks=[5, 4, 3, 1, 1, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 1, 1, 0, 4, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1] ctxmap_hash=2109
+EXIT=0
